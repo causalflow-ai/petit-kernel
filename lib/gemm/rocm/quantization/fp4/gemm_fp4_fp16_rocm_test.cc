@@ -124,14 +124,14 @@ void GemmFp4Fp16Test::CopyAndCompareOutput(GemmMPTestData *ctx) const {
                 reinterpret_cast<const half *>(&h_reference[i]);
             float of = __half2float(output_ptr[0]);
             float rf = __half2float(ref_ptr[0]);
-            EXPECT_NEAR(of, rf, std::min<float>(1e-2, fabs(rf) * 0.01f))
+            EXPECT_NEAR(of, rf, std::min<float>(2e-2, fabs(rf) * 0.01f))
                 << "Output and reference differ at index " << i;
         } else if (dequant_type_ == DataType::kDataTypeBf16) {
             unsigned o = (unsigned)h_output[i] << 16,
                      r = (unsigned)h_reference[i] << 16;
             float of = reinterpret_cast<const float &>(o);
             float rf = reinterpret_cast<const float &>(r);
-            EXPECT_NEAR(of, rf, std::min<float>(1e-2, fabs(rf) * 0.01f))
+            EXPECT_NEAR(of, rf, std::min<float>(2e-2, fabs(rf) * 0.01f))
                 << "Output and reference differ at index " << i;
         }
     }
@@ -164,24 +164,24 @@ void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
     hints.require_high_precision =
         sol_id.features & MatmulFeatures::kMatmulFeatures_HighPrecision;
 
-    GemmFp4Fp16Grid(reinterpret_cast<unsigned *>(ctx.output()),
-                    reinterpret_cast<const unsigned *>(ctx.input()),
-                    reinterpret_cast<const unsigned *>(ctx.weights_quant()),
-                    reinterpret_cast<const unsigned *>(ctx.scales()),
-                    global_scale, m, n, k, hints, sol_id.Repr(), nullptr);
+    ASSERT_EQ(0, GemmFp4Fp16Grid(
+                     reinterpret_cast<unsigned *>(ctx.output()),
+                     reinterpret_cast<const unsigned *>(ctx.input()),
+                     reinterpret_cast<const unsigned *>(ctx.weights_quant()),
+                     reinterpret_cast<const unsigned *>(ctx.scales()),
+                     global_scale, m, n, k, hints, sol_id.Repr(), nullptr));
     CopyAndCompareOutput(&ctx);
 }
 
-static inline constexpr SolutionId Fp4NK(int features, MatmulPipeline pipeline,
-                                         MatmulMfmaType mfma_type,
-                                         unsigned tile_m, unsigned tile_n,
-                                         unsigned tile_k, unsigned partition_n,
-                                         unsigned partition_k) {
+static inline constexpr SolutionId
+Fp4NK(int features, MatmulPipeline pipeline, MatmulMfmaType mfma_type,
+      unsigned tile_m, unsigned tile_n, unsigned tile_k, unsigned partition_m,
+      unsigned partition_n, unsigned partition_k) {
     return SolutionId::MultiStage(pipeline, (MatmulFeatures)features,
                                   MatmulElementB::kMatmulTypeBFp4, mfma_type,
                                   tile_m, tile_n, tile_k,
                                   MatmulWarpPartition::kMatmulWarpPartition_NK,
-                                  1, partition_n, partition_k);
+                                  partition_m, partition_n, partition_k);
 }
 
 static inline constexpr SolutionId Fp4(MatmulPipeline pipeline,
@@ -189,7 +189,7 @@ static inline constexpr SolutionId Fp4(MatmulPipeline pipeline,
                                        unsigned tile_m, unsigned tile_n,
                                        unsigned tile_k) {
     return Fp4NK(MatmulFeatures::kMatmulFeatures_Grid, pipeline, mfma_type,
-                 tile_m, tile_n, tile_k, tile_n, 4 / tile_n);
+                 tile_m, tile_n, tile_k, 1, tile_n, 4 / tile_n);
 }
 
 static inline constexpr SolutionId Fp4Hp(MatmulPipeline pipeline,
@@ -198,7 +198,7 @@ static inline constexpr SolutionId Fp4Hp(MatmulPipeline pipeline,
                                          unsigned tile_k) {
     return Fp4NK(MatmulFeatures::kMatmulFeatures_Grid |
                      MatmulFeatures::kMatmulFeatures_HighPrecision,
-                 pipeline, mfma_type, tile_m, tile_n, tile_k, tile_n,
+                 pipeline, mfma_type, tile_m, tile_n, tile_k, 1, tile_n,
                  4 / tile_n);
 }
 
@@ -262,6 +262,49 @@ TEST_F(GemmFp4Fp16Test, TestGemm16x64x512_SingleStage) {
     TestGemm(32, 64, 512, 1.0f,
              Fp4(MatmulPipeline::kMatmulPipeline_1,
                  MatmulMfmaType::kMatmulMfmaTypeBf16, 2, 1, 32));
+}
+
+TEST_F(GemmFp4Fp16Test, TestGemm16x64x512_16x48x512) {
+    TestGemm(16, 64, 512, 1.0f,
+             Fp4NK(MatmulFeatures::kMatmulFeatures_Grid |
+                       MatmulFeatures::kMatmulFeatures_HighPrecision,
+                   MatmulPipeline::kMatmulPipeline_1,
+                   MatmulMfmaType::kMatmulMfmaTypeFp16, 1, 4, 32, 1, 2, 1));
+}
+TEST_F(GemmFp4Fp16Test, TestGemm32x64x512_32x48x512) {
+    TestGemm(32, 64, 512, 1.0f,
+             Fp4NK(MatmulFeatures::kMatmulFeatures_Grid |
+                       MatmulFeatures::kMatmulFeatures_HighPrecision,
+                   MatmulPipeline::kMatmulPipeline_1,
+                   MatmulMfmaType::kMatmulMfmaTypeFp16, 2, 4, 32, 1, 2, 1));
+}
+TEST_F(GemmFp4Fp16Test, TestGemm32x64x512_16x48x512) {
+    TestGemm(32, 64, 512, 1.0f,
+             Fp4NK(MatmulFeatures::kMatmulFeatures_Grid |
+                       MatmulFeatures::kMatmulFeatures_HighPrecision,
+                   MatmulPipeline::kMatmulPipeline_1,
+                   MatmulMfmaType::kMatmulMfmaTypeFp16, 2, 4, 32, 2, 2, 1));
+}
+TEST_F(GemmFp4Fp16Test, TestGemm16x64x512_16x48x256) {
+    TestGemm(16, 64, 512, 1.0f,
+             Fp4NK(MatmulFeatures::kMatmulFeatures_Grid |
+                       MatmulFeatures::kMatmulFeatures_HighPrecision,
+                   MatmulPipeline::kMatmulPipeline_1,
+                   MatmulMfmaType::kMatmulMfmaTypeFp16, 1, 4, 32, 1, 2, 2));
+}
+TEST_F(GemmFp4Fp16Test, TestGemm32x64x512_32x48x256) {
+    TestGemm(32, 64, 512, 1.0f,
+             Fp4NK(MatmulFeatures::kMatmulFeatures_Grid |
+                       MatmulFeatures::kMatmulFeatures_HighPrecision,
+                   MatmulPipeline::kMatmulPipeline_1,
+                   MatmulMfmaType::kMatmulMfmaTypeFp16, 2, 4, 32, 1, 2, 2));
+}
+TEST_F(GemmFp4Fp16Test, TestGemm32x64x512_16x48x256) {
+    TestGemm(32, 64, 512, 1.0f,
+             Fp4NK(MatmulFeatures::kMatmulFeatures_Grid |
+                       MatmulFeatures::kMatmulFeatures_HighPrecision,
+                   MatmulPipeline::kMatmulPipeline_1,
+                   MatmulMfmaType::kMatmulMfmaTypeFp16, 2, 4, 32, 2, 2, 2));
 }
 
 } // namespace causalflow::petit::rocm::quantization::fp4

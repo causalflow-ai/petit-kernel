@@ -22,27 +22,30 @@ struct TileShape {
 };
 
 // Describe how warps are partitioned for the matmul operation.
-template <unsigned kNumWarps_, unsigned kPartitionN_, unsigned kPartitionK_>
+template <unsigned kPartitionM_, unsigned kPartitionN_, unsigned kPartitionK_>
 struct WarpPartition {
+    static constexpr unsigned kPartitionM = kPartitionM_;
     static constexpr unsigned kPartitionN = kPartitionN_;
     static constexpr unsigned kPartitionK = kPartitionK_;
-    static constexpr unsigned kNumWarps = kNumWarps_;
-    static constexpr unsigned kThreads = kNumWarps_ * kWarpSize;
+    static constexpr unsigned kNumWarps =
+        kPartitionM * kPartitionN * kPartitionK;
+    static constexpr unsigned kThreads = kNumWarps * kWarpSize;
 
-    static_assert(kNumWarps_ == kPartitionN * kPartitionK,
-                  "The number of warps must be equal to the product of the "
-                  "partition dimensions");
-
-    // Arrange the wid in (k, m, n) order. for now we fix m to 1.
+    // Arrange the wid in (k, m, n) order.
 
     // The index in the k dimension where the accumulation is performed.
     __device__ static constexpr unsigned AccRowK(unsigned wid) {
-        return wid / kPartitionN;
+        return wid / kPartitionN / kPartitionM;
     }
 
     // Index of the independent dimension of n.
     __device__ static constexpr unsigned WarpColN(unsigned wid) {
         return wid % kPartitionN;
+    }
+
+    // Index of the independent dimension of m.
+    __device__ static constexpr unsigned WarpRowM(unsigned wid) {
+        return wid / kPartitionN % kPartitionM;
     }
 };
 

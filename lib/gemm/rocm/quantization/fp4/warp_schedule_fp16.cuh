@@ -29,7 +29,7 @@ struct MmaSelector<__hip_bfloat16, kHighPrecision> {
 };
 
 template <class Config>
-__device__ static void Matmul(const uint4 va[Config::kNumTileM][4],
+__device__ static void Matmul(const uint4 va[Config::kWarpTilesM][4],
                               const uint *qw, unsigned short packed_scale,
                               typename Config::ThreadAccum &__restrict__ acc,
                               unsigned warp_idx_n) {
@@ -45,7 +45,7 @@ __device__ static void Matmul(const uint4 va[Config::kNumTileM][4],
     const auto bias = DQ::Bias(Config::kHighPrecision);
     const VectorType bias2{bias, bias};
 
-    for (int m = 0; m < Config::kNumTileM; m++) {
+    for (int m = 0; m < Config::kWarpTilesM; m++) {
         // Compute C^T = B^T * A so that the actual accumulation results
         // are in row-major.
         for (int j = 0; j < 4; j++) {
@@ -111,11 +111,12 @@ template <class Config> struct WarpPartitionMatmul {
             typename Config::ThreadAccum *__restrict__ acc, unsigned stage,
             unsigned wid, unsigned wtid) {
         const unsigned warp_row_k = Partition::AccRowK(wid),
-                       warp_col_n = Partition::WarpColN(wid);
+                       warp_col_n = Partition::WarpColN(wid),
+                       warp_row_m = Partition::WarpRowM(wid);
 
         uint4 qw;
         unsigned short packed_scales;
-        uint4 va[Config::kNumTileM][kBatchA];
+        uint4 va[Config::kWarpTilesM][kBatchA];
 
         static_assert(
             Config::kGroupK / Config::kLayoutM / Partition::kPartitionK > 0,
@@ -131,6 +132,7 @@ template <class Config> struct WarpPartitionMatmul {
                     *shm_buf, stage, warp_row_k * kWarpTileK + i,
                     warp_col_n * kWarpTileN + j, wtid);
                 LayoutA::FetchRegisters(va, shm_buf->data[stage].a,
+                                        warp_row_m * Config::kWarpTilesM,
                                         warp_row_k * kWarpTileK + i, wtid);
                 LayoutB::FetchRegisters(&qw, shm_buf->data[stage].b,
                                         warp_col_n * kWarpTileN + j,

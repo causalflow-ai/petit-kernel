@@ -33,54 +33,44 @@ WriteResult(float alpha, typename ShmBuf<Config>::Layout *__restrict__ shm_buf,
                 .config = BufferResource::kDataFormatU32Config,
             },
     };
-
-#pragma unroll
-    for (int q = 0, m_tile_idx = 0;
-         q < tal::CeilingDiv(Config::kNumTileM, ShmBuf<Config>::kResultMTiles);
-         q++, m_tile_idx += ShmBuf<Config>::kResultMTiles) {
-        if (acc_row == 0) {
-            for (int i = m_tile_idx; i < Config::kNumTileM; i++) {
-                for (int j = 0; j < Config::kThreadAccumTileNRegs; j++) {
-                    VectorType v[2];
-                    for (int l = 0; l < 2; l++) {
-                        float2 f2 =
-                            reinterpret_cast<const float2 *>(&acc[i][j])[l];
-                        if constexpr (kHasAlpha) {
-                            float2 alpha2{alpha, alpha};
-                            f2 = amdgcn_pk_mul_f32(f2, alpha2);
-                        }
-                        if constexpr (kIsHalf) {
-                            v[l] = __float22half2_rn(f2);
-                        } else {
-                            v[l] = __float22bfloat162_rn(f2);
-                        }
+    if (acc_row == 0) {
+        for (int i = 0; i < Config::kWarpTilesM; i++) {
+            for (int j = 0; j < Config::kThreadAccumTileNRegs; j++) {
+                VectorType v[2];
+                for (int l = 0; l < 2; l++) {
+                    float2 f2 = reinterpret_cast<const float2 *>(&acc[i][j])[l];
+                    if constexpr (kHasAlpha) {
+                        float2 alpha2{alpha, alpha};
+                        f2 = amdgcn_pk_mul_f32(f2, alpha2);
                     }
-                    unsigned row = wtid % 16 + i * Config::kTile;
-                    unsigned col =
-                        wtid / 16 + j * 4 + wid * Config::kLayoutN / 4;
-                    shm_buf->result[row * kGroupN / 4 + col] =
-                        *reinterpret_cast<const uint2 *>(&v);
+                    if constexpr (kIsHalf) {
+                        v[l] = __float22half2_rn(f2);
+                    } else {
+                        v[l] = __float22bfloat162_rn(f2);
+                    }
                 }
+                unsigned row = wtid % 16 + i * Config::kTile +
+                               Config::kGroupM / Config::WP::kPartitionM *
+                                   Config::WP::WarpRowM(wid);
+                unsigned col = wtid / 16 + j * 4 +
+                               Config::WP::WarpColN(wid) * Config::kGroupN /
+                                   Config::WP::kPartitionN / 4;
+                shm_buf->result[row * kGroupN / 4 + col] =
+                    *reinterpret_cast<const uint2 *>(&v);
             }
         }
-        __syncthreads();
+    }
+    __syncthreads();
 
-        for (unsigned i = 0, idx = tid;
-             i < tal::CeilingDiv(kGroupM * kGroupN / kResultVecSize,
-                                 kThreads) &&
-             idx < kGroupM * kGroupN / kResultVecSize;
-             i++, idx += kThreads) {
-            unsigned row = idx / (kGroupN / kResultVecSize) + m_tile_idx,
-                     col = idx % (kGroupN / kResultVecSize);
-            uint4 v = reinterpret_cast<const uint4 *>(shm_buf->result)[idx];
-            br.Store((row * n / kResultVecSize + col) * sizeof(uint4), 0,
-                     BufferResource::kNone, v);
-        }
-
-        if (q + 1 <
-            tal::CeilingDiv(Config::kNumTileM, ShmBuf<Config>::kResultMTiles)) {
-            __syncthreads();
-        }
+    for (unsigned i = 0, idx = tid;
+         i < tal::CeilingDiv(kGroupM * kGroupN / kResultVecSize, kThreads) &&
+         idx < kGroupM * kGroupN / kResultVecSize;
+         i++, idx += kThreads) {
+        unsigned row = idx / (kGroupN / kResultVecSize),
+                 col = idx % (kGroupN / kResultVecSize);
+        uint4 v = reinterpret_cast<const uint4 *>(shm_buf->result)[idx];
+        br.Store((row * n / kResultVecSize + col) * sizeof(uint4), 0,
+                 BufferResource::kNone, v);
     }
 }
 
