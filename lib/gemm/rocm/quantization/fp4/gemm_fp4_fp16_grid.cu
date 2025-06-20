@@ -43,6 +43,10 @@ struct GEMMFp4Fp16Config {
     static constexpr unsigned kGroupK = TS::kGroupK;
 
     static constexpr unsigned kNumWarps = WP::kNumWarps;
+    static constexpr unsigned kWarpTilesM = kNumTileM / WP::kPartitionM;
+    static constexpr unsigned kWarpTilesN = kNumTileN / WP::kPartitionN;
+    static constexpr unsigned kWarpTilesK =
+        tal::CeilingDiv(kGroupK / kGroupSize, WP::kPartitionK);
     static constexpr unsigned kThreads = WP::kThreads;
 
     static constexpr unsigned kMmaM = 16;
@@ -55,7 +59,7 @@ struct GEMMFp4Fp16Config {
 
     static constexpr unsigned kThreadAccumTileNRegs =
         kNumTileN / WP::kPartitionN / (kMmaN / kTile);
-    using ThreadAccum = float4[kNumTileM][kThreadAccumTileNRegs];
+    using ThreadAccum = float4[kWarpTilesM][kThreadAccumTileNRegs];
 
     static_assert(kThreadAccumTileNRegs > 0, "");
     static_assert(kGroupK % kLayoutM == 0,
@@ -336,14 +340,17 @@ template <> struct MfmaElementTypes<MatmulMfmaType::kMatmulMfmaTypeFp8> {
     using ElementA = uchar;
 };
 
-template <SolutionId id, unsigned kNumWarps> struct ConfigSelector {
+template <SolutionId id> struct ConfigSelector {
     static constexpr unsigned kGroupSize = 16;
     static constexpr unsigned kNumTilesM = id.tile_m;
     static constexpr unsigned kNumTilesN = id.tile_n;
     static constexpr unsigned kNumTilesK = id.tile_k * 4;
     static constexpr unsigned kPipelineStages = id.pipeline + 1;
+    static constexpr unsigned kPartitionM = id.warp_partition_m;
     static constexpr unsigned kPartitionN = id.warp_partition_n;
     static constexpr unsigned kPartitionK = id.warp_partition_k;
+    static constexpr unsigned kNumWarps =
+        kPartitionM * kPartitionN * kPartitionK;
     static constexpr MatmulMfmaType kMfmaType = id.mfma_type;
     static constexpr bool kHighPrecision =
         id.features & kMatmulFeatures_HighPrecision;
@@ -351,7 +358,7 @@ template <SolutionId id, unsigned kNumWarps> struct ConfigSelector {
     using ElementA = MfmaElementTypes<kMfmaType>::ElementA;
     using TS =
         TileShape<ElementA, kGroupSize, kNumTilesM, kNumTilesN, kNumTilesK>;
-    using WP = WarpPartition<kNumWarps, kPartitionN, kPartitionK>;
+    using WP = WarpPartition<kPartitionM, kPartitionN, kPartitionK>;
     using Config = GEMMFp4Fp16Config<TS, WP, kPipelineStages, kHighPrecision>;
     using ArchMma = MmaSelector<typename Config::ElementA, kHighPrecision>;
     using DQ = ArchMma::DQ;
@@ -411,8 +418,7 @@ class Dispatcher {
              [](unsigned *c, const unsigned *a, const unsigned *b,
                 const unsigned *scales, float global_scale, const unsigned m,
                 const unsigned n, const unsigned k, hipStream_t stream) {
-                 static constexpr unsigned kNumWarps = 4;
-                 using Trait = ConfigSelector<sols, kNumWarps>;
+                 using Trait = ConfigSelector<sols>;
                  return Trait::Invoke(c, a, b, scales, global_scale, m, n, k,
                                       stream);
              }}...};
