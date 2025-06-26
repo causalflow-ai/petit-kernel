@@ -44,9 +44,9 @@ template <class Config> struct MatrixALayout {
 
     template <unsigned kReadBatchA>
     __device__ static void
-    FetchRegisters(uint4 va[Config::kNumTileM][kReadBatchA],
-                   const Shm &__restrict__ shm, unsigned tile_idx_k,
-                   unsigned wtid);
+    FetchRegisters(uint4 va[Config::kWarpTileM][kReadBatchA],
+                   const Shm &__restrict__ shm, unsigned tile_idx_m,
+                   unsigned tile_idx_k, unsigned wtid);
 };
 
 template <class Config> struct MatrixBLayout {
@@ -110,10 +110,6 @@ template <class Config> struct ShmBuf {
         tal::CeilingDiv(kGroupK, Config::kGroupSize);
     static constexpr unsigned kVecSize = Config::kVecSize;
 
-    static constexpr unsigned kResultMTiles = std::min<unsigned>(
-        Config::kNumTileM,
-        kMaxShmSize / (kGroupN * sizeof(half) * Config::kTile));
-
     using LayoutA = MatrixALayout<Config>;
     using LayoutB = MatrixBLayout<Config>;
     using LayoutScale = ScaleLayout<Config>;
@@ -140,7 +136,7 @@ template <class Config> struct ShmBuf {
 
     using Layout = union {
         Data data[Config::kStages];
-        uint2 result[kResultMTiles * Config::kTile * kGroupN / 4];
+        uint2 result[Config::kGroupM * Config::kGroupN / 4];
         ReductionStorage red;
     };
 };
@@ -195,15 +191,14 @@ MatrixALayout<Config>::StoreShared(const uint4 reg_a[kLoadGlobalA],
 
 template <class Config>
 template <unsigned kReadBatchA>
-__device__ void
-MatrixALayout<Config>::FetchRegisters(uint4 va[Config::kNumTileM][kReadBatchA],
-                                      const Shm &__restrict__ shm,
-                                      unsigned tile_idx_k, unsigned wtid) {
-    for (int tile_idx_m = 0; tile_idx_m < Config::kNumTileM; tile_idx_m++) {
+__device__ void MatrixALayout<Config>::FetchRegisters(
+    uint4 va[Config::kWarpTileM][kReadBatchA], const Shm &__restrict__ shm,
+    unsigned tile_idx_m, unsigned tile_idx_k, unsigned wtid) {
+    for (int m = 0; m < Config::kWarpTileM; m++) {
         for (int j = 0; j < kReadBatchA; j++) {
             auto shm_coord =
-                Config::ReadShmCoordA(tile_idx_m, tile_idx_k, j, wtid);
-            va[tile_idx_m][j] = shm[shm_coord];
+                Config::ReadShmCoordA(tile_idx_m + m, tile_idx_k, j, wtid);
+            va[m][j] = shm[shm_coord];
         }
     }
 }

@@ -45,6 +45,9 @@ struct GEMMFp4Fp16Config {
     static constexpr unsigned kNumWarps = WP::kNumWarps;
     static constexpr unsigned kThreads = WP::kThreads;
 
+    // The number of tiles in the m dimension that a warp is responsible to.
+    static constexpr unsigned kWarpTileM = kNumTileM / WP::kPartitionM;
+
     static constexpr unsigned kMmaM = 16;
     static constexpr unsigned kMmaN = 16;
     static constexpr unsigned kMmaTileK = kVecSize * kWarpSize / kMmaM;
@@ -55,7 +58,7 @@ struct GEMMFp4Fp16Config {
 
     static constexpr unsigned kThreadAccumTileNRegs =
         kNumTileN / WP::kPartitionN / (kMmaN / kTile);
-    using ThreadAccum = float4[kNumTileM][kThreadAccumTileNRegs];
+    using ThreadAccum = float4[kWarpTileM][kThreadAccumTileNRegs];
 
     static_assert(kThreadAccumTileNRegs > 0, "");
     static_assert(kGroupK % kLayoutM == 0,
@@ -286,7 +289,6 @@ __launch_bounds__(Config::kThreads) __global__
 
     const unsigned tid = threadIdx.x, gid_m = blockIdx.x, gid_n = blockIdx.y;
     const unsigned wid = tid / kWarpSize, wtid = tid % kWarpSize;
-    const unsigned acc_row = Config::WP::AccRowK(wid);
 
     __shared__ typename ShmBuf<Config>::Layout shm_buf;
     using ThreadAccum = Config::ThreadAccum;
@@ -318,8 +320,8 @@ __launch_bounds__(Config::kThreads) __global__
     uint4 *c_ptr = C + gid_m * n * (kGroupM / kResultVecSize) +
                    gid_n * (kGroupN / kResultVecSize);
 
-    WriteResult<Config, true>(global_scale, &shm_buf, acc, c_ptr, acc_row, tid,
-                              tile_m, n);
+    WriteResult<Config, true>(global_scale, &shm_buf, acc, c_ptr, tid, tile_m,
+                              n);
 }
 
 template <MatmulMfmaType kMfmaType> struct MfmaElementTypes;
@@ -336,12 +338,13 @@ template <> struct MfmaElementTypes<MatmulMfmaType::kMatmulMfmaTypeFp8> {
     using ElementA = uchar;
 };
 
-template <SolutionId id, unsigned kNumWarps> struct ConfigSelector {
+template <SolutionId id> struct ConfigSelector {
     static constexpr unsigned kGroupSize = 16;
     static constexpr unsigned kNumTilesM = id.tile_m;
     static constexpr unsigned kNumTilesN = id.tile_n;
     static constexpr unsigned kNumTilesK = id.tile_k * 4;
     static constexpr unsigned kPipelineStages = id.pipeline + 1;
+    static constexpr unsigned kPartitionM = id.warp_partition_m;
     static constexpr unsigned kPartitionN = id.warp_partition_n;
     static constexpr unsigned kPartitionK = id.warp_partition_k;
     static constexpr MatmulMfmaType kMfmaType = id.mfma_type;
@@ -351,11 +354,13 @@ template <SolutionId id, unsigned kNumWarps> struct ConfigSelector {
     using ElementA = MfmaElementTypes<kMfmaType>::ElementA;
     using TS =
         TileShape<ElementA, kGroupSize, kNumTilesM, kNumTilesN, kNumTilesK>;
-    using WP = WarpPartition<kNumWarps, kPartitionN, kPartitionK>;
+    using WP = WarpPartition<kPartitionM, kPartitionN, kPartitionK>;
     using Config = GEMMFp4Fp16Config<TS, WP, kPipelineStages, kHighPrecision>;
     using ArchMma = MmaSelector<typename Config::ElementA, kHighPrecision>;
     using DQ = ArchMma::DQ;
     using DS = ArchMma::DS;
+
+    static constexpr unsigned kNumWarps = WP::kNumWarps;
 
     static int Invoke(unsigned *c, const unsigned *a, const unsigned *b,
                       const unsigned *scales, float global_scale,
@@ -411,8 +416,7 @@ class Dispatcher {
              [](unsigned *c, const unsigned *a, const unsigned *b,
                 const unsigned *scales, float global_scale, const unsigned m,
                 const unsigned n, const unsigned k, hipStream_t stream) {
-                 static constexpr unsigned kNumWarps = 4;
-                 using Trait = ConfigSelector<sols, kNumWarps>;
+                 using Trait = ConfigSelector<sols>;
                  return Trait::Invoke(c, a, b, scales, global_scale, m, n, k,
                                       stream);
              }}...};
