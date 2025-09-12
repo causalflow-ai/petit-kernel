@@ -7,10 +7,11 @@ from .ops import PetitSolutionHints
 
 class DataType(enum.Enum):
     int4 = 0
-    float8_e4m3fn = 1
-    float4_e2m1 = 2
-    float16 = 3
-    bfloat16 = 4
+    float8_e4m3 = 1
+    float8_e5m2fn = 2
+    float4_e2m1 = 3
+    float16 = 4
+    bfloat16 = 5
 
 
 def repack_nvfp4(qw: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
@@ -45,7 +46,7 @@ def get_fp4_solutions(
 __all__ = [
     "repack_nvfp4",
     "process_nvfp4_scales",
-    "mul_fp4_a16",
+    "mul_nvfp4_a16",
     "get_fp4_solutions",
     "DataType",
     "PetitSolutionHints",

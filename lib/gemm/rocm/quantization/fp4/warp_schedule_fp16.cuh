@@ -10,8 +10,6 @@ namespace causalflow::petit::rocm::quantization::fp4 {
 template <class ElementA, bool kHighPrecision> struct MmaSelector;
 
 template <bool kHighPrecision> struct MmaSelector<__half, kHighPrecision> {
-    using DQ = Dequantizer<half2, kDataTypeFp4e2m1>;
-    using DS = DequantizerForFp8Scale<half2, !kHighPrecision>;
     using UDQ = UnifiedDequantizerForFp4Fp16<kHighPrecision>;
 
     __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {
@@ -21,8 +19,6 @@ template <bool kHighPrecision> struct MmaSelector<__half, kHighPrecision> {
 
 template <bool kHighPrecision>
 struct MmaSelector<__hip_bfloat16, kHighPrecision> {
-    using DQ = Dequantizer<__hip_bfloat162, kDataTypeFp4e2m1>;
-    using DS = DequantizerForFp8Scale<__hip_bfloat162, !kHighPrecision>;
     using UDQ = UnifiedDequantizerForFp4Bf16<kHighPrecision>;
 
     __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {

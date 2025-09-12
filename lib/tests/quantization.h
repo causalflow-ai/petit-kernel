@@ -61,6 +61,7 @@ class GemmMPTestData {
         case DataType::kDataTypeBf16:
             return 2;
         case DataType::kDataTypeFp8e4m3:
+        case DataType::kDataTypeFp8e5m2Fnuz:
             return 1;
         default:
             throw std::runtime_error("Invalid quant data type");

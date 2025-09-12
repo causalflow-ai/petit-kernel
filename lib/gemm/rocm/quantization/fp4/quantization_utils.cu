@@ -134,8 +134,13 @@ __device__ static unsigned PetitFormat(unsigned v) {
             off_d = off_s + 4;
         }
         unsigned u = (v >> (i * 4)) & 0xf;
-        unsigned sgn = u >> 3;
         unsigned val = u & 0x7;
+
+        // Change negative zero to positive zero as in MI300x natively
+        // supports e5m2fnuz where 0x80 will be incorrectly dequantized to NaN
+        // in Petit.
+        unsigned sgn = val == 0 ? 0 : u >> 3;
+
         if (i >= 4) {
             val = __builtin_bitreverse32(val) >> 29;
         }

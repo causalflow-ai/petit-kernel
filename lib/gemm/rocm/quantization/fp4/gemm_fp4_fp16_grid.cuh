@@ -464,8 +464,8 @@ __launch_bounds__(Config::kThreads) __global__
                            MultiStagePipeline<Config>>;
     using ArchMma =
         MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
-    using DS = ArchMma::DS;
-    float global_scale = *global_scale_ptr * DS::GlobalScaleFactor();
+    float global_scale =
+        *global_scale_ptr * ArchMma::UDQ::DS::GlobalScaleFactor();
 
     [[assume(tid < Config::kThreads)]];
 
@@ -528,8 +528,6 @@ template <SolutionId id> struct ConfigSelector {
     using WP = WarpPartition<kPartitionM, kPartitionN, kPartitionK>;
     using Config = GEMMFp4Fp16Config<TS, WP, kPipelineStages, kHighPrecision>;
     using ArchMma = MmaSelector<typename Config::ElementA, kHighPrecision>;
-    using DQ = ArchMma::DQ;
-    using DS = ArchMma::DS;
 
     static constexpr unsigned kNumWarps = WP::kNumWarps;
 

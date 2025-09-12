@@ -1,9 +1,28 @@
 #include "quantization.h"
 #include "utils/monad_runner.h"
 #include "utils/test_utils.h"
+#include <functional>
 #include <random>
 
 namespace causalflow::petit::tests::quantization {
+
+// Change negative zero to positive zero in packed petit fp4 format
+static unsigned MaskNegativeZeroOnPetitFp4Format(unsigned v) {
+    for (unsigned i = 0; i < 4; ++i) {
+        unsigned shift = i * 8;
+        unsigned mask = 0x8e << shift;
+        unsigned nan = 0x80 << shift;
+        unsigned mask_rev = 0x71 << shift;
+        unsigned nan_rev = 0x01 << shift;
+        if ((v & mask) == nan) {
+            v &= ~mask;
+        }
+        if ((v & mask_rev) == nan_rev) {
+            v &= ~mask_rev;
+        }
+    }
+    return v;
+}
 
 void GenerateQuantizedWeightsFp4(unsigned m, unsigned n, unsigned k,
                                  unsigned group_size,
@@ -22,7 +41,9 @@ void GenerateQuantizedWeightsFp4(unsigned m, unsigned n, unsigned k,
 
         return (sgn << 7) | (exp << 3) | mantissa;
     };
-    auto gen_q = [&]() { return dist_q(gen); };
+    auto gen_q = [&]() {
+        return MaskNegativeZeroOnPetitFp4Format(dist_q(gen));
+    };
 
     FillRandomValue(gen_fp8_e4m3_fnuz, scales);
     FillRandomValue(gen_q, qweights);
@@ -120,7 +141,14 @@ absl::Status GemmMPTestData::GenerateScales(std::mt19937 *gen) {
 
 absl::Status GemmMPTestData::GenerateQWeights(std::mt19937 *gen) {
     std::uniform_int_distribution<unsigned> dist_q(0, UINT_MAX);
-    auto gen_q = [&]() { return dist_q(*gen); };
+    std::function<unsigned()> gen_q;
+    if (type_b_ == DataType::kDataTypeFp4e2m1) {
+        gen_q = [&]() {
+            return MaskNegativeZeroOnPetitFp4Format(dist_q(*gen));
+        };
+    } else {
+        gen_q = [&]() { return dist_q(*gen); };
+    }
     FillRandomValue(gen_q, &h_qweights_);
     return absl::OkStatus();
 }
