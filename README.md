@@ -22,7 +22,7 @@ Petit provides python APIs for matrix multiplications that are intended to be in
 
 ## Techniques and Evaluations
 
-Petit adopts the core ideas from [Marlin](https://github.com/IST-DASLab/marlin.git) and tailors the ideas optimizations for the throughput-oriented CDNA2 and CDNA3 architectures. Detailed information about these optimizations is available in a separate article.
+Similar to [Marlin](https://github.com/IST-DASLab/marlin.git), Petit performs offline weight shuffling to enable efficient GPU dequantization. To achieve optimal performance, Petit utilizes ranged buffer loads and vector instructions specifically designed for CDNA2 and CDNA3 architectures. These optimizations are based on the assumptions that scales remain positive and quantized weights contain no negative zeros. For detailed information about these optimizations, please refer to the documentation available [here](https://www.causalflow.ai/blogs/2025-08-optimizing-fp4-mixed-precision-inference-on-amd-gpus).
 
 Petit is optimized for the real-world use cases where the LLM engines perform inferences with small batches. For example, Petit is 1.2x-2.2x faster compared to [hipBLASLt](https://rocm.docs.amd.com/projects/hipBLASLt/en/latest) when performing BF16 matrix multiplications when batch size less than 16. For larger batches where the performance is bound by the available computational powers, Petit performs within 70% of the hand-optimized hipBLASLt library.
 

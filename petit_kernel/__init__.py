@@ -11,7 +11,7 @@ class DataType(enum.Enum):
     float4_e2m1 = 2
     float16 = 3
     bfloat16 = 4
-
+    float8_e5m2fn = 5
 
 def repack_nvfp4(qw: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
     return ops.repack_nvfp4(qw, size_n, size_k)
@@ -45,7 +45,7 @@ def get_fp4_solutions(
 __all__ = [
     "repack_nvfp4",
     "process_nvfp4_scales",
-    "mul_fp4_a16",
+    "mul_nvfp4_a16",
     "get_fp4_solutions",
     "DataType",
     "PetitSolutionHints",
