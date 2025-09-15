@@ -1,4 +1,5 @@
 #include "quantization.h"
+#include "tests/floating_points.h"
 #include "utils/monad_runner.h"
 #include "utils/test_utils.h"
 #include <functional>
@@ -24,29 +25,40 @@ static unsigned MaskNegativeZeroOnPetitFp4Format(unsigned v) {
     return v;
 }
 
+// Upscale fp8e4m3 to e5m3 to avoid denormals. The output is still in 8 bits.
+static unsigned char UpscaleFp8e4m3ToE5m3(cpu_numeric::fp8_e4m3_t e4m3) {
+    static constexpr unsigned kScaleBias = 7;
+    // Adjust for scale bias
+    float fp32_val = e4m3.to_fp32() * (1 << kScaleBias);
+    // Use fp16 e5m10 representation to adjust exponent
+    cpu_numeric::fp16_t fp16_val = cpu_numeric::fp16_t::from_fp32(fp32_val);
+    uint16_t bits16 = fp16_val.to_bits();
+    // Extract the e5m3 representation
+    return (bits16 >> 7) & 0xff;
+}
+
 void GenerateQuantizedWeightsFp4(unsigned m, unsigned n, unsigned k,
                                  unsigned group_size,
                                  std::vector<unsigned> *qweights,
                                  std::span<unsigned char> scales) {
     std::mt19937 gen(42);
-    std::uniform_int_distribution<unsigned> dist(0, 255 / 2);
-    std::uniform_int_distribution<unsigned> dist_q(0, UINT_MAX);
-    // Limit the range of the input and scale so that the final results will
-    // stay in fp16. The generated values do not have NaN.
-    auto gen_fp8_e4m3_fnuz = [&]() {
-        auto v = dist(gen);
-        unsigned sgn = 0;
-        unsigned mantissa = v & 0x7;
-        unsigned exp = ((v & 0x18) >> 3) + 8;
 
-        return (sgn << 7) | (exp << 3) | mantissa;
-    };
+    std::uniform_int_distribution<unsigned> dist_q(0, UINT_MAX);
     auto gen_q = [&]() {
         return MaskNegativeZeroOnPetitFp4Format(dist_q(gen));
     };
-
-    FillRandomValue(gen_fp8_e4m3_fnuz, scales);
     FillRandomValue(gen_q, qweights);
+
+    // All valid positive values for E4M3 format
+    std::uniform_int_distribution<unsigned> dist(
+        std::numeric_limits<cpu_numeric::fp8_e4m3_t>::denorm_min().to_bits(),
+        std::numeric_limits<cpu_numeric::fp8_e4m3_t>::max().to_bits());
+    auto gen_scale_fp8_e5m3 = [&]() {
+        return UpscaleFp8e4m3ToE5m3(
+            cpu_numeric::fp8_e4m3_t::from_bits(dist(gen)));
+    };
+
+    FillRandomValue(gen_scale_fp8_e5m3, scales);
 }
 
 GemmMPTestData::GemmMPTestData(hal::Device *dev, DataType type_a,
@@ -104,9 +116,14 @@ absl::Status GemmMPTestData::GenerateInputs(std::mt19937 *gen) {
 absl::Status GemmMPTestData::GenerateScales(std::mt19937 *gen) {
     if (type_b_ == DataType::kDataTypeFp4e2m1) {
         h_scales_.resize(k_ / group_size_ * n_ * sizeof(unsigned char));
-        std::uniform_int_distribution<unsigned> dist(1, 196);
-        // FIXME: Do we need to make sure the scale is sufficiently small?
-        auto gen_scale_fp8_e5m3 = [&]() { return dist(*gen); };
+        std::uniform_int_distribution<unsigned> dist(
+            std::numeric_limits<cpu_numeric::fp8_e4m3_t>::denorm_min()
+                .to_bits(),
+            std::numeric_limits<cpu_numeric::fp8_e4m3_t>::max().to_bits());
+        auto gen_scale_fp8_e5m3 = [&]() {
+            return UpscaleFp8e4m3ToE5m3(
+                cpu_numeric::fp8_e4m3_t::from_bits(dist(*gen)));
+        };
         FillRandomValue(
             gen_scale_fp8_e5m3,
             std::span(reinterpret_cast<unsigned char *>(h_scales_.data()),
