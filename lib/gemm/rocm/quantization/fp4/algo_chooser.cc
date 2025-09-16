@@ -72,10 +72,6 @@ unsigned long ChooseDefaultFp4Fp16Solution(unsigned m, unsigned n, unsigned k,
         const unsigned tile_m_b = b.tile_m * kTile;
         bool is_small_m = m <= 64;
 
-        if (a.pipeline != b.pipeline) {
-            return a.pipeline > b.pipeline;
-        }
-
         if (is_small_m) {
             if (a.tile_m != b.tile_m) {
                 unsigned delta_a = std::abs(static_cast<int>(m % tile_m_a) -

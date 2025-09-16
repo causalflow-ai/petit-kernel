@@ -248,63 +248,33 @@ __device__ static void LoadGlobal(PipelineContext &ctx, unsigned n, unsigned k,
 template <class Config, class PipelineContext>
 __device__ static void
 StoreShm(const PipelineContext &ctx,
-         typename ShmBuf<Config>::Layout *__restrict__ shm_buf, unsigned stage,
-         unsigned tid) {
+         typename ShmBuf<Config>::Data *__restrict__ shm_data,
+         unsigned stage_reg, unsigned tid) {
     using LayoutA = MatrixALayout<Config>;
     using LayoutB = MatrixBLayout<Config>;
     using LayoutScale = ScaleLayout<Config>;
 
-    LayoutA::StoreShared(ctx.reg_a[stage], tid, &shm_buf->data[stage].a);
-    LayoutB::StoreShared(ctx.reg_b[stage], tid, &shm_buf->data[stage].b);
-    LayoutScale::StoreScaleShm(ctx.reg_packed_scales[stage], tid,
-                               &shm_buf->data[stage].scales[0]);
+    LayoutA::StoreShared(ctx.reg_a[stage_reg], tid, &shm_data->a);
+    LayoutB::StoreShared(ctx.reg_b[stage_reg], tid, &shm_data->b);
+    LayoutScale::StoreScaleShm(ctx.reg_packed_scales[stage_reg], tid,
+                               &shm_data->scales[0]);
 }
-
-template <class Config> struct SingleStagePipeline {
-    using LayoutA = MatrixALayout<Config>;
-    using LayoutB = MatrixBLayout<Config>;
-    using Matmul = WPMatmul<Config>;
-    using ThreadAccum = Config::ThreadAccum;
-
-    static constexpr unsigned kStages = 1;
-    static constexpr unsigned kGroupK = Config::kGroupK;
-    static constexpr unsigned kGroupSize = Config::kGroupSize;
-
-    template <class PipelineContext>
-    __device__ static void
-    Run(ThreadAccum *__restrict__ acc,
-        typename ShmBuf<Config>::Layout *__restrict__ shm_buf,
-        PipelineContext &ctx, unsigned n, unsigned k, unsigned wid,
-        unsigned wtid, unsigned tid) {
-        const unsigned k_total = k / kGroupK;
-
-        unsigned curr_stage = 0;
-        for (unsigned k_idx = 0; k_idx < k_total; k_idx++) {
-            LoadGlobal<Config, PipelineContext>(ctx, n, k, curr_stage, wid,
-                                                tid);
-            StoreShm<Config, PipelineContext>(ctx, shm_buf, curr_stage, tid);
-            ctx.AdvanceGlobalPtr();
-            __syncthreads();
-
-            Matmul matmul(shm_buf, curr_stage, wid, wtid);
-            matmul.Compute(acc);
-            __syncthreads();
-        }
-    }
-};
 
 template <class Config> struct MultiStagePipeline {
     using Matmul = WPMatmul<Config>;
     using WP = Config::WP;
     using ThreadAccum = Config::ThreadAccum;
+    using Shm = ShmBuf<Config>;
 
-    static constexpr unsigned kStages = 2;
+    static constexpr bool kSingleBuffer = Shm::kSingleBuffer;
+    static constexpr unsigned kStages = Config::kStages;
+    static_assert(kStages == 2, "Only supports 2 stages");
+
     static constexpr unsigned kGroupK = Config::kGroupK;
     static constexpr unsigned kGroupSize = Config::kGroupSize;
 
     __device__ static void HotLoopScheduler() {
         static constexpr int kSchedGroupId = 0;
-        using Shm = ShmBuf<Config>;
         static constexpr unsigned kLoadGlobalA = Shm::LayoutA::kLoadGlobalA;
         static constexpr unsigned kLoadGlobalB = Shm::LayoutB::kLoadGlobalB;
         static constexpr unsigned kLoadScale = Shm::LayoutScale::kLoadScale;
@@ -351,11 +321,10 @@ template <class Config> struct MultiStagePipeline {
     }
 
     template <class PipelineContext>
-    __device__ static void
-    Run(ThreadAccum *__restrict__ acc,
-        typename ShmBuf<Config>::Layout *__restrict__ shm_buf,
-        PipelineContext &ctx, unsigned n, unsigned k, unsigned wid,
-        unsigned wtid, unsigned tid) {
+    __device__ static void Run(ThreadAccum *__restrict__ acc,
+                               typename Shm::Layout *__restrict__ shm_buf,
+                               PipelineContext &ctx, unsigned n, unsigned k,
+                               unsigned wid, unsigned wtid, unsigned tid) {
         const unsigned k_total = k / kGroupK;
 
         unsigned curr_stage = 0;
@@ -364,7 +333,7 @@ template <class Config> struct MultiStagePipeline {
         __builtin_amdgcn_sched_barrier(0x7dfu);
 
         __builtin_amdgcn_s_waitcnt(0 | (7 << 4) | (15 << 8));
-        StoreShm<Config, PipelineContext>(ctx, shm_buf, curr_stage, tid);
+        StoreShm<Config, PipelineContext>(ctx, &shm_buf->data[0], 0, tid);
 
         if (k_total > 1) {
             ctx.AdvanceGlobalPtr();
@@ -375,7 +344,10 @@ template <class Config> struct MultiStagePipeline {
 
         typename Matmul::DataA a;
         typename Matmul::DataB b;
-        Matmul matmul_0(shm_buf, 0, wid, wtid), matmul_1(shm_buf, 1, wid, wtid);
+        // For single buffer pipeline, two matmuls shared the same shared memory
+        // stage.
+        Matmul matmul_0(shm_buf, 0, wid, wtid);
+        Matmul matmul_1(shm_buf, kSingleBuffer ? 0 : 1, wid, wtid);
 
         unsigned k_idx = 0;
         for (; k_idx + 3 < k_total; k_idx += 2) {
@@ -385,8 +357,20 @@ template <class Config> struct MultiStagePipeline {
 
             matmul_0.Prefetch(&a, &b);
             LoadGlobal<Config, PipelineContext>(ctx, n, k, 0, wid, tid);
-            StoreShm<Config, PipelineContext>(ctx, shm_buf, 1, tid);
-            matmul_0.PipelineCompute(&a, &b, acc);
+            // For single buffer pipeline, we separate the two stages with
+            // `syncthreads` to avoid read-write hazard.
+            // For double buffer pipeline, we overlap the `StoreShm` with the
+            // `PipelineCompute` of the last matmul for latency hiding.
+            if constexpr (kSingleBuffer) {
+                matmul_0.PipelineCompute(&a, &b, acc);
+                __syncthreads();
+                StoreShm<Config, PipelineContext>(ctx, &shm_buf->data[0], 1,
+                                                  tid);
+            } else {
+                StoreShm<Config, PipelineContext>(ctx, &shm_buf->data[1], 1,
+                                                  tid);
+                matmul_0.PipelineCompute(&a, &b, acc);
+            }
 
             HotLoopScheduler();
 
@@ -395,8 +379,16 @@ template <class Config> struct MultiStagePipeline {
 
             matmul_1.Prefetch(&a, &b);
             LoadGlobal<Config, PipelineContext>(ctx, n, k, 1, wid, tid);
-            StoreShm<Config, PipelineContext>(ctx, shm_buf, 0, tid);
-            matmul_1.PipelineCompute(&a, &b, acc);
+            if constexpr (kSingleBuffer) {
+                matmul_1.PipelineCompute(&a, &b, acc);
+                __syncthreads();
+                StoreShm<Config, PipelineContext>(ctx, &shm_buf->data[0], 0,
+                                                  tid);
+            } else {
+                StoreShm<Config, PipelineContext>(ctx, &shm_buf->data[0], 0,
+                                                  tid);
+                matmul_1.PipelineCompute(&a, &b, acc);
+            }
 
             HotLoopScheduler();
         }
@@ -408,7 +400,7 @@ template <class Config> struct MultiStagePipeline {
             }
             ctx.AdvanceGlobalPtr();
             __syncthreads();
-            Matmul matmul(shm_buf, curr_stage, wid, wtid);
+            Matmul matmul(shm_buf, kSingleBuffer ? 0 : curr_stage, wid, wtid);
             matmul.Prefetch(&a, &b);
 
             if (k_idx + i + 2 < k_total) {
@@ -416,12 +408,23 @@ template <class Config> struct MultiStagePipeline {
                                                     tid);
             }
 
-            if (k_idx + i + 1 < k_total) {
-                StoreShm<Config, PipelineContext>(ctx, shm_buf, next_stage,
-                                                  tid);
+            if constexpr (kSingleBuffer) {
+                matmul.PipelineCompute(&a, &b, acc);
+
+                if (k_idx + i + 1 < k_total) {
+                    __syncthreads();
+                    StoreShm<Config, PipelineContext>(ctx, &shm_buf->data[0],
+                                                      next_stage, tid);
+                }
+            } else {
+                if (k_idx + i + 1 < k_total) {
+                    StoreShm<Config, PipelineContext>(
+                        ctx, &shm_buf->data[next_stage], next_stage, tid);
+                }
+
+                matmul.PipelineCompute(&a, &b, acc);
             }
 
-            matmul.PipelineCompute(&a, &b, acc);
             curr_stage = next_stage;
             next_stage = curr_stage ^ 1;
         }
@@ -459,9 +462,7 @@ __launch_bounds__(Config::kThreads) __global__
 
     __shared__ typename ShmBuf<Config>::Layout shm_buf;
     using ThreadAccum = Config::ThreadAccum;
-    using Pipeline =
-        std::conditional_t<Config::kStages == 1, SingleStagePipeline<Config>,
-                           MultiStagePipeline<Config>>;
+    using Pipeline = MultiStagePipeline<Config>;
     using ArchMma =
         MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
     float global_scale =
@@ -514,7 +515,7 @@ template <SolutionId id> struct ConfigSelector {
     static constexpr unsigned kNumTilesM = id.tile_m;
     static constexpr unsigned kNumTilesN = id.tile_n;
     static constexpr unsigned kNumTilesK = id.tile_k * 4;
-    static constexpr unsigned kPipelineStages = id.pipeline + 1;
+    static constexpr unsigned kPipelineStages = 2;
     static constexpr unsigned kPartitionM = id.warp_partition_m;
     static constexpr unsigned kPartitionN = id.warp_partition_n;
     static constexpr unsigned kPartitionK = id.warp_partition_k;

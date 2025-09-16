@@ -16,7 +16,6 @@ namespace rocm {
 using causalflow::petit::rocm::quantization::MatmulElementB;
 using causalflow::petit::rocm::quantization::MatmulFeatures;
 using causalflow::petit::rocm::quantization::MatmulMfmaType;
-using causalflow::petit::rocm::quantization::MatmulPipeline;
 using causalflow::petit::rocm::quantization::MatmulWarpPartition;
 using causalflow::petit::rocm::quantization::PetitSolutionHints;
 using causalflow::petit::rocm::quantization::SolutionId;

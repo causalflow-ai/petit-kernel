@@ -11,11 +11,6 @@ enum MatmulFeatures {
     kMatmulFeatures_HighPrecision = 1 << 1,
 };
 
-enum MatmulPipeline {
-    kMatmulPipeline_1,
-    kMatmulPipeline_2,
-};
-
 enum MatmulElementB {
     kMatmulTypeBInt4,
     kMatmulTypeBFp4,
@@ -40,14 +35,13 @@ struct SolutionId {
     // number of K tiles / 4 as the unit is 64
     unsigned tile_k : 8;
     MatmulFeatures features : 4;
-    MatmulPipeline pipeline : 4;
     MatmulElementB element_b : 4;
     MatmulMfmaType mfma_type : 4;
     unsigned warp_partition_m : 4;
     unsigned warp_partition_n : 4;
     unsigned warp_partition_k : 4;
     MatmulWarpPartition warp_partition : 4;
-    unsigned padding : 8;
+    unsigned padding : 12;
 
     constexpr unsigned long Repr() const {
         return *(const unsigned long *)(this);
@@ -59,43 +53,51 @@ struct SolutionId {
             .tile_n = static_cast<unsigned int>((repr >> 8) & 0xff),
             .tile_k = static_cast<unsigned int>((repr >> 16) & 0xff),
             .features = static_cast<MatmulFeatures>((repr >> 24) & 0xf),
-            .pipeline = static_cast<MatmulPipeline>((repr >> 28) & 0xf),
-            .element_b = static_cast<MatmulElementB>((repr >> 32) & 0xf),
-            .mfma_type = static_cast<MatmulMfmaType>((repr >> 36) & 0xf),
-            .warp_partition_m = static_cast<unsigned int>((repr >> 40) & 0xf),
-            .warp_partition_n = static_cast<unsigned int>((repr >> 44) & 0xf),
-            .warp_partition_k = static_cast<unsigned int>((repr >> 48) & 0xf),
+            .element_b = static_cast<MatmulElementB>((repr >> 28) & 0xf),
+            .mfma_type = static_cast<MatmulMfmaType>((repr >> 32) & 0xf),
+            .warp_partition_m = static_cast<unsigned int>((repr >> 36) & 0xf),
+            .warp_partition_n = static_cast<unsigned int>((repr >> 40) & 0xf),
+            .warp_partition_k = static_cast<unsigned int>((repr >> 44) & 0xf),
             .warp_partition =
-                static_cast<MatmulWarpPartition>((repr >> 52) & 0xf),
+                static_cast<MatmulWarpPartition>((repr >> 48) & 0xf),
             .padding = 0,
         };
     }
 
     static constexpr SolutionId
-    MultiStage(MatmulPipeline pipeline, MatmulFeatures features,
-               MatmulElementB element_b, MatmulMfmaType mfma_type,
-               unsigned tile_m, unsigned tile_n, unsigned tile_k,
-               MatmulWarpPartition warp_partition, unsigned warp_partition_m,
-               unsigned warp_partition_n, unsigned warp_partition_k) {
-        return SolutionId{tile_m,           tile_n,           tile_k / 4,
-                          features,         pipeline,         element_b,
-                          mfma_type,        warp_partition_m, warp_partition_n,
-                          warp_partition_k, warp_partition,   0};
+    MultiStage(MatmulFeatures features, MatmulElementB element_b,
+               MatmulMfmaType mfma_type, unsigned tile_m, unsigned tile_n,
+               unsigned tile_k, MatmulWarpPartition warp_partition,
+               unsigned warp_partition_m, unsigned warp_partition_n,
+               unsigned warp_partition_k) {
+        return SolutionId{
+            .tile_m = tile_m,
+            .tile_n = tile_n,
+            .tile_k = tile_k / 4,
+            .features = features,
+            .element_b = element_b,
+            .mfma_type = mfma_type,
+            .warp_partition_m = warp_partition_m,
+            .warp_partition_n = warp_partition_n,
+            .warp_partition_k = warp_partition_k,
+            .warp_partition = warp_partition,
+            .padding = 0,
+        };
     }
 
     static constexpr SolutionId Default() {
         return SolutionId{
-            1,
-            4,
-            2,
-            kMatmulFeatures_Grid,
-            kMatmulPipeline_2,
-            kMatmulTypeBFp4,
-            kMatmulMfmaTypeFp16,
-            1,
-            2,
-            2,
-            kMatmulWarpPartition_NK,
+            .tile_m = 1,
+            .tile_n = 4,
+            .tile_k = 2,
+            .features = kMatmulFeatures_Grid,
+            .element_b = kMatmulTypeBFp4,
+            .mfma_type = kMatmulMfmaTypeFp16,
+            .warp_partition_m = 1,
+            .warp_partition_n = 2,
+            .warp_partition_k = 2,
+            .warp_partition = kMatmulWarpPartition_NK,
+            .padding = 0,
         };
     }
 };

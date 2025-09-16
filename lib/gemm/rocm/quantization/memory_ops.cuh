@@ -134,6 +134,8 @@ template <class Config> struct ShmBuf {
     using Data = std::conditional_t<Config::kUseZeroPoints && Config::kZpInShm,
                                     DataWithZP, DataWithoutZP>;
 
+    static constexpr bool kSingleBuffer = sizeof(Data) * 2 > kMaxShmSize;
+
     static constexpr unsigned kMaxResultMTilePerPartition = std::min<unsigned>(
         Config::kWarpTileM,
         kMaxShmSize /
@@ -146,7 +148,7 @@ template <class Config> struct ShmBuf {
         tal::CeilingDiv(Config::kWarpTileM, kMaxResultMTilePerPartition);
 
     using Layout = union {
-        Data data[Config::kStages];
+        Data data[kSingleBuffer ? 1 : 2];
         uint2 result[kResultMTilePerPartition * Config::WP::kPartitionM *
                      Config::kTile * Config::kGroupN / 4];
         ReductionStorage red;

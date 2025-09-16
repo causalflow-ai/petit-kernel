@@ -52,24 +52,6 @@ static constexpr TSWP kTSWP[] = {
     {16, 16, 4, 2, 2, 1},
 };
 
-static MatmulPipeline GetPipelineStage(const TSWP &tswp) {
-    static constexpr unsigned kSizeHalf = sizeof(unsigned short);
-    static constexpr unsigned kGroupSize = 16;
-    static constexpr unsigned kMaxShmSize = 65536;
-    unsigned shm_size = tswp.tile_m * kTile * tswp.tile_k * kTile * kSizeHalf +
-                        tswp.tile_n * kTile * tswp.tile_k * kTile / 2 +
-                        tswp.tile_n * kTile * tswp.tile_k * kTile / kGroupSize;
-    if (shm_size > kMaxShmSize) {
-        throw std::runtime_error(fmt::format(
-            "Out of shared memory: {}x{}x{}, minimum shared memory: {}",
-            tswp.tile_m, tswp.tile_n, tswp.tile_k, shm_size));
-    } else if (shm_size <= kMaxShmSize / 2) {
-        return MatmulPipeline::kMatmulPipeline_2;
-    } else {
-        return MatmulPipeline::kMatmulPipeline_1;
-    }
-}
-
 static std::vector<SolutionId> FromTSWPList() {
     std::vector<SolutionId> solutions;
     for (const auto &tswp : kTSWP) {
@@ -80,7 +62,7 @@ static std::vector<SolutionId> FromTSWPList() {
                 tswp.tile_m * kTile, tswp.tile_n * kTile, kLayoutM, kLayoutN));
         }
         solutions.push_back(SolutionId::MultiStage(
-            GetPipelineStage(tswp), MatmulFeatures::kMatmulFeatures_Grid,
+            MatmulFeatures::kMatmulFeatures_Grid,
             MatmulElementB::kMatmulTypeBFp4,
             MatmulMfmaType::kMatmulMfmaTypeFp16, tswp.tile_m, tswp.tile_n,
             tswp.tile_k, MatmulWarpPartition::kMatmulWarpPartition_NK,

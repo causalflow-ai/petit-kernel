@@ -216,43 +216,33 @@ void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
 }
 
 static inline constexpr SolutionId
-Fp4MNK(int features, MatmulPipeline pipeline, MatmulMfmaType mfma_type,
-       unsigned tile_m, unsigned tile_n, unsigned tile_k, unsigned partition_m,
-       unsigned partition_n, unsigned partition_k) {
-    return SolutionId::MultiStage(pipeline, (MatmulFeatures)features,
-                                  MatmulElementB::kMatmulTypeBFp4, mfma_type,
-                                  tile_m, tile_n, tile_k,
-                                  MatmulWarpPartition::kMatmulWarpPartition_NK,
-                                  partition_m, partition_n, partition_k);
+Fp4MNK(int features, MatmulMfmaType mfma_type, unsigned tile_m, unsigned tile_n,
+       unsigned tile_k, unsigned partition_m, unsigned partition_n,
+       unsigned partition_k) {
+    return SolutionId::MultiStage(
+        (MatmulFeatures)features, MatmulElementB::kMatmulTypeBFp4, mfma_type,
+        tile_m, tile_n, tile_k, MatmulWarpPartition::kMatmulWarpPartition_NK,
+        partition_m, partition_n, partition_k);
 }
 
 static inline SolutionId Fp4Bf16(unsigned tile_m, unsigned tile_n,
                                  unsigned tile_k, unsigned partition_m,
                                  unsigned partition_n, unsigned partition_k) {
-    static constexpr unsigned kSizeHalf = sizeof(unsigned short);
-    static constexpr unsigned kGroupSize = 16;
-    static constexpr unsigned kTile = 16;
-    static constexpr unsigned kMaxShmSize = 65536;
-    unsigned shm_size = tile_m * kTile * tile_k * kTile * kSizeHalf +
-                        tile_n * kTile * tile_k * kTile / 2 +
-                        tile_n * kTile * tile_k * kTile / kGroupSize;
-    MatmulPipeline pipeline = shm_size > kMaxShmSize / 2
-                                  ? MatmulPipeline::kMatmulPipeline_1
-                                  : MatmulPipeline::kMatmulPipeline_2;
 
-    return Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid, pipeline,
+    return Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid,
                   MatmulMfmaType::kMatmulMfmaTypeBf16, tile_m, tile_n, tile_k,
                   partition_m, partition_n, partition_k);
 }
 
-static inline constexpr SolutionId
-Fp4Hp(MatmulPipeline pipeline, MatmulMfmaType mfma_type, unsigned tile_m,
-      unsigned tile_n, unsigned tile_k, unsigned partition_m,
-      unsigned partition_n, unsigned partition_k) {
+static inline constexpr SolutionId Fp4Hp(MatmulMfmaType mfma_type,
+                                         unsigned tile_m, unsigned tile_n,
+                                         unsigned tile_k, unsigned partition_m,
+                                         unsigned partition_n,
+                                         unsigned partition_k) {
     return Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid |
                       MatmulFeatures::kMatmulFeatures_HighPrecision,
-                  pipeline, mfma_type, tile_m, tile_n, tile_k, partition_m,
-                  partition_n, partition_k);
+                  mfma_type, tile_m, tile_n, tile_k, partition_m, partition_n,
+                  partition_k);
 }
 
 #define TEST_BF16(m, n, k, partition_m, partition_n, partition_k)                   \
@@ -268,14 +258,12 @@ Fp4Hp(MatmulPipeline pipeline, MatmulMfmaType mfma_type, unsigned tile_m,
 // loss of precision
 TEST_F(GemmFp4Fp16Test, TestGemm16x32x256Fp16HighPrecision) {
     TestGemm(16, 64, 256, 1.0f,
-             Fp4Hp(MatmulPipeline::kMatmulPipeline_2,
-                   MatmulMfmaType::kMatmulMfmaTypeFp16, 1, 2, 16, 1, 1, 4));
+             Fp4Hp(MatmulMfmaType::kMatmulMfmaTypeFp16, 1, 2, 16, 1, 1, 4));
 }
 
 TEST_F(GemmFp4Fp16Test, TestGemm16x32x256Bf16HighPrecision) {
     TestGemm(16, 64, 256, 1.0f,
-             Fp4Hp(MatmulPipeline::kMatmulPipeline_2,
-                   MatmulMfmaType::kMatmulMfmaTypeBf16, 1, 2, 16, 1, 1, 4));
+             Fp4Hp(MatmulMfmaType::kMatmulMfmaTypeBf16, 1, 2, 16, 1, 1, 4));
 }
 
 TEST_BF16(64, 32, 128, 4, 1, 1)
@@ -318,13 +306,21 @@ TEST_BF16(192, 256, 64, 2, 2, 1)
 TEST_BF16(224, 256, 64, 2, 2, 1)
 TEST_BF16(256, 256, 64, 2, 2, 1)
 
-TEST_F(GemmFp4Fp16Test, TestGemm_32x32x256_2x1x2_Pipeline) {
+TEST_F(GemmFp4Fp16Test, TestGemm_32x32x256_2x1x2_Pipeline_DoubleBuffer) {
     for (auto k : {512, 768, 1024}) {
         TestGemm(32, 32, k, 1.0f,
                  Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid,
-                        MatmulPipeline::kMatmulPipeline_2,
                         MatmulMfmaType::kMatmulMfmaTypeBf16, 2, 2, 16, 2, 1,
                         2));
+    }
+}
+
+TEST_F(GemmFp4Fp16Test, TestGemm_256x256x64_2x2x1_Pipeline_SingleBuffer) {
+    for (auto k : {512, 768, 1024}) {
+        TestGemm(256, 256, k, 1.0f,
+                 Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid,
+                        MatmulMfmaType::kMatmulMfmaTypeBf16, 16, 16, 4, 2, 2,
+                        1));
     }
 }
 
