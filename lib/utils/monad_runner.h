@@ -9,7 +9,7 @@ template <class T> class MonadRunner {
     template <class Func, typename... Args>
     MonadRunner &Run(const Func &func, Args &&...args) {
         if (code_ == okay_) {
-            auto t = std::bind(func, std::forward<Args>(args)...);
+            auto t = std::bind_front(func, std::forward<Args>(args)...);
             code_ = t();
         }
         return *this;

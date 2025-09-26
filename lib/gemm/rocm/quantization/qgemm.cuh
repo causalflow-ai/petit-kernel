@@ -180,8 +180,8 @@ WriteResult(float alpha, typename ShmBuf<Config>::Layout *__restrict__ shm_buf,
                 Op::WriteBackIdxToCoord(idx, m_tile_base, &row, &col);
 
                 uint4 v = reinterpret_cast<const uint4 *>(shm_buf->result)[idx];
-                br.Store((row * n / kResultVecSize + col) * sizeof(uint4), 0,
-                         BufferResource::kNone, v);
+                br.Store<BufferResource::kNone>(
+                    (row * n / kResultVecSize + col) * sizeof(uint4), 0, v);
             }
         }
 

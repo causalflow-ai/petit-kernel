@@ -100,21 +100,23 @@ union BufferResource {
         unsigned config;
     } v;
 
-    __device__ inline uint4 Load(int voffset, int soffset, int aux) const {
+    template <int kAux>
+    __device__ inline uint4 Load(int voffset, int soffset) const {
         v4i v =
-            llvm_amdgcn_raw_buffer_load_v4i32(content, voffset, soffset, aux);
+            llvm_amdgcn_raw_buffer_load_v4i32(content, voffset, soffset, kAux);
         return *reinterpret_cast<const uint4 *>(&v);
     }
 
-    __device__ inline void Store(int voffset, int soffset, int aux,
-                                 uint4 data) const {
+    template <int kAux>
+    __device__ inline void Store(int voffset, int soffset, uint4 data) const {
         v4i v = *reinterpret_cast<const v4i *>(&data);
-        llvm_amdgcn_raw_buffer_store_v4i32(v, content, voffset, soffset, aux);
+        llvm_amdgcn_raw_buffer_store_v4i32(v, content, voffset, soffset, kAux);
     }
 
-    __device__ inline uint2 LoadU64(int voffset, int soffset, int aux) const {
+    template <int kAux>
+    __device__ inline uint2 LoadU64(int voffset, int soffset) const {
         v2i v =
-            llvm_amdgcn_raw_buffer_load_v2i32(content, voffset, soffset, aux);
+            llvm_amdgcn_raw_buffer_load_v2i32(content, voffset, soffset, kAux);
         return *reinterpret_cast<const uint2 *>(&v);
     }
 };

@@ -361,7 +361,7 @@ template <class Config> struct MultiStagePipeline {
         unsigned curr_stage = 0;
         unsigned next_stage = curr_stage ^ 1;
         LoadGlobal<Config, PipelineContext>(ctx, n, k, curr_stage, wid, tid);
-        __builtin_amdgcn_sched_barrier(~0x20);
+        __builtin_amdgcn_sched_barrier(0x7dfu);
 
         __builtin_amdgcn_s_waitcnt(0 | (7 << 4) | (15 << 8));
         StoreShm<Config, PipelineContext>(ctx, shm_buf, curr_stage, tid);

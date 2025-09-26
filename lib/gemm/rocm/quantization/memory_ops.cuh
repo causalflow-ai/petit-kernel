@@ -180,8 +180,8 @@ __device__ void MatrixALayout<Config>::FetchGlobal(const BufferResource &r_a,
          ++i, idx += kThreads) {
         unsigned row = idx / (kGroupK / kVecSize),
                  col = idx % (kGroupK / kVecSize);
-        reg_a[i] = r_a.Load((row * k / kVecSize + col) * sizeof(uint4), 0,
-                            BufferResource::kNone);
+        reg_a[i] = r_a.Load<BufferResource::kNone>(
+            (row * k / kVecSize + col) * sizeof(uint4), 0);
     }
 }
 
@@ -244,10 +244,10 @@ __device__ void MatrixBLayout<Config>::FetchGlobal(const BufferResource &r_b,
          ++i, idx += kThreads) {
         unsigned row = idx / (kLayoutM * kGroupN / kPackFactor / kQuantVecSize),
                  col = idx % (kLayoutM * kGroupN / kPackFactor / kQuantVecSize);
-        reg_b[i] =
-            r_b.Load((row * n * kLayoutM / kPackFactor / kQuantVecSize + col) *
-                         sizeof(uint4),
-                     0, BufferResource::kNone);
+        reg_b[i] = r_b.Load<BufferResource::kNone>(
+            (row * n * kLayoutM / kPackFactor / kQuantVecSize + col) *
+                sizeof(uint4),
+            0);
     }
 }
 
@@ -298,10 +298,10 @@ __device__ void ScaleLayout<Config>::FetchScale(const BufferResource &r_scale,
     for (unsigned i = 0, idx = tid; i < kLoadScale; ++i, idx += kThreads) {
         unsigned row = idx / (kLayoutM / kGroupSize * kGroupN / kScaleVecSize),
                  col = idx % (kLayoutM / kGroupSize * kGroupN / kScaleVecSize);
-        reg_scale[i] = r_scale.Load(
+        reg_scale[i] = r_scale.Load<BufferResource::kNone>(
             (row * n * kLayoutM / kGroupSize / kScaleVecSize + col) *
                 sizeof(uint4),
-            0, BufferResource::kNone);
+            0);
     }
 }
 

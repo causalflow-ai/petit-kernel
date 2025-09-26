@@ -63,8 +63,8 @@ MATCHER_P2(IsNearFp16, ref, mantissa_diff, "") {
                    std::abs(mantissa_a - mantissa_b) <= mantissa_diff);
 
     if (!result && result_listener->IsInterested()) {
-        *result_listener << "Expected float value near " << std::hex << ref
-                         << " (0x" << b_u16 << "), but got " << std::hex << arg
+        *result_listener << "Expected float value near " << std::hex << b_f
+                         << " (0x" << b_u16 << "), but got " << std::hex << a_f
                          << " (0x" << a_u16 << ")";
     }
 
