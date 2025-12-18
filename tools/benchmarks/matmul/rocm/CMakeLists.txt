@@ -1,5 +1,4 @@
 add_library(benchmark_matmul_rocm
-  matmul_rocblas.cc
   matmul_petit.cc
   matmul_hipblaslt.cc
 ) 

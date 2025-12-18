@@ -5,7 +5,6 @@
 
 namespace causalflow::petit::benchmark::matmul {
 
-std::unique_ptr<MatmulFactory> CreateMatmulFactoryRocBLASBackend();
 std::unique_ptr<MatmulFactory> CreateMatmulFactoryPetitBackend();
 std::unique_ptr<MatmulFactory> CreateMatmulFactoryHipBLASLtBackend();
 
@@ -13,7 +12,6 @@ static const std::map<std::string,
                       std::function<std::unique_ptr<MatmulFactory>()>>
     kBackends = {
 #ifdef WITH_ROCM
-        {"rocblas", CreateMatmulFactoryRocBLASBackend},
         {"hipblaslt", CreateMatmulFactoryHipBLASLtBackend},
         {"petit", CreateMatmulFactoryPetitBackend},
 #endif
