@@ -12,8 +12,11 @@ __device__ static inline __hip_bfloat162 hmul2(__hip_bfloat162 a,
                                                __hip_bfloat162 b) {
     unsigned a_u = reinterpret_cast<const unsigned &>(a);
     unsigned b_u = reinterpret_cast<const unsigned &>(b);
-    uint2 a2{(a_u & 0xffff) << 16, a_u & 0xffff0000},
-        b2{(b_u & 0xffff) << 16, b_u & 0xffff0000};
+    // Use perm to extract bf16 values into high 16 bits of each word (as f32)
+    uint2 a2{amdgcn_perm_b32(a_u, 0, 0x05040c0c),
+             amdgcn_perm_b32(a_u, 0, 0x07060c0c)},
+        b2{amdgcn_perm_b32(b_u, 0, 0x05040c0c),
+           amdgcn_perm_b32(b_u, 0, 0x07060c0c)};
     float2 r2 = amdgcn_pk_mul_f32(reinterpret_cast<float2 &>(a2),
                                   reinterpret_cast<float2 &>(b2));
     const unsigned *r2_u = reinterpret_cast<const unsigned *>(&r2);
