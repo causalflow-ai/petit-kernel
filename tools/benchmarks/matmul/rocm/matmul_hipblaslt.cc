@@ -5,6 +5,7 @@
 #include <absl/status/status.h>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <hip/hip_fp16.h>
 #include <hipblaslt/hipblaslt.h>
 
@@ -192,8 +193,17 @@ HipBLASLtStridedBatchMatmul::SetAlgorithm(AlgorithmDescriptor algo_desc) {
         auto idx = stoi(algo_desc.repr);
         algo_ = algorithms_.at(idx);
     } else if (algo_desc.tag == AlgorithmDescriptor::kOpaqueRepresentation) {
+        if (algo_desc.repr.size() != sizeof(hipblasLtMatmulAlgo_t)) {
+            return absl::InvalidArgumentError(
+                "Invalid hipBLASLt algorithm representation size");
+        }
         algo_ = *reinterpret_cast<const hipblasLtMatmulAlgo_t *>(
             algo_desc.repr.c_str());
+
+        if (algo_.max_workspace_bytes == 0 ||
+            algo_.max_workspace_bytes > kWorkspaceSize) {
+            return absl::InvalidArgumentError("Incompatible algorithm");
+        }
     }
     return absl::OkStatus();
 }
@@ -204,10 +214,14 @@ absl::Status HipBLASLtStridedBatchMatmul::EnumerateAlgorithms() {
     int num_algo_ids = 0;
     hipblasLtMatmulPreference_t preference = nullptr;
     CheckHipblasStatus(hipblasLtMatmulPreferenceCreate(&preference));
+    CheckHipblasStatus(hipblasLtMatmulPreferenceSetAttribute(
+        preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &kWorkspaceSize,
+        sizeof(kWorkspaceSize)));
     CheckHipblasStatus(hipblasLtMatmulAlgoGetHeuristic(
         handle_, matmul_desc_, layout_a_, layout_b_, layout_c_, layout_c_,
         preference, kMaxAlgorithms, algo_ids.data(), &num_algo_ids));
 
+    algorithms_.clear();
     algo_ids.resize(num_algo_ids);
     std::vector<hipblasLtMatmulAlgo_t> algos;
     for (const auto &algo : algo_ids) {
