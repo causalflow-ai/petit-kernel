@@ -11,6 +11,10 @@ int DequantPetitFp4(unsigned *output, const unsigned *input,
                     const unsigned *scales, float global_scale,
                     DataType out_type, unsigned k, unsigned n);
 
+int DequantPetitMxFp4(unsigned *output, const unsigned *input,
+                      const unsigned *scales, float global_scale,
+                      DataType out_type, unsigned k, unsigned n);
+
 template <unsigned long kRepr> struct SolutionAdapter {
     static int Invoke(unsigned *c, const unsigned *a, const unsigned *b,
                       const unsigned *scales, const float *global_scale,

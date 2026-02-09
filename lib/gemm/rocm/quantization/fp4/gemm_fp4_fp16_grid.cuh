@@ -465,8 +465,7 @@ __launch_bounds__(Config::kThreads) __global__
     using Pipeline = MultiStagePipeline<Config>;
     using ArchMma =
         MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
-    float global_scale =
-        *global_scale_ptr * ArchMma::UDQ::DS::GlobalScaleFactor();
+    float global_scale = *global_scale_ptr * ArchMma::UDQ::GlobalScaleFactor();
 
     [[assume(tid < Config::kThreads)]];
 

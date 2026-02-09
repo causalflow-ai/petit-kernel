@@ -19,7 +19,7 @@ template <bool kHighPrecision> struct MmaSelector<__half, kHighPrecision> {
 
 template <bool kHighPrecision>
 struct MmaSelector<__hip_bfloat16, kHighPrecision> {
-    using UDQ = UnifiedDequantizerForFp4Bf16<kHighPrecision>;
+    using UDQ = UnifiedDequantizerForNvFp4Bf16<kHighPrecision>;
 
     __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {
         return mma_m16n16k16_bf16(fa, fb, c);

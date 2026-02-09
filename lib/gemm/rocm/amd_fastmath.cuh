@@ -8,6 +8,30 @@
 
 namespace causalflow::petit::rocm::fastmath {
 
+template <class Scalar> struct Fp16Trait;
+
+template <> struct Fp16Trait<half> {
+    __device__ static inline float ToFloat(half value) {
+        return __half2float(value);
+    }
+
+    __device__ static inline float2 ToFloat2(half scale) {
+        const float s = ToFloat(scale);
+        return float2{s, s};
+    }
+};
+
+template <> struct Fp16Trait<__hip_bfloat16> {
+    __device__ static inline float ToFloat(__hip_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+
+    __device__ static inline float2 ToFloat2(__hip_bfloat16 scale) {
+        const float s = ToFloat(scale);
+        return float2{s, s};
+    }
+};
+
 __device__ static inline __hip_bfloat162 hmul2(__hip_bfloat162 a,
                                                __hip_bfloat162 b) {
     unsigned a_u = reinterpret_cast<const unsigned &>(a);

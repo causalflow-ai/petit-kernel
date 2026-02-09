@@ -132,6 +132,10 @@ void RepackNvFp4ToPetitFp4Weights(unsigned *output, const unsigned *input,
 void RepackNvFp4ToPetitFp4Scales(unsigned *out_scales, const unsigned *scales,
                                  unsigned in_chan, unsigned out_chan,
                                  hipStream_t stream);
+
+void RepackMxFp4ToPetitFp4Scales(unsigned *out_scales, const unsigned *scales,
+                                 unsigned in_chan, unsigned out_chan,
+                                 hipStream_t stream);
 } // namespace fp4
 
 } // namespace causalflow::petit::rocm::quantization

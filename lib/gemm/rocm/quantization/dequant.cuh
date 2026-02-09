@@ -193,6 +193,33 @@ struct DequantizerForFp8Scale<__hip_bfloat162, kIntermediateDataType, kUpscale_>
     }
 };
 
+// FIXME: Change kIntermediate type to FP8 type
+template <bool kUpscale_>
+struct DequantizerForFp8Scale<__hip_bfloat162, kDataTypeFp8e8m0, kUpscale_> {
+    __device__ static void Dequant(__hip_bfloat162 *out, unsigned short s) {
+        const unsigned lo = (s & 0xffu) << 7;
+        const unsigned hi = ((s >> 8) & 0xffu) << 23;
+        reinterpret_cast<unsigned *>(out)[0] = lo | hi;
+    }
+
+    __device__ static void DequantFullScale(__hip_bfloat162 *out,
+                                            unsigned short s) {
+        // The fp4 dequant path already compensates 2 ** 8 in high-precision
+        // mode (see UnifiedDequantizerForFp4Bf16::DequantWithScaleImplBf8Fnuz).
+        // Therefore the e8m0 scale only needs to compensate the remaining
+        // 2 ** 7 to restore fp4 values in fp32 before converting to bf16.
+        static constexpr unsigned kExpBias = kFp8ScaleBias;
+        static constexpr unsigned kExpBiasRawU32 = (kExpBias | (kExpBias << 16))
+                                                   << 7;
+        Dequant(out, s);
+        if constexpr (kUpscale_) {
+            *reinterpret_cast<unsigned *>(out) += kExpBiasRawU32;
+        }
+    }
+
+    static constexpr float GlobalScaleFactor() { return 1.0f; }
+};
+
 template <bool kHighPrecision> struct UnifiedDequantizerForFp4Fp16 {
     using UnpackedScale = half2;
     using Element = half;
@@ -205,6 +232,10 @@ template <bool kHighPrecision> struct UnifiedDequantizerForFp4Fp16 {
         UnpackedScale ds;
         DS::DequantFullScale(&ds, s);
         return ds;
+    }
+
+    static constexpr float GlobalScaleFactor() {
+        return DS::GlobalScaleFactor();
     }
 
     __device__ static void DequantWithScale(UnpackedData &out, unsigned q,
@@ -240,40 +271,32 @@ template <bool kHighPrecision> struct UnifiedDequantizerForFp4Bf16 {
                                kUseBf8 ? kDataTypeFp8e5m2Fnuz : kDataTypeFp16,
                                !kHighPrecision>;
 
-    __device__ static half2 DequantScales(unsigned short s) {
-        using FP8Scale = DequantizerForFp8Scale<half2, kDataTypeFp16, false>;
-        half2 ds;
-        FP8Scale::Dequant(&ds, s);
-        return ds;
-    }
-
+    template <class Scale>
     __device__ static void DequantWithScale(UnpackedData &out, unsigned q,
-                                            half scale) {
+                                            Scale scale) {
+        const float2 s2 = fastmath::Fp16Trait<Scale>::ToFloat2(scale);
         if constexpr (kUseBf8) {
-            DequantWithScaleImplBf8Fnuz(out, q, scale);
+            DequantWithScaleImplBf8Fnuz(out, q, s2);
         } else {
-            DequantWithScaleImplFp16(out, q, scale);
+            DequantWithScaleImplFp16(out, q, s2);
         }
     }
 
-  private:
+  protected:
     __device__ static void DequantWithScaleImplFp16(UnpackedData &out,
-                                                    unsigned q, half scale);
+                                                    unsigned q, float2 s2);
+
     __device__ static void DequantWithScaleImplBf8Fnuz(UnpackedData &out,
-                                                       unsigned q, half scale);
+                                                       unsigned q, float2 s2);
 };
 
 template <bool kHighPrecision>
 __device__ void
 UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplFp16(
-    UnpackedData &out, unsigned q, half scale) {
-
-    const float2 s2{__half2float(scale), __half2float(scale)};
-
-    // Since internallly it is FP16, the bias is the same as the FP16 bias
-    // For high precision we divide by 2 ** 7 to undo the preprocessing of
-    // the scales
-    static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2** 7
+    UnpackedData &out, unsigned q, float2 s2) {
+    // Since internally it is FP16, the bias is the same as the FP16 bias.
+    // For high precision we divide by 2 ** 7 to undo preprocessing of scales.
+    static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2 ** 7
                                                      : 0x46800000; // 2 ** 14
     const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
                             reinterpret_cast<const float &>(kBias)};
@@ -303,15 +326,11 @@ UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplFp16(
 template <bool kHighPrecision>
 __device__ void
 UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8Fnuz(
-    UnpackedData &out, unsigned q, half scale) {
+    UnpackedData &out, unsigned q, float2 s2) {
 #if defined(__gfx942__) || defined(__gfx950__)
-    const float2 s2{__half2float(scale), __half2float(scale)};
-
-    // Since internallly it is FP16, the bias is the same as the FP16 bias
-    // For high precision we divide by 2 ** 7 to undo the preprocessing of
-    // the scales
-    // The additional 1 in bias is to compensate the fnuz offset of bias (16 vs
-    // 15).
+    // Since internally it is FP16, the bias is the same as the FP16 bias.
+    // For high precision we divide by 2 ** 7 to undo preprocessing of scales.
+    // The additional 1 in bias is to compensate fnuz bias offset (16 vs 15).
     static constexpr unsigned kBias = kHighPrecision ? 0x43800000  // 2 ** 8
                                                      : 0x46800000; // 2 ** 14
     const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
@@ -342,5 +361,43 @@ UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8Fnuz(
     o[3] = amdgcn_perm_b32(out_b32[6], out_b32[4], 0x07060302);
 #endif
 }
+
+template <bool kHighPrecision>
+struct UnifiedDequantizerForMxFp4Bf16
+    : public UnifiedDequantizerForFp4Bf16<kHighPrecision> {
+    using DS = DequantizerForFp8Scale<__hip_bfloat162, kDataTypeFp8e8m0,
+                                      kHighPrecision>;
+
+    __device__ static auto DequantScales(unsigned short s) {
+        __hip_bfloat162 ds;
+        DS::DequantFullScale(&ds, s);
+        return ds;
+    }
+
+    static constexpr float GlobalScaleFactor() {
+        if constexpr (kHighPrecision) {
+            return 1.0f;
+        } else {
+            return 32768.0f;
+        }
+    }
+};
+
+template <bool kHighPrecision>
+struct UnifiedDequantizerForNvFp4Bf16
+    : public UnifiedDequantizerForFp4Bf16<kHighPrecision> {
+    using Base = UnifiedDequantizerForFp4Bf16<kHighPrecision>;
+
+    __device__ static auto DequantScales(unsigned short s) {
+        using FP8Scale = DequantizerForFp8Scale<half2, kDataTypeFp16, false>;
+        half2 ds;
+        FP8Scale::Dequant(&ds, s);
+        return ds;
+    }
+
+    static constexpr float GlobalScaleFactor() {
+        return Base::DS::GlobalScaleFactor();
+    }
+};
 
 } // namespace causalflow::petit::rocm::quantization
