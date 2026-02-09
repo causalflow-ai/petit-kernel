@@ -11,6 +11,11 @@ int SolutionAdapter<kRepr>::Invoke(unsigned *c, const unsigned *a,
                                    const unsigned n, const unsigned k,
                                    hipStream_t stream) {
     static constexpr SolutionId kSolId = SolutionId::FromRepr(kRepr);
+    if constexpr (kSolId.element_b == MatmulElementB::kMatmulTypeBMxFp4) {
+        if constexpr (kSolId.mfma_type != MatmulMfmaType::kMatmulMfmaTypeBf16) {
+            return kErrorKernelShape;
+        }
+    }
     using Impl = ConfigSelector<kSolId>;
     return Impl::Invoke(c, a, b, scales, global_scale, m, n, k, stream);
 }

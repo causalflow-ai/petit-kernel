@@ -9,6 +9,7 @@ enum DataType {
     kDataTypeFp16,
     kDataTypeBf16,
     kDataTypeFp8e5m2Fnuz,
+    kDataTypeMxFp4e2m1,
 };
 
 } // namespace causalflow::petit::rocm::quantization

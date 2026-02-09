@@ -128,6 +128,19 @@ absl::Status GemmMPTestData::GenerateScales(std::mt19937 *gen) {
             gen_scale_fp8_e5m3,
             std::span(reinterpret_cast<unsigned char *>(h_scales_.data()),
                       k_ / group_size_ * n_));
+    } else if (type_b_ == DataType::kDataTypeMxFp4e2m1) {
+        static constexpr unsigned kMxScaleMin = 1;
+        static constexpr unsigned kMxScaleNoOverflowMax = 237;
+        h_scales_.resize(k_ / group_size_ * n_ * sizeof(unsigned char));
+        std::uniform_int_distribution<unsigned> dist(kMxScaleMin,
+                                                     kMxScaleNoOverflowMax);
+        auto gen_scale_e8m0 = [&]() {
+            return static_cast<unsigned char>(dist(*gen));
+        };
+        FillRandomValue(
+            gen_scale_e8m0,
+            std::span(reinterpret_cast<unsigned char *>(h_scales_.data()),
+                      k_ / group_size_ * n_));
     } else if (type_b_ == DataType::kDataTypeInt4) {
         h_scales_.resize(k_ / group_size_ * n_ * sizeof(unsigned short));
         std::uniform_real_distribution<float> dist(0.001f, 0.01f);
@@ -159,7 +172,8 @@ absl::Status GemmMPTestData::GenerateScales(std::mt19937 *gen) {
 absl::Status GemmMPTestData::GenerateQWeights(std::mt19937 *gen) {
     std::uniform_int_distribution<unsigned> dist_q(0, UINT_MAX);
     std::function<unsigned()> gen_q;
-    if (type_b_ == DataType::kDataTypeFp4e2m1) {
+    if (type_b_ == DataType::kDataTypeFp4e2m1 ||
+        type_b_ == DataType::kDataTypeMxFp4e2m1) {
         gen_q = [&]() {
             return MaskNegativeZeroOnPetitFp4Format(dist_q(*gen));
         };

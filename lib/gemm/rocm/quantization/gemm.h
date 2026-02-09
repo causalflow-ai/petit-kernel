@@ -13,7 +13,8 @@ enum MatmulFeatures {
 
 enum MatmulElementB {
     kMatmulTypeBInt4,
-    kMatmulTypeBFp4,
+    kMatmulTypeBNvFp4,
+    kMatmulTypeBMxFp4,
 };
 
 enum MatmulMfmaType {
@@ -91,7 +92,7 @@ struct SolutionId {
             .tile_n = 4,
             .tile_k = 2,
             .features = kMatmulFeatures_Grid,
-            .element_b = kMatmulTypeBFp4,
+            .element_b = kMatmulTypeBNvFp4,
             .mfma_type = kMatmulMfmaTypeFp16,
             .warp_partition_m = 1,
             .warp_partition_n = 2,
@@ -121,6 +122,12 @@ int GemmFp4Fp16Grid(unsigned *c, const unsigned *a, const unsigned *b,
                     const unsigned m, const unsigned n, const unsigned k,
                     const PetitSolutionHints &hints, unsigned long solution_id,
                     hipStream_t stream);
+
+int GemmMxFp4Fp16Grid(unsigned *c, const unsigned *a, const unsigned *b,
+                      const unsigned *scales, const float *global_scale,
+                      const unsigned m, const unsigned n, const unsigned k,
+                      const PetitSolutionHints &hints,
+                      unsigned long solution_id, hipStream_t stream);
 
 int GemmGetSolutions(const PetitSolutionHints &hints, unsigned m, unsigned n,
                      unsigned k, SolutionId *sols, unsigned *n_sols);

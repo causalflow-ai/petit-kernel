@@ -23,6 +23,21 @@ using causalflow::petit::rocm::quantization::SolutionId;
 namespace fp4 = causalflow::petit::rocm::quantization::fp4;
 using GemmDataType = causalflow::petit::rocm::quantization::DataType;
 
+static inline GemmDataType GetFp4GemmBTypeFromGroupSize(int groupsize) {
+    if (groupsize == Matmul::kMxFp4GroupSize) {
+        return GemmDataType::kDataTypeMxFp4e2m1;
+    }
+    return GemmDataType::kDataTypeFp4e2m1;
+}
+
+static inline auto GetFp4GemmKernelFromGroupSize(int groupsize)
+    -> decltype(&fp4::GemmFp4Fp16Grid) {
+    if (groupsize == Matmul::kMxFp4GroupSize) {
+        return fp4::GemmMxFp4Fp16Grid;
+    }
+    return fp4::GemmFp4Fp16Grid;
+}
+
 class PetitMatmulFp4Base : public Matmul {
   public:
     explicit PetitMatmulFp4Base(int m, int n, int k, DataType a_type,
@@ -92,16 +107,17 @@ class PetitMatmulFp4Fp16 : public PetitMatmulFp4Base {
         : PetitMatmulFp4Base(m, n, k, a_type, groupsize) {
         auto gemm_a_type = GetGemmDataType(a_type);
         hints_.a_type = gemm_a_type;
-        hints_.b_type = GemmDataType::kDataTypeFp4e2m1;
+        hints_.b_type = GetFp4GemmBTypeFromGroupSize(groupsize_);
         hints_.c_type = gemm_a_type;
         hints_.require_high_precision = false;
     }
     using ElementA = unsigned short;
 
     absl::Status Execute(size_t repeat) override {
+        auto gemm = GetFp4GemmKernelFromGroupSize(groupsize_);
         for (size_t i = 0; i < repeat; ++i) {
             for (int b = 0; b < batch_; ++b) {
-                fp4::GemmFp4Fp16Grid(
+                gemm(
                     reinterpret_cast<unsigned *>(d_d_) +
                         b * stride_c_ / (sizeof(unsigned) / sizeof(half)),
                     reinterpret_cast<const unsigned *>(d_a_) +
@@ -129,7 +145,7 @@ PetitMatmulFp4Base::PetitMatmulFp4Base(int m, int n, int k, DataType a_type,
     GemmDataType gemm_a_type = GetGemmDataType(a_type);
     PetitSolutionHints hints;
     hints.a_type = gemm_a_type;
-    hints.b_type = GemmDataType::kDataTypeFp4e2m1;
+    hints.b_type = GetFp4GemmBTypeFromGroupSize(groupsize_);
     hints.c_type = gemm_a_type;
     hints.require_high_precision = false;
     int err = fp4::GemmGetSolutions(hints, m, n, k, available_sols_.data(),
@@ -176,6 +192,21 @@ absl::Status PetitMatmulFp4Base::PrepareForBatchExecution(
     CheckHIPStatus(hipMemcpy(d_scales_, h_scales.data(),
                              h_scales.size() * sizeof(unsigned char),
                              hipMemcpyHostToDevice));
+
+    if (groupsize_ == Matmul::kMxFp4GroupSize) {
+        unsigned *d_scales_repacked = nullptr;
+        CheckHIPStatus(hipMalloc(
+            &d_scales_repacked,
+            n_ * k_ * batch_ / groupsize_ * sizeof(unsigned char)));
+        for (int b = 0; b < batch_; ++b) {
+            fp4::RepackMxFp4ToPetitFp4Scales(
+                d_scales_repacked + b * stride_scales_ / sizeof(unsigned),
+                d_scales_ + b * stride_scales_ / sizeof(unsigned), k_, n_,
+                nullptr);
+        }
+        CheckHIPStatus(hipFree(d_scales_));
+        d_scales_ = d_scales_repacked;
+    }
     CheckHIPStatus(hipMemcpy(d_b_quant_, h_qweights.data(),
                              h_qweights.size() * sizeof(unsigned),
                              hipMemcpyHostToDevice));
@@ -204,14 +235,22 @@ class PetitMatmulFactory : public MatmulFactory {
   public:
     virtual const char *GetPlatformName() const override { return "rocm"; }
     virtual absl::Status
-    CreateMatmul(hal::Device *dev, const Matmul::DataType a_type,
-                 const Matmul::DataType c_type, int m, int n, int k,
+    CreateMatmul(hal::Device *, const Matmul::DataType a_type,
+                 const Matmul::DataType c_type, const Matmul::BType b_type,
+                 int m, int n, int k,
                  std::unique_ptr<Matmul> *result) override {
         if ((a_type == Matmul::DataType::kFp16 &&
              c_type == Matmul::DataType::kFp16) ||
             (a_type == Matmul::DataType::kBf16 &&
              c_type == Matmul::DataType::kBf16)) {
-            *result = std::make_unique<PetitMatmulFp4Fp16>(m, n, k, 16, a_type);
+            auto groupsize = Matmul::GetFp4GroupSize(b_type);
+            if (!groupsize.has_value()) {
+                return absl::InvalidArgumentError(
+                    "Invalid btype for petit backend. Expected nvfp4 or "
+                    "mxfp4");
+            }
+            *result =
+                std::make_unique<PetitMatmulFp4Fp16>(m, n, k, *groupsize, a_type);
         } else {
             return absl::InvalidArgumentError(
                 "Invalid combination of input and output types");

@@ -17,13 +17,14 @@ int GemmGetSolutions(const PetitSolutionHints &hints, unsigned m, unsigned n,
     static constexpr unsigned kSolTileK = kTile * 4;
 
     unsigned sol_count = 0;
-    if (hints.b_type != DataType::kDataTypeFp4e2m1) {
+    if (hints.b_type != DataType::kDataTypeFp4e2m1 &&
+        hints.b_type != DataType::kDataTypeMxFp4e2m1) {
         return -1;
     }
 
     for (const auto &entries : SolutionMap::GetDispatchEntries()) {
         const auto &sol = reinterpret_cast<const SolutionId &>(entries.first);
-        if (sol.element_b != MatmulElementB::kMatmulTypeBFp4) {
+        if (sol.element_b != MatmulElementB::kMatmulTypeBNvFp4) {
             continue;
         }
 
@@ -36,12 +37,21 @@ int GemmGetSolutions(const PetitSolutionHints &hints, unsigned m, unsigned n,
         if ((sol.mfma_type == MatmulMfmaType::kMatmulMfmaTypeFp16 &&
              hints.a_type == DataType::kDataTypeFp16) ||
             (sol.mfma_type == MatmulMfmaType::kMatmulMfmaTypeBf16 &&
-             hints.a_type == DataType::kDataTypeBf16)) {
+                 hints.a_type == DataType::kDataTypeBf16)) {
+            if (hints.b_type == DataType::kDataTypeMxFp4e2m1 &&
+                sol.mfma_type != MatmulMfmaType::kMatmulMfmaTypeBf16) {
+                continue;
+            }
             unsigned group_n = sol.tile_n * kTile,
                      group_k = sol.tile_k * kSolTileK;
             if (n % group_n == 0 && k % group_k == 0) {
                 if (sols && sol_count < *n_sols) {
-                    sols[sol_count] = sol;
+                    auto final_sol = sol;
+                    final_sol.element_b =
+                        hints.b_type == DataType::kDataTypeMxFp4e2m1
+                            ? MatmulElementB::kMatmulTypeBMxFp4
+                            : MatmulElementB::kMatmulTypeBNvFp4;
+                    sols[sol_count] = final_sol;
                 }
                 sol_count++;
             }
@@ -59,12 +69,18 @@ unsigned long ChooseDefaultFp4Fp16Solution(unsigned m, unsigned n, unsigned k,
         unsigned group_n = sol.tile_n * kTile, group_k = sol.tile_k * 64;
         bool not_high_precision =
             (sol.features & MatmulFeatures::kMatmulFeatures_HighPrecision) == 0;
+        bool disallow_mxfp4_fp16 =
+            hints.b_type == DataType::kDataTypeMxFp4e2m1 &&
+            sol.mfma_type != MatmulMfmaType::kMatmulMfmaTypeBf16;
         return (hints.require_high_precision ^ not_high_precision) &&
                ((sol.mfma_type == MatmulMfmaType::kMatmulMfmaTypeFp16 &&
                  hints.a_type == DataType::kDataTypeFp16) ||
                 (sol.mfma_type == MatmulMfmaType::kMatmulMfmaTypeBf16 &&
                  hints.a_type == DataType::kDataTypeBf16)) &&
-               n % group_n == 0 && k % group_k == 0;
+               n % group_n == 0 && k % group_k == 0 &&
+               !disallow_mxfp4_fp16 &&
+               (hints.b_type != DataType::kDataTypeMxFp4e2m1 ||
+                k % 32 == 0);
     };
 
     auto is_better = [&](const SolutionId &a, const SolutionId &b) {
@@ -108,7 +124,11 @@ unsigned long ChooseDefaultFp4Fp16Solution(unsigned m, unsigned n, unsigned k,
             best_sol = sol;
         }
     }
-    return best_sol.value().Repr();
+    auto final_sol = best_sol.value();
+    final_sol.element_b = hints.b_type == DataType::kDataTypeMxFp4e2m1
+                              ? MatmulElementB::kMatmulTypeBMxFp4
+                              : MatmulElementB::kMatmulTypeBNvFp4;
+    return final_sol.Repr();
 }
 
 } // namespace causalflow::petit::rocm::quantization::fp4

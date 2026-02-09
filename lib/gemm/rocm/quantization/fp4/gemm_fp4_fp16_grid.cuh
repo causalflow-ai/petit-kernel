@@ -147,10 +147,10 @@ struct GEMMFp4Fp16Config {
     static constexpr unsigned kLayoutN = WarpMatmulLayout::kLayoutN;
 
     static constexpr bool kHighPrecision = kHighPrecision_;
+    static constexpr DataType kElementBTypeId = TS::kElementBTypeId;
 
     static constexpr unsigned kVecSize = sizeof(uint4) / sizeof(ElementA);
-    static constexpr unsigned kScaleVecSize =
-        sizeof(uint4) / sizeof(unsigned char);
+    static constexpr unsigned kScaleVecSize = sizeof(uint4) / sizeof(unsigned char);
 
     static constexpr unsigned kTile = TS::kTile;
     static constexpr unsigned kNumTileM = TS::kNumTileM;
@@ -464,8 +464,10 @@ __launch_bounds__(Config::kThreads) __global__
     using ThreadAccum = Config::ThreadAccum;
     using Pipeline = MultiStagePipeline<Config>;
     using ArchMma =
-        MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
-    float global_scale = *global_scale_ptr * ArchMma::UDQ::GlobalScaleFactor();
+        MmaSelector<typename Config::ElementA, Config::kElementBTypeId,
+                                Config::kHighPrecision>;
+    float global_scale =
+        *global_scale_ptr * ArchMma::UDQ::GlobalScaleFactor();
 
     [[assume(tid < Config::kThreads)]];
 
@@ -510,7 +512,11 @@ template <> struct MfmaElementTypes<MatmulMfmaType::kMatmulMfmaTypeFp8> {
 };
 
 template <SolutionId id> struct ConfigSelector {
-    static constexpr unsigned kGroupSize = 16;
+    static constexpr DataType kElementBTypeId =
+        id.element_b == kMatmulTypeBMxFp4 ? kDataTypeMxFp4e2m1
+                                          : kDataTypeFp4e2m1;
+    static constexpr unsigned kGroupSize =
+        kElementBTypeId == kDataTypeMxFp4e2m1 ? 32 : 16;
     static constexpr unsigned kNumTilesM = id.tile_m;
     static constexpr unsigned kNumTilesN = id.tile_n;
     static constexpr unsigned kNumTilesK = id.tile_k * 4;
@@ -523,11 +529,13 @@ template <SolutionId id> struct ConfigSelector {
         id.features & kMatmulFeatures_HighPrecision;
 
     using ElementA = MfmaElementTypes<kMfmaType>::ElementA;
-    using TS =
-        TileShape<ElementA, kGroupSize, kNumTilesM, kNumTilesN, kNumTilesK>;
+    using TS = TileShape<ElementA, kElementBTypeId, kGroupSize, kNumTilesM,
+                         kNumTilesN, kNumTilesK>;
     using WP = WarpPartition<kPartitionM, kPartitionN, kPartitionK>;
     using Config = GEMMFp4Fp16Config<TS, WP, kPipelineStages, kHighPrecision>;
-    using ArchMma = MmaSelector<typename Config::ElementA, kHighPrecision>;
+    using ArchMma =
+        MmaSelector<typename Config::ElementA, kElementBTypeId,
+                    kHighPrecision>;
 
     static constexpr unsigned kNumWarps = WP::kNumWarps;
 

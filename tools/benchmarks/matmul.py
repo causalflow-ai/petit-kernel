@@ -89,6 +89,33 @@ ENTRIES = [
     (16375, 57344, 8192),
 ]
 
+ENTRIES = [
+    (16, 4096, 4096),
+    (16, 4096, 14336),
+    (16, 6144, 4096),
+    (16, 8192, 8192),
+    (16, 8192, 28672),
+    (16, 10240, 8192),
+    (16, 28672, 4096),
+    (16, 57344, 8192),
+    (256, 4096, 4096),
+    (256, 4096, 14336),
+    (256, 6144, 4096),
+    (256, 8192, 8192),
+    (256, 8192, 28672),
+    (256, 10240, 8192),
+    (256, 28672, 4096),
+    (256, 57344, 8192),
+    (512, 4096, 4096),
+    (512, 4096, 14336),
+    (512, 6144, 4096),
+    (512, 8192, 8192),
+    (512, 8192, 28672),
+    (512, 10240, 8192),
+    (512, 28672, 4096),
+    (512, 57344, 8192),
+]
+
 # Default benchmark parameters
 WARMUP = 5
 REPEAT = 20
@@ -96,6 +123,7 @@ BATCH = 1
 DEFAULT_BACKEND = "petit"
 ALGO = "tune"
 DEFAULT_ATYPE = "fp16"
+DEFAULT_BTYPE = "nvfp4"
 DEFAULT_CTYPE = "fp16"
 
 
@@ -106,6 +134,8 @@ def run_benchmark(m, n, k, args):
         f"{args.backend}",
         "-atype",
         f"{args.atype}",
+        "-btype",
+        f"{args.btype}",
         "-ctype",
         f"{args.ctype}",
         "-m",
@@ -148,6 +178,12 @@ def main():
         type=str,
         default=DEFAULT_ATYPE,
         help=f"Data type of matrix A (default: {DEFAULT_ATYPE})",
+    )
+    parser.add_argument(
+        "--btype",
+        type=str,
+        default=DEFAULT_BTYPE,
+        help=f"Data type of matrix B (default: {DEFAULT_BTYPE})",
     )
     parser.add_argument(
         "--ctype",

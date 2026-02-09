@@ -1,9 +1,10 @@
 #pragma once
 
-#include "gemm/rocm/quantization/types.h"
+#include "gemm/rocm/quantization/gemm.h"
 
 #include <functional>
 #include <hip/hip_runtime.h>
+#include <unordered_map>
 
 namespace causalflow::petit::rocm::quantization::fp4 {
 
@@ -14,6 +15,10 @@ int DequantPetitFp4(unsigned *output, const unsigned *input,
 int DequantPetitMxFp4(unsigned *output, const unsigned *input,
                       const unsigned *scales, float global_scale,
                       DataType out_type, unsigned k, unsigned n);
+
+int DequantMxFp4(unsigned *output, const unsigned *input,
+                 const unsigned *scales, float global_scale, DataType out_type,
+                 unsigned k, unsigned n);
 
 template <unsigned long kRepr> struct SolutionAdapter {
     static int Invoke(unsigned *c, const unsigned *a, const unsigned *b,

@@ -1,14 +1,16 @@
 #pragma once
 
 #include "gemm/rocm/amd_intrinsics.cuh"
+#include "gemm/rocm/quantization/types.h"
 
 namespace causalflow::petit::rocm::quantization {
 
 // The shape of tile stored in the shared memory
-template <class ElementA_, unsigned kGroupSize_, unsigned kNumTileM_,
-          unsigned kNumTileN_, unsigned kNumTileK_>
+template <class ElementA_, DataType kElementBTypeId_, unsigned kGroupSize_,
+          unsigned kNumTileM_, unsigned kNumTileN_, unsigned kNumTileK_>
 struct TileShape {
     using ElementA = ElementA_;
+    static constexpr DataType kElementBTypeId = kElementBTypeId_;
     static constexpr unsigned kTile = 16;
 
     static constexpr unsigned kNumTileM = kNumTileM_;

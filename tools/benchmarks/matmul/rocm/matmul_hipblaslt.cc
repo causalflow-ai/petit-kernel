@@ -25,6 +25,7 @@ class HipBLASLtStridedBatchMatmul : public Matmul {
     static constexpr size_t kWorkspaceSize = 32 * 1024 * 1024;
     explicit HipBLASLtStridedBatchMatmul(int m, int n, int k,
                                          const Matmul::DataType a_type,
+                                         const Matmul::DataType b_type,
                                          const Matmul::DataType c_type);
 
     absl::Status PrepareForBatchExecution(void *d, const void *a, const void *b,
@@ -65,10 +66,17 @@ class HipBLASLtMatmulFactory : public MatmulFactory {
   public:
     virtual const char *GetPlatformName() const override { return "rocm"; }
     virtual absl::Status
-    CreateMatmul(hal::Device *dev, const Matmul::DataType a_type,
-                 const Matmul::DataType c_type, int m, int n, int k,
+    CreateMatmul(hal::Device *, const Matmul::DataType a_type,
+                 const Matmul::DataType c_type, const Matmul::BType b_type,
+                 int m, int n, int k,
                  std::unique_ptr<Matmul> *result) override {
+        if (!Matmul::IsHipBLASLtCompatibleBType(b_type)) {
+            return absl::InvalidArgumentError(
+                "Invalid btype for hipblaslt backend. Expected fp16 or bf16");
+        }
+        auto b_data_type = Matmul::GetDenseBDataType(b_type);
         *result = std::make_unique<HipBLASLtStridedBatchMatmul>(m, n, k, a_type,
+                                                                *b_data_type,
                                                                 c_type);
         return absl::OkStatus();
     }
@@ -94,6 +102,7 @@ static hipDataType GetHipblasDataType(const Matmul::DataType type) {
 
 HipBLASLtStridedBatchMatmul::HipBLASLtStridedBatchMatmul(
     int m, int n, int k, const Matmul::DataType a_type,
+    const Matmul::DataType b_type,
     const Matmul::DataType c_type) {
     static constexpr hipblasOperation_t kTransposed = HIPBLAS_OP_T;
 
@@ -109,7 +118,7 @@ HipBLASLtStridedBatchMatmul::HipBLASLtStridedBatchMatmul(
     CheckHipblasStatus(hipblasLtMatrixLayoutCreate(
         &layout_a_, GetHipblasDataType(a_type), k, m, k));
     CheckHipblasStatus(hipblasLtMatrixLayoutCreate(
-        &layout_b_, GetHipblasDataType(a_type), k, n, k));
+        &layout_b_, GetHipblasDataType(b_type), k, n, k));
     CheckHipblasStatus(hipblasLtMatrixLayoutCreate(
         &layout_c_, GetHipblasDataType(c_type), n, m, n));
 

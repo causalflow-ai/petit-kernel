@@ -63,7 +63,7 @@ static std::vector<SolutionId> FromTSWPList() {
         }
         solutions.push_back(SolutionId::MultiStage(
             MatmulFeatures::kMatmulFeatures_Grid,
-            MatmulElementB::kMatmulTypeBFp4,
+            MatmulElementB::kMatmulTypeBNvFp4,
             MatmulMfmaType::kMatmulMfmaTypeFp16, tswp.tile_m, tswp.tile_n,
             tswp.tile_k, MatmulWarpPartition::kMatmulWarpPartition_NK,
             tswp.warp_partition_m, tswp.warp_partition_n,
@@ -102,10 +102,17 @@ int main(int argc, char *argv[]) {
     builder
         .Fork({[](SolutionId s) {
                    s.mfma_type = MatmulMfmaType::kMatmulMfmaTypeFp16;
+                   s.element_b = MatmulElementB::kMatmulTypeBNvFp4;
                    return s;
                },
                [](SolutionId s) {
                    s.mfma_type = MatmulMfmaType::kMatmulMfmaTypeBf16;
+                   s.element_b = MatmulElementB::kMatmulTypeBNvFp4;
+                   return s;
+               },
+               [](SolutionId s) {
+                   s.mfma_type = MatmulMfmaType::kMatmulMfmaTypeBf16;
+                   s.element_b = MatmulElementB::kMatmulTypeBMxFp4;
                    return s;
                }})
         .Fork({[](SolutionId s) {

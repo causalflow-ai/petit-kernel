@@ -7,9 +7,11 @@
 
 namespace causalflow::petit::rocm::quantization::fp4 {
 
-template <class ElementA, bool kHighPrecision> struct MmaSelector;
+template <class ElementA, DataType kElemBType, bool kHighPrecision>
+struct MmaSelector;
 
-template <bool kHighPrecision> struct MmaSelector<__half, kHighPrecision> {
+template <bool kHighPrecision>
+struct MmaSelector<__half, kDataTypeFp4e2m1, kHighPrecision> {
     using UDQ = UnifiedDequantizerForFp4Fp16<kHighPrecision>;
 
     __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {
@@ -18,8 +20,23 @@ template <bool kHighPrecision> struct MmaSelector<__half, kHighPrecision> {
 };
 
 template <bool kHighPrecision>
-struct MmaSelector<__hip_bfloat16, kHighPrecision> {
+struct MmaSelector<__half, kDataTypeMxFp4e2m1, kHighPrecision> {
+    static_assert(kHighPrecision != kHighPrecision,
+                  "MXFP4 x FP16 is unsupported");
+};
+
+template <bool kHighPrecision>
+struct MmaSelector<__hip_bfloat16, kDataTypeFp4e2m1, kHighPrecision> {
     using UDQ = UnifiedDequantizerForNvFp4Bf16<kHighPrecision>;
+
+    __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {
+        return mma_m16n16k16_bf16(fa, fb, c);
+    }
+};
+
+template <bool kHighPrecision>
+struct MmaSelector<__hip_bfloat16, kDataTypeMxFp4e2m1, kHighPrecision> {
+    using UDQ = UnifiedDequantizerForMxFp4Bf16<kHighPrecision>;
 
     __device__ static inline float4 Mma(uint2 fa, uint2 fb, float4 c) {
         return mma_m16n16k16_bf16(fa, fb, c);
@@ -33,6 +50,14 @@ FetchScalesRegs(const typename ShmBuf<Config>::Data &__restrict__ shm,
     using namespace causalflow::tal;
     static constexpr unsigned kLayoutN = Config::kLayoutN;
     static constexpr unsigned kGroupN = Config::kGroupN;
+
+    if constexpr (Config::kElementBTypeId == kDataTypeMxFp4e2m1) {
+        const unsigned lane_scale =
+            (wtid / 32) * (kLayoutN / 2) + (wtid % (kLayoutN / 2));
+        const unsigned idx = group_k * kGroupN + group_n * kLayoutN +
+                             lane_scale;
+        return reinterpret_cast<const unsigned short *>(shm.scales)[idx];
+    }
 
     using ScaleShape = Shape<_1, _1, C<kWarpSize>>;
     using ScaleStride =
@@ -131,7 +156,8 @@ template <class Config> struct WarpPartitionMatmul {
                            unsigned warp_idx_n) {
         using causalflow::tal::make_coord;
         using ArchMma =
-            MmaSelector<typename Config::ElementA, Config::kHighPrecision>;
+            MmaSelector<typename Config::ElementA, Config::kElementBTypeId,
+                        Config::kHighPrecision>;
         using UDQ = ArchMma::UDQ;
         typename Config::WarpAccumLayout accum_layout;
         typename Config::WarpMatmulRegALayout reg_a_layout;

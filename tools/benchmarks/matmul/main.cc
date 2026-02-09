@@ -11,8 +11,8 @@
 #include <fmt/core.h>
 #include <gflags/gflags.h>
 #include <memory>
-#include <optional>
 #include <random>
+#include <string_view>
 
 DEFINE_string(backend, "hipblaslt",
               "Backend to use for matmul. Available: "
@@ -30,12 +30,21 @@ DEFINE_string(atype, "fp16",
               "The type of the inputs (fp8e5m2, fp8e4m3, fp16, bf16, fp32)");
 DEFINE_string(ctype, "fp16",
               "The type of the results (fp8e5m2, fp8e4m3, fp16, bf16, fp32)");
+DEFINE_string(btype, "fp16",
+              "The type of matrix B. For petit: nvfp4/mxfp4. "
+              "For hipblaslt: fp16/bf16");
 
 using namespace causalflow::petit::benchmark;
 namespace hal = causalflow::petit::hal;
 using AlgorithmDescriptor = matmul::Matmul::AlgorithmDescriptor;
 using DataType = matmul::Matmul::DataType;
+using BType = matmul::Matmul::BType;
 using causalflow::petit::FillRandomValue;
+
+static constexpr std::string_view kSupportedDataTypes =
+    "fp8e5m2, fp8e4m3, fp16, bf16, fp32";
+static constexpr std::string_view kSupportedBTypes =
+    "fp16, bf16, nvfp4, mxfp4";
 
 class DataTypeTrait {
   public:
@@ -132,21 +141,81 @@ static inline const DataTypeTrait *ParseDataType(const std::string &data_type) {
     return nullptr;
 }
 
+static inline const DataTypeTrait *GetDataTypeTrait(DataType data_type) {
+    for (size_t i = 0; i < sizeof(kDataTypeTraits) / sizeof(kDataTypeTraits[0]);
+         ++i) {
+        if (kDataTypeTraits[i]->GetDataType() == data_type) {
+            return kDataTypeTraits[i];
+        }
+    }
+    return nullptr;
+}
+
+static inline bool IsBTypeCompatibleWithBackend(const std::string &backend,
+                                                BType b_type) {
+    if (backend == "petit") {
+        return matmul::Matmul::IsPetitCompatibleBType(b_type);
+    }
+    if (backend == "hipblaslt") {
+        return matmul::Matmul::IsHipBLASLtCompatibleBType(b_type);
+    }
+    return true;
+}
+
+static inline std::string_view GetSupportedBTypesForBackend(
+    const std::string &backend) {
+    if (backend == "petit") {
+        return "nvfp4, mxfp4";
+    }
+    if (backend == "hipblaslt") {
+        return "fp16, bf16";
+    }
+    return kSupportedBTypes;
+}
+
+static bool ValidateDataTypeFlag(const char *flagname,
+                                 const std::string &value) {
+    if (ParseDataType(value)) {
+        return true;
+    }
+    std::cerr << "Invalid value for --" << flagname << ": " << value
+              << ". Supported: " << kSupportedDataTypes << std::endl;
+    return false;
+}
+
+static bool ValidateBTypeFlag(const char *flagname, const std::string &value) {
+    auto b_type = matmul::Matmul::ParseBType(value);
+    if (!b_type.has_value()) {
+        std::cerr << "Invalid value for --" << flagname << ": " << value
+                  << ". Supported: " << kSupportedBTypes << std::endl;
+        return false;
+    }
+    return true;
+}
+
+[[maybe_unused]] static const bool kATypeFlagValidator =
+    gflags::RegisterFlagValidator(&FLAGS_atype, &ValidateDataTypeFlag);
+[[maybe_unused]] static const bool kCTypeFlagValidator =
+    gflags::RegisterFlagValidator(&FLAGS_ctype, &ValidateDataTypeFlag);
+[[maybe_unused]] static const bool kBTypeFlagValidator =
+    gflags::RegisterFlagValidator(&FLAGS_btype, &ValidateBTypeFlag);
+
 static absl::Status InitializeData(hal::Device *dev, void **d_a, void **d_b,
                                    void **d_c, const DataTypeTrait *a_type,
+                                   const DataTypeTrait *b_type,
                                    const DataTypeTrait *c_type) {
 
     const size_t a_size =
         FLAGS_m * FLAGS_k * a_type->GetTypeBits() * FLAGS_batch / 8;
     const size_t b_size =
-        FLAGS_k * FLAGS_n * a_type->GetTypeBits() * FLAGS_batch / 8;
+        FLAGS_k * FLAGS_n * b_type->GetTypeBits() * FLAGS_batch / 8;
     const size_t c_size =
         FLAGS_m * FLAGS_n * c_type->GetTypeBits() * FLAGS_batch / 8;
 
     std::mt19937 e(42);
     std::vector<unsigned char> a(a_size), b(b_size);
     a_type->FillRandom(e, a.data(), FLAGS_m * FLAGS_k);
-    a_type->FillRandom(e, b.data(), FLAGS_k * FLAGS_n);
+    b_type->FillRandom(e, b.data(), FLAGS_k * FLAGS_n);
 
     causalflow::petit::MonadRunner<absl::Status> runner(absl::OkStatus());
     runner.Run([&]() { return dev->Malloc(d_a, a_size); })
@@ -198,7 +267,7 @@ static void PrintResult(const std::string &algo,
 }
 
 static void TuneMatmul(hal::Device *dev, const DataTypeTrait *a_type,
-                       const DataTypeTrait *c_type,
+                       const DataTypeTrait *c_type, BType b_type,
                        matmul::MatmulFactory *factory, void *d_c, void *d_a,
                        void *d_b) {
     std::unique_ptr<matmul::Matmul> matmul;
@@ -206,8 +275,8 @@ static void TuneMatmul(hal::Device *dev, const DataTypeTrait *a_type,
     runner
         .Run([&]() {
             return factory->CreateMatmul(dev, a_type->GetDataType(),
-                                         c_type->GetDataType(), FLAGS_m,
-                                         FLAGS_n, FLAGS_k, &matmul);
+                                         c_type->GetDataType(), b_type,
+                                         FLAGS_m, FLAGS_n, FLAGS_k, &matmul);
         })
         .Run([&]() {
             return matmul->PrepareForBatchExecution(
@@ -259,9 +328,26 @@ int main(int argc, char *argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     auto a_type = ParseDataType(FLAGS_atype);
     auto c_type = ParseDataType(FLAGS_ctype);
-    if (!a_type || !c_type) {
-        std::cerr << "Unknown data type: " << FLAGS_atype << " or "
-                  << FLAGS_ctype << std::endl;
+    auto b_type = matmul::Matmul::ParseBType(FLAGS_btype);
+    if (!a_type || !c_type || !b_type.has_value()) {
+        std::cerr << "Invalid flags after validation" << std::endl;
+        return 1;
+    }
+    if (!IsBTypeCompatibleWithBackend(FLAGS_backend, *b_type)) {
+        std::cerr << "Invalid b type for backend '" << FLAGS_backend
+                  << "': " << FLAGS_btype << ". Supported: "
+                  << GetSupportedBTypesForBackend(FLAGS_backend) << std::endl;
+        return 1;
+    }
+
+    const DataTypeTrait *b_data_type = a_type;
+    auto dense_b_data_type = matmul::Matmul::GetDenseBDataType(*b_type);
+    if (dense_b_data_type.has_value()) {
+        b_data_type = GetDataTypeTrait(*dense_b_data_type);
+    }
+    if (!b_data_type) {
+        std::cerr << "Internal error: failed to resolve B data type trait"
+                  << std::endl;
         return 1;
     }
 
@@ -289,7 +375,8 @@ int main(int argc, char *argv[]) {
     causalflow::petit::MonadRunner<absl::Status> runner(absl::OkStatus());
 
     runner.Run([&]() {
-        return InitializeData(dev.get(), &d_a, &d_b, &d_c, a_type, c_type);
+        return InitializeData(dev.get(), &d_a, &d_b, &d_c, a_type,
+                              b_data_type, c_type);
     });
 
     if (!runner.code().ok()) {
@@ -299,7 +386,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (FLAGS_algo == "tune") {
-        TuneMatmul(dev.get(), a_type, c_type, factory.get(), d_c, d_a, d_b);
+        TuneMatmul(dev.get(), a_type, c_type, *b_type, factory.get(), d_c, d_a,
+                   d_b);
         return 0;
     }
 
@@ -316,8 +404,8 @@ int main(int argc, char *argv[]) {
     runner
         .Run([&]() {
             return factory->CreateMatmul(dev.get(), a_type->GetDataType(),
-                                         c_type->GetDataType(), FLAGS_m,
-                                         FLAGS_n, FLAGS_k, &matmul);
+                                         c_type->GetDataType(), *b_type,
+                                         FLAGS_m, FLAGS_n, FLAGS_k, &matmul);
         })
         .Run([&]() {
             return RunMatmul(&elapsed, algo, dev.get(), matmul.get(), d_c, d_a,
