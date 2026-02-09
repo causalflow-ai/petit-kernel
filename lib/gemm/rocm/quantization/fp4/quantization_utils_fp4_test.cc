@@ -137,11 +137,11 @@ class NvFp4ToPetitFp4Test : public ::testing::Test {
 // we use exhaustive testing for quantized weights and scales.
 template <class Element, unsigned kN_, unsigned kScaleRowGroupSize_>
 struct ExhaustiveDeviceContext {
-    // Ensure input data alignment to meet the dequantizer's requirements.
     static constexpr unsigned kM = 256;
     static constexpr unsigned kN = kN_;
     static constexpr unsigned kScaleRowGroupSize = kScaleRowGroupSize_;
     static constexpr unsigned kOutVecSize = sizeof(uint4) / sizeof(Element);
+
     uint4 d_weights_quant[kM * kN / kPackFactor / kQuantVecSize];
     uint4 d_scales[kM * kN / kScaleRowGroupSize / kVecSize];
     uint4 d_reference[kM * kN / kOutVecSize];
@@ -263,19 +263,26 @@ static float GenerateNvOutput(unsigned i_qweight, unsigned i_scale) {
     return scale.to_fp32() * fp4_values[qweight];
 }
 
-template <class Element>
-using NvExhaustiveDeviceContext =
-    ExhaustiveDeviceContext<Element, 128, kNvRowGroupSize>;
-template <class Element>
-using MxExhaustiveDeviceContext =
-    ExhaustiveDeviceContext<Element, 256, kMxRowGroupSize>;
-
 static constexpr uint8_t kMxScaleMin = 1;
 // e8m0 scale is converted to BF16 and multiplied by max |FP4| value (=6).
 // To avoid BF16 overflow: 6 * 2^(raw - 112) <= max_bf16, hence raw <= 237.
 static constexpr uint8_t kMxScaleNoOverflowMax = 237;
 static constexpr unsigned kMxScaleCount =
     kMxScaleNoOverflowMax - kMxScaleMin + 1;
+
+static uint8_t GenerateMxScale(unsigned row, unsigned col) {
+    // Mix row and col so any row/col permutation or transpose in scale
+    // repacking/dequantization is exposed by mismatched outputs.
+    unsigned mixed = (col + 29 * row) % kMxScaleCount;
+    return static_cast<uint8_t>(kMxScaleMin + mixed);
+}
+
+template <class Element>
+using NvExhaustiveDeviceContext =
+    ExhaustiveDeviceContext<Element, 128, kNvRowGroupSize>;
+template <class Element>
+using MxExhaustiveDeviceContext =
+    ExhaustiveDeviceContext<Element, 256, kMxRowGroupSize>;
 
 template <class Context, class RepackScalesFn, class DequantPetitFn>
 void RunPetitDequant(Context *d_ctx, float global_scale, DataType out_type,
@@ -314,9 +321,8 @@ class MxFp4DequantTest : public ::testing::Test {
                 unsigned group_i = row * kPackFactor / kMxRowGroupSize + col;
                 return GenerateQweight(group_i);
             },
-            [](unsigned, unsigned col) {
-                return static_cast<uint8_t>(kMxScaleMin +
-                                            (col % kMxScaleCount));
+            [](unsigned row, unsigned col) {
+                return GenerateMxScale(row, col);
             });
 
         ASSERT_EQ(
@@ -370,6 +376,10 @@ TEST_F(NvFp4ToPetitFp4Test, TestLayout128x16Fp16) {
 }
 
 TEST_F(MxFp4DequantTest, AllMxFp4ScaleCombinationsBf16) {
+    TestAllCombinations<bf16_t>(kDataTypeBf16);
+}
+
+TEST_F(MxFp4DequantTest, MxFp4ScaleCoverageBf16) {
     TestAllCombinations<bf16_t>(kDataTypeBf16);
 }
 

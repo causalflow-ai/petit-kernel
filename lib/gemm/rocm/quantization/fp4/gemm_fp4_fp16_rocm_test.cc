@@ -76,8 +76,14 @@ class GemmFp4Fp16Test : public ::testing::Test {
 
     void ComputeReference(GemmMPTestData *ctx) const;
     void CopyAndCompareOutput(GemmMPTestData *ctx) const;
+    void TestGemmBySolutionId(unsigned m, unsigned n, unsigned k,
+                              float global_scale, unsigned long solution_id,
+                              DataType data_type, DataType b_type,
+                              bool require_high_precision,
+                              unsigned group_size = 16);
     void TestGemm(unsigned m, unsigned n, unsigned k, float global_scale,
-                  SolutionId sol_id, DataType b_type = DataType::kDataTypeFp4e2m1,
+                  SolutionId sol_id,
+                  DataType b_type = DataType::kDataTypeFp4e2m1,
                   unsigned group_size = 16);
 
     hipblasLtHandle_t handle_;
@@ -183,18 +189,19 @@ void GemmFp4Fp16Test::CopyAndCompareOutput(GemmMPTestData *ctx) const {
     }
 }
 
-void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
-                               float global_scale, SolutionId sol_id,
-                               DataType b_type, unsigned group_size) {
+void GemmFp4Fp16Test::TestGemmBySolutionId(unsigned m, unsigned n, unsigned k,
+                                           float global_scale,
+                                           unsigned long solution_id,
+                                           DataType data_type, DataType b_type,
+                                           bool require_high_precision,
+                                           unsigned group_size) {
     const bool is_mxfp4 = b_type == DataType::kDataTypeMxFp4e2m1;
     if (is_mxfp4) {
-        ASSERT_EQ(sol_id.mfma_type, MatmulMfmaType::kMatmulMfmaTypeBf16)
-            << "MXFP4 only supports BF16 accumulation";
-        dequant_type_ = DataType::kDataTypeBf16;
-    } else if (sol_id.mfma_type == MatmulMfmaType::kMatmulMfmaTypeBf16) {
+        ASSERT_EQ(data_type, DataType::kDataTypeBf16)
+            << "MXFP4 only supports BF16 input/output type";
         dequant_type_ = DataType::kDataTypeBf16;
     } else {
-        dequant_type_ = DataType::kDataTypeFp16;
+        dequant_type_ = data_type;
     }
 
     GemmMPTestData ctx(dev_.get(), dequant_type_, b_type, m, n, k, group_size);
@@ -225,30 +232,33 @@ void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
                                 dequant_type_, k, n);
         ASSERT_EQ(err, 0) << "DequantPetitMxFp4 failed";
     } else {
-        err = DequantPetitFp4(reinterpret_cast<unsigned *>(ctx.weights()),
-                              reinterpret_cast<const unsigned *>(ctx.weights_quant()),
-                              reinterpret_cast<const unsigned *>(ctx.scales()),
-                              global_scale, dequant_type_, k, n);
+        err = DequantPetitFp4(
+            reinterpret_cast<unsigned *>(ctx.weights()),
+            reinterpret_cast<const unsigned *>(ctx.weights_quant()),
+            reinterpret_cast<const unsigned *>(ctx.scales()), global_scale,
+            dequant_type_, k, n);
         ASSERT_EQ(err, 0) << "DequantPetitFp4 failed";
     }
 
     ComputeReference(&ctx);
 
-    auto data_type = sol_id.mfma_type == MatmulMfmaType::kMatmulMfmaTypeBf16
-                         ? DataType::kDataTypeBf16
-                         : DataType::kDataTypeFp16;
     PetitSolutionHints hints;
     hints.a_type = data_type;
     hints.b_type = b_type;
     hints.c_type = data_type;
-    hints.require_high_precision =
-        sol_id.features & MatmulFeatures::kMatmulFeatures_HighPrecision;
+    hints.require_high_precision = require_high_precision;
 
-    err = GemmFp4Fp16Grid(
-        reinterpret_cast<unsigned *>(ctx.output()),
-        reinterpret_cast<const unsigned *>(ctx.input()),
-        weights_ptr, scales_ptr, d_global_scale_, m, n, k, hints, sol_id.Repr(),
-        nullptr);
+    if (is_mxfp4) {
+        err = GemmMxFp4Fp16Grid(reinterpret_cast<unsigned *>(ctx.output()),
+                                reinterpret_cast<const unsigned *>(ctx.input()),
+                                weights_ptr, scales_ptr, d_global_scale_, m, n,
+                                k, hints, solution_id, nullptr);
+    } else {
+        err = GemmFp4Fp16Grid(reinterpret_cast<unsigned *>(ctx.output()),
+                              reinterpret_cast<const unsigned *>(ctx.input()),
+                              weights_ptr, scales_ptr, d_global_scale_, m, n, k,
+                              hints, solution_id, nullptr);
+    }
     ASSERT_EQ(err, 0);
 
     if (d_petit_weights) {
@@ -261,14 +271,31 @@ void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
     CopyAndCompareOutput(&ctx);
 }
 
+void GemmFp4Fp16Test::TestGemm(unsigned m, unsigned n, unsigned k,
+                               float global_scale, SolutionId sol_id,
+                               DataType b_type, unsigned group_size) {
+    if (b_type == DataType::kDataTypeMxFp4e2m1) {
+        ASSERT_EQ(sol_id.mfma_type, MatmulMfmaType::kMatmulMfmaTypeBf16)
+            << "MXFP4 only supports BF16 accumulation";
+    }
+
+    auto data_type = sol_id.mfma_type == MatmulMfmaType::kMatmulMfmaTypeBf16
+                         ? DataType::kDataTypeBf16
+                         : DataType::kDataTypeFp16;
+    bool require_high_precision =
+        sol_id.features & MatmulFeatures::kMatmulFeatures_HighPrecision;
+    TestGemmBySolutionId(m, n, k, global_scale, sol_id.Repr(), data_type,
+                         b_type, require_high_precision, group_size);
+}
+
 static inline constexpr SolutionId
 Fp4MNK(int features, MatmulElementB element_b, MatmulMfmaType mfma_type,
        unsigned tile_m, unsigned tile_n, unsigned tile_k, unsigned partition_m,
        unsigned partition_n, unsigned partition_k) {
-    return SolutionId::MultiStage(
-        (MatmulFeatures)features, element_b, mfma_type, tile_m, tile_n, tile_k,
-        MatmulWarpPartition::kMatmulWarpPartition_NK, partition_m, partition_n,
-        partition_k);
+    return SolutionId::MultiStage((MatmulFeatures)features, element_b,
+                                  mfma_type, tile_m, tile_n, tile_k,
+                                  MatmulWarpPartition::kMatmulWarpPartition_NK,
+                                  partition_m, partition_n, partition_k);
 }
 
 static inline SolutionId Fp4Bf16(MatmulElementB element_b, unsigned tile_m,
@@ -288,9 +315,8 @@ static inline constexpr SolutionId Fp4Hp(MatmulMfmaType mfma_type,
                                          unsigned partition_k) {
     return Fp4MNK(MatmulFeatures::kMatmulFeatures_Grid |
                       MatmulFeatures::kMatmulFeatures_HighPrecision,
-                  MatmulElementB::kMatmulTypeBNvFp4,
-                  mfma_type, tile_m, tile_n, tile_k, partition_m, partition_n,
-                  partition_k);
+                  MatmulElementB::kMatmulTypeBNvFp4, mfma_type, tile_m, tile_n,
+                  tile_k, partition_m, partition_n, partition_k);
 }
 
 #define TEST_BF16(m, n, k, partition_m, partition_n, partition_k)                   \
@@ -383,6 +409,18 @@ TEST_F(GemmFp4Fp16Test, TestGemmMx_32x64x256_2x2x1) {
 TEST_F(GemmFp4Fp16Test, TestGemmMx_64x64x256_2x2x1) {
     TestGemm(64, 64, 256, 1.0f,
              Fp4Bf16(MatmulElementB::kMatmulTypeBMxFp4, 4, 4, 16, 2, 2, 1),
+             DataType::kDataTypeMxFp4e2m1, 32);
+}
+
+TEST_F(GemmFp4Fp16Test, TestGemmMx_64x128x256_NormalPrecision) {
+    TestGemm(64, 128, 256, 1.0f,
+             Fp4Bf16(MatmulElementB::kMatmulTypeBMxFp4, 2, 4, 16, 2, 2, 1),
+             DataType::kDataTypeMxFp4e2m1, 32);
+}
+
+TEST_F(GemmFp4Fp16Test, TestGemmMx_64x128x256_HighPrecision) {
+    TestGemm(64, 128, 256, 1.0f,
+             Fp4Hp(MatmulMfmaType::kMatmulMfmaTypeBf16, 2, 4, 16, 2, 2, 1),
              DataType::kDataTypeMxFp4e2m1, 32);
 }
 
