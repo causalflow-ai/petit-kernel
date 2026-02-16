@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petit_kernel"
-version = "0.0.2"
+version = "0.0.3"
 readme = "README.md"
 description = "Optimized FP4 GPU kernels for AMD GPUs"
 authors = [
@@ -28,6 +28,11 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+test = [
+  "amd-quark",
 ]
 
 [project.urls]

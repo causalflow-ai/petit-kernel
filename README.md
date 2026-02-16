@@ -1,6 +1,6 @@
 # Petit
 
-Petit provides optimized FP16/BF16 x FP4 GPU kernels specifically designed for AMD GPUs. It enables efficient execution of NVFP4 quantized models on GPUs that lack native FP4 arithmetic capabilities. This makes Petit particularly well-suited for serving high-quality NVFP4 models on standard GPUs while achieving ~3.3x memory savings. For example, a server with 8x AMD MI300x GPUs running [sglang v0.4.9.post2](https://github.com/sgl-project/sglang) can serve the [Llama-3.3-70B-Instruct](meta-llama/Llama-3.3-70B-Instruct) / [Llama-3.3-70B-Instruct-FP4](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP4) model with a MMLU score of 82.15 and 80.79 respectively.
+Petit provides optimized FP16/BF16 x FP4 GPU kernels specifically designed for AMD GPUs. It enables efficient execution of NVFP4 and MXFP4 quantized models on GPUs that lack native FP4 arithmetic capabilities. This makes Petit particularly well-suited for serving high-quality FP4 models on standard GPUs while achieving ~3.3x memory savings. For example, a server with 8x AMD MI300x GPUs running [sglang v0.4.9.post2](https://github.com/sgl-project/sglang) can serve the [Llama-3.3-70B-Instruct](meta-llama/Llama-3.3-70B-Instruct) / [Llama-3.3-70B-Instruct-FP4](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP4) model with a MMLU score of 82.15 and 80.79 respectively.
 
 ## Requirements
 
@@ -39,4 +39,3 @@ Compared to NVIDIA architectures, CDNA architectures are significantly more sens
 We thank AMD and [InnoMatrix](https://innomatrix.ai) for their generous support of providing access of the GPUs to make this project possible. Neither organization is involved in the development of the project.
 
 Petit is a very young project and we are still working on implementing various optimizations.  Please contact haohui@causalflow.ai for questions and supports. Contributions are welcome.
-
