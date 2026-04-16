@@ -295,8 +295,8 @@ template <class Config> struct MultiStagePipeline {
                 : (kInstMFMA / kInstGlobals > 6 ? 2 : 1);
 
         // Load A and first B and scales to start the pipeline
-        __builtin_amdgcn_sched_group_barrier(0x100, kInstLoadForFirstPipeline,
-                                             kSchedGroupId);
+        amdgcn_sched_group_barrier<0x100, kInstLoadForFirstPipeline,
+                                   kSchedGroupId>();
 
         // Ideal schedule order: ds_read + ds_write + buffer_load
         // The heuristics of the instruction scheduler in LLVM fails to schedule
@@ -304,20 +304,20 @@ template <class Config> struct MultiStagePipeline {
 
         // ds_write
         for (int i = 0; i < kInstGlobals; i++) {
-            __builtin_amdgcn_sched_group_barrier(0x200, 1, kSchedGroupId);
-            __builtin_amdgcn_sched_group_barrier(0x8, kInstMFMAPerLoad,
-                                                 kSchedGroupId);
+            amdgcn_sched_group_barrier<0x200, 1, kSchedGroupId>();
+            amdgcn_sched_group_barrier<0x8, kInstMFMAPerLoad,
+                                       kSchedGroupId>();
         }
 
         // buffer_load
         for (int i = 0; i < kInstGlobals; i++) {
-            __builtin_amdgcn_sched_group_barrier(0x20, 1, kSchedGroupId);
-            __builtin_amdgcn_sched_group_barrier(0x8, kInstMFMAPerLoad * 2,
-                                                 kSchedGroupId);
+            amdgcn_sched_group_barrier<0x20, 1, kSchedGroupId>();
+            amdgcn_sched_group_barrier<0x8, kInstMFMAPerLoad * 2,
+                                       kSchedGroupId>();
         }
 
         static_assert(kInstMFMAPerLoad * kInstGlobals <= kInstMFMA, "");
-        __builtin_amdgcn_sched_barrier(0);
+        amdgcn_sched_barrier<0>();
     }
 
     template <class PipelineContext>
@@ -330,7 +330,7 @@ template <class Config> struct MultiStagePipeline {
         unsigned curr_stage = 0;
         unsigned next_stage = curr_stage ^ 1;
         LoadGlobal<Config, PipelineContext>(ctx, n, k, curr_stage, wid, tid);
-        __builtin_amdgcn_sched_barrier(0x7dfu);
+        amdgcn_sched_barrier<0x7dfu>();
 
         __builtin_amdgcn_s_waitcnt(0 | (7 << 4) | (15 << 8));
         StoreShm<Config, PipelineContext>(ctx, &shm_buf->data[0], 0, tid);
@@ -351,7 +351,7 @@ template <class Config> struct MultiStagePipeline {
 
         unsigned k_idx = 0;
         for (; k_idx + 3 < k_total; k_idx += 2) {
-            __builtin_amdgcn_sched_barrier(0);
+            amdgcn_sched_barrier<0>();
             ctx.AdvanceGlobalPtr();
             __syncthreads();
 

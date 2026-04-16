@@ -259,7 +259,7 @@ template <bool kHighPrecision> struct UnifiedDequantizerForFp4Bf16 {
     using Element = __hip_bfloat16;
     using UnpackedData = __hip_bfloat162[4];
 
-#if defined(__gfx942__) || defined(__gfx950__)
+#if HAS_AMD_BF8_PACK_CONVERSION
     static constexpr bool kUseBf8 = true;
 #else
     static constexpr bool kUseBf8 = false;
@@ -327,7 +327,7 @@ template <bool kHighPrecision>
 __device__ void
 UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8Fnuz(
     UnpackedData &out, unsigned q, float2 s2) {
-#if defined(__gfx942__) || defined(__gfx950__)
+#if HAS_AMD_BF8_PACK_CONVERSION
     // Since internally it is FP16, the bias is the same as the FP16 bias.
     // For high precision we divide by 2 ** 7 to undo preprocessing of scales.
     // The additional 1 in bias is to compensate fnuz bias offset (16 vs 15).
@@ -342,8 +342,8 @@ UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8Fnuz(
     float2 out_f2[4];
     auto *out_v2f = reinterpret_cast<v2f *>(&out_f2);
     for (int i = 0; i < 2; i++) {
-        out_v2f[i * 2] = __builtin_amdgcn_cvt_pk_f32_bf8(bf8[i], false);
-        out_v2f[i * 2 + 1] = __builtin_amdgcn_cvt_pk_f32_bf8(bf8[i], true);
+        out_v2f[i * 2] = amdgcn_cvt_pk_f32_bf8<false>(bf8[i]);
+        out_v2f[i * 2 + 1] = amdgcn_cvt_pk_f32_bf8<true>(bf8[i]);
     }
 
     for (int i = 0; i < 4; i++) {
