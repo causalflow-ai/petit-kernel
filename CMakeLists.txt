@@ -48,6 +48,7 @@ find_package(fmt CONFIG REQUIRED)
 find_package(gflags CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 find_package(absl CONFIG REQUIRED)
+find_package(TBB REQUIRED COMPONENTS tbb)
 
 enable_testing()
 
