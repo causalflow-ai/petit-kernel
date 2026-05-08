@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petit_kernel"
-version = "0.0.3"
+version = "0.0.4"
 readme = "README.md"
 description = "Optimized FP4 GPU kernels for AMD GPUs"
 authors = [

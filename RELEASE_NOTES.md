@@ -2,6 +2,11 @@
 
 This file tracks release notes for all published versions.
 
+## 0.0.4 - 2026-05-08
+
+- Added fused MoE blockscale FP8 kernels.
+- Added fused MoE blockscale FP8 with MXFP4 weights support.
+
 ## 0.0.3 - 2026-02-16
 
 - Added MXFP4 GEMM support for MI300X / MI250X GPUs. 
