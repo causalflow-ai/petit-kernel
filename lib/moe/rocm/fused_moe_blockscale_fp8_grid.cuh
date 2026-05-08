@@ -183,8 +183,9 @@ template <class Config> struct FusedMoEBlockScaleFP8KernelTrait {
     using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
     using Stage1Trait = FusedMoEBlockScaleFP8Stage1Trait<Config, kTokenBatch>;
     using Stage1Op =
-        FusedMoEBlockScaleFP8Stage1Op<Stage1Trait, Config::kGroupDim,
-                                      kTokenBatch>;
+        FusedMoEBlockScaleFP8Stage1DoubleBufferOp<Stage1Trait,
+                                                  Config::kGroupDim,
+                                                  kTokenBatch>;
     using Stage2Trait = FusedMoEBlockScaleFP8Stage2Trait<Config>;
     using Stage2Op =
         FusedMoEBlockScaleFP8Stage2Op<Stage2Trait, Config::kGroupDim,

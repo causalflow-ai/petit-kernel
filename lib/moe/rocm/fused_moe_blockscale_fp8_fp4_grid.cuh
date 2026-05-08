@@ -177,8 +177,10 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
     using Stage1Trait =
         FusedMoEBlockScaleFP8Fp4Stage1Trait<Config, kTokenBatch>;
     using Stage1Op =
-        FusedMoEBlockScaleFP8Stage1Op<Stage1Trait, Config::kGroupDim,
-                                      kTokenBatch>;
+        FusedMoEBlockScaleFP8Stage1SingleBufferOp<Stage1Trait,
+                                                  Config::kGroupDim,
+                                                  kTokenBatch>;
+
     using Stage2Trait = FusedMoEBlockScaleFP8Fp4Stage2Trait<Config>;
     using Stage2Op =
         FusedMoEBlockScaleFP8Stage2Op<Stage2Trait, Config::kGroupDim,

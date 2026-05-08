@@ -7,7 +7,7 @@
 namespace causalflow::petit::rocm::moe {
 
 template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
-struct FusedMoEBlockScaleFP8Stage1Op {
+struct FusedMoEBlockScaleFP8Stage1DoubleBufferOp {
     static constexpr unsigned kStage = 2;
     using Input = typename Trait::Input;
     static constexpr unsigned kAccumFragments = Trait::kAccumFragments;
@@ -62,6 +62,47 @@ struct FusedMoEBlockScaleFP8Stage1Op {
                 trait.ReadInput(x[next], scale_x[next], shm.x[next].act,
                                 shm.x[next].scale, wtid);
             }
+        }
+
+        for (unsigned i = 0; i < kAccumFragments; i++) {
+            h[i] = SiluDot(t_gate[i], t_up[i]);
+        }
+    }
+};
+
+template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
+struct FusedMoEBlockScaleFP8Stage1SingleBufferOp {
+    static constexpr unsigned kStage = 1;
+    using Input = typename Trait::Input;
+    static constexpr unsigned kAccumFragments = Trait::kAccumFragments;
+    static constexpr unsigned kActivationFragments =
+        Trait::kActivationFragments;
+
+    struct Shm {
+        struct {
+            unsigned act[Input::kShmInputElements];
+            float scale[Input::kThreads];
+        } x[kStage];
+    };
+
+    __device__ static void Run(float4 h[kAccumFragments], Shm &shm, Trait &trait,
+                               unsigned dim, unsigned tid, unsigned wid,
+                               unsigned wtid, const uint2 token_select,
+                               const unsigned tokens[kTokenBatch], unsigned m) {
+        float4 t_gate[kAccumFragments], t_up[kAccumFragments];
+        uint4 x[kActivationFragments];
+        float4 scale_x;
+        ClearMat(t_gate);
+        ClearMat(t_up);
+
+        trait.LoadInitial(tid, wid, wtid);
+
+        for (unsigned d = 0; d < dim; d += kGroupDim) {
+            trait.PrefetchInput(shm.x[0].act, shm.x[0].scale, wid, wtid,
+                                token_select, tokens, m);
+            amdgcn_s_waitcnt_barrier<0>();
+            trait.ReadInput(x, scale_x, shm.x[0].act, shm.x[0].scale, wtid);
+            trait.Matmul(t_gate, t_up, x, scale_x, tid, wid, wtid);
         }
 
         for (unsigned i = 0; i < kAccumFragments; i++) {

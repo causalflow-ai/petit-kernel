@@ -30,8 +30,6 @@ struct OnestageFusedMoEBlockScaleFP8 {
     using Stage2Op = typename KernelTrait::Stage2Op;
 
     struct ShmBuf {
-        static constexpr unsigned kStage = Stage1Op::kStage;
-        static_assert(Stage1Op::kStage == Stage2Op::kStage);
         typename Stage1Op::Shm x;
         typename QuantizeAndShuffleOp::MaxShm max;
         typename QuantizeAndShuffleOp::Shm q_h;
