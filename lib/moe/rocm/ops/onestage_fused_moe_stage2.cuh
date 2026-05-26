@@ -55,7 +55,7 @@ __device__ static inline uint2 ToBf16Rn(float4 m) {
 }
 
 template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
-struct FusedMoEBlockScaleFP8Stage2Op {
+struct OnestageFusedMoEStage2Op {
     static constexpr unsigned kNumWarps = 4;
     static constexpr unsigned kStage = 2;
     static constexpr unsigned kSubGroupSize = 16;
@@ -131,8 +131,8 @@ struct FusedMoEBlockScaleFP8Stage2Op {
 
     __device__ static void Run(uint4 *__restrict__ out, Shm &shm, Trait &trait,
                                unsigned dim,
-                               const uint4 quant_h[kActivationFragments],
-                               float4 dq_act, float2 sorted_weights,
+                               const typename Trait::InputRegs &input,
+                               float2 sorted_weights,
                                const unsigned tokens[kTokenBatch],
                                unsigned invalid_token_mask, unsigned tid,
                                unsigned wid, unsigned wtid) {
@@ -161,7 +161,7 @@ struct FusedMoEBlockScaleFP8Stage2Op {
                 trait.LoadStage(next, tid, wid, wtid);
                 uint2 ret[kTokenBatch];
                 ReadShm(shm, next, ret, wid, wtid);
-                trait.Matmul(t, quant_h, dq_act, curr, wtid);
+                trait.Matmul(t, input, curr, wtid);
                 MultRouteWeights<kAccumFragments>(t, sorted_weights);
                 uint2 o[kAccumFragments];
                 for (unsigned i = 0; i < kAccumFragments; i++) {
