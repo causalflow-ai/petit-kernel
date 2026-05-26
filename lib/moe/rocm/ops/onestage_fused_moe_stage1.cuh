@@ -7,7 +7,7 @@
 namespace causalflow::petit::rocm::moe {
 
 template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
-struct FusedMoEBlockScaleFP8Stage1DoubleBufferOp {
+struct OnestageFusedMoEStage1DoubleBufferOp {
     static constexpr unsigned kStage = 2;
     using Input = typename Trait::Input;
     static constexpr unsigned kAccumFragments = Trait::kAccumFragments;
@@ -71,7 +71,7 @@ struct FusedMoEBlockScaleFP8Stage1DoubleBufferOp {
 };
 
 template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
-struct FusedMoEBlockScaleFP8Stage1SingleBufferOp {
+struct OnestageFusedMoEStage1SingleBufferOp {
     static constexpr unsigned kStage = 1;
     using Input = typename Trait::Input;
     static constexpr unsigned kAccumFragments = Trait::kAccumFragments;

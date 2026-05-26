@@ -55,7 +55,7 @@ __device__ static inline uint2 ToBf16Rn(float4 m) {
 }
 
 template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
-struct FusedMoEBlockScaleFP8Stage2Op {
+struct OnestageFusedMoEStage2Op {
     static constexpr unsigned kNumWarps = 4;
     static constexpr unsigned kStage = 2;
     static constexpr unsigned kSubGroupSize = 16;

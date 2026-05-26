@@ -6,10 +6,10 @@
 #include "gemm/rocm/quantization/fp4/quantization_utils.cuh"
 #include "memory_ops.cuh"
 #include "moe/rocm/fused_moe.cuh"
-#include "moe/rocm/ops/onestage_blockscale_fp8_stage1.cuh"
-#include "moe/rocm/ops/onestage_blockscale_fp8_stage2.cuh"
-#include "moe/rocm/ops/onestage_blockscale_quantization.cuh"
-#include "moe/rocm/ops/onestage_fused_moe_blockscale_fp8.cuh"
+#include "moe/rocm/ops/onestage_fused_moe_stage1.cuh"
+#include "moe/rocm/ops/onestage_fused_moe_stage2.cuh"
+#include "moe/rocm/ops/onestage_fused_moe_fp8_quantize_shuffle.cuh"
+#include "fused_moe_blockscale_fp8_kernel.cuh"
 #include "moe/rocm/quantization.cuh"
 #include "moe/rocm/warp_schedule.cuh"
 
@@ -177,13 +177,13 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
     using Stage1Trait =
         FusedMoEBlockScaleFP8Fp4Stage1Trait<Config, kTokenBatch>;
     using Stage1Op =
-        FusedMoEBlockScaleFP8Stage1SingleBufferOp<Stage1Trait,
+        OnestageFusedMoEStage1SingleBufferOp<Stage1Trait,
                                                   Config::kGroupDim,
                                                   kTokenBatch>;
 
     using Stage2Trait = FusedMoEBlockScaleFP8Fp4Stage2Trait<Config>;
     using Stage2Op =
-        FusedMoEBlockScaleFP8Stage2Op<Stage2Trait, Config::kGroupDim,
+        OnestageFusedMoEStage2Op<Stage2Trait, Config::kGroupDim,
                                       kTokenBatch>;
 
     static constexpr unsigned kElementsPerThread =
