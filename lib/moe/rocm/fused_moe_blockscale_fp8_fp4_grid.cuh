@@ -107,6 +107,16 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
     using W13 = MxFp4WeightLayout<kNumWarps, Config::kGroupDim>;
 
+    struct Shm {
+        unsigned act[Input::kShmInputElements];
+        float scale[Input::kThreads];
+    };
+
+    struct InputRegs {
+        uint4 x[kActivationFragments];
+        float4 scale_x;
+    };
+
     Input &input;
     W13 &w1, &w3;
     uint4 w1_tile[kKStages][W13::kLoadGlobal];
@@ -119,13 +129,12 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
                                                             W13 &w1, W13 &w3)
         : input(input), w1(w1), w3(w3) {}
 
-    __device__ void PrefetchInput(unsigned *shm_act, float *shm_scale,
-                                  unsigned wid, unsigned wtid,
+    __device__ void PrefetchInput(Shm *shm, unsigned wid, unsigned wtid,
                                   const uint2 token_select,
                                   const unsigned tokens[Input::kTokenBatch],
                                   unsigned m) {
-        input.FetchAsync(shm_act, wid, wtid, tokens);
-        input.FetchScaleAsync(shm_scale, wid, wtid, token_select, m);
+        input.FetchAsync(shm->act, wid, wtid, tokens);
+        input.FetchScaleAsync(shm->scale, wid, wtid, token_select, m);
     }
 
     __device__ void LoadInitial(unsigned tid, unsigned wid, unsigned wtid) {
@@ -136,17 +145,16 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
         }
     }
 
-    __device__ void ReadInput(uint4 x[kActivationFragments], float4 &scale_x,
-                              const unsigned *shm_act, const float *shm_scale,
+    __device__ void ReadInput(InputRegs &regs, const Shm *shm,
                               unsigned wtid) const {
-        input.FetchToRegsFP4(x, shm_act, wtid);
-        scale_x = input.FetchScaleToReg(shm_scale, wtid);
+        input.FetchToRegsFP4(regs.x, shm->act, wtid);
+        regs.scale_x = input.FetchScaleToReg(shm->scale, wtid);
     }
 
     __device__ void Matmul(float4 t_gate[kAccumFragments],
                            float4 t_up[kAccumFragments],
-                           const uint4 x[kActivationFragments], float4 scale_x,
-                           unsigned tid, unsigned wid, unsigned wtid) {
+                           const InputRegs &regs, unsigned tid, unsigned wid,
+                           unsigned wtid) {
         uint4 w3_tile[kKStages][W13::kLoadGlobal];
         unsigned scale_w3[kKStages];
         for (unsigned j = 0; j < kKStages; j++) {
@@ -154,16 +162,17 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
             scale_w3[j] = w3.LoadScale(tid);
             w3.template AdvanceStep<0, 1>();
             MatmulBlockScaleFp4<W13::kLoadGlobal, kActivationFragments>(
-                t_gate, w1_tile[j], x, scale_x, scale_w1[j], j);
+                t_gate, w1_tile[j], regs.x, regs.scale_x, scale_w1[j], j);
         }
         for (unsigned j = 0; j < kKStages; j++) {
             w1.LoadTile(w1_tile[j], j, wid, wtid);
             scale_w1[j] = w1.LoadScale(tid);
             w1.template AdvanceStep<0, 1>();
             MatmulBlockScaleFp4<W13::kLoadGlobal, kActivationFragments>(
-                t_up, w3_tile[j], x, scale_x, scale_w3[j], j);
+                t_up, w3_tile[j], regs.x, regs.scale_x, scale_w3[j], j);
         }
     }
+
 };
 
 template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
@@ -178,13 +187,12 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
         FusedMoEBlockScaleFP8Fp4Stage1Trait<Config, kTokenBatch>;
     using Stage1Op =
         OnestageFusedMoEStage1SingleBufferOp<Stage1Trait,
-                                                  Config::kGroupDim,
-                                                  kTokenBatch>;
+                                             Config::kGroupDim, kTokenBatch>;
 
     using Stage2Trait = FusedMoEBlockScaleFP8Fp4Stage2Trait<Config>;
     using Stage2Op =
         OnestageFusedMoEStage2Op<Stage2Trait, Config::kGroupDim,
-                                      kTokenBatch>;
+                                 kTokenBatch>;
 
     static constexpr unsigned kElementsPerThread =
         (Config::kGroupM * Config::kGroupN) / kThreads;
@@ -283,6 +291,10 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4Stage2Trait {
     static constexpr unsigned kAccumFragments = 2 * W2::kLoadGlobal;
     static constexpr unsigned kActivationFragments = Config::kGroupDim / 32;
     static constexpr unsigned kOutputPacksPerToken = Config::kGroupN / 128;
+    struct InputRegs {
+        uint4 x[kActivationFragments];
+        float4 scale;
+    };
 
     static_assert(kAccumFragments == Schedule::kAccumulatorFragments, "");
     static_assert(kActivationFragments == Config::kGroupDim / 32, "");
@@ -300,15 +312,16 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4Stage2Trait {
         w2.template AdvanceStep<Config::kGroupN / 128, -kKStages>();
     }
 
-    __device__ void Matmul(float4 t[kAccumFragments],
-                           const uint4 quant_h[kActivationFragments],
-                           float4 dq_act, unsigned stage, unsigned wtid) {
+    __device__ void Matmul(float4 t[kAccumFragments], const InputRegs &input,
+                           unsigned stage, unsigned wtid) {
         (void)wtid;
         for (unsigned j = 0; j < kKStages; ++j) {
             MatmulBlockScaleFp4<W2::kLoadGlobal, kActivationFragments>(
-                t, w2_tile[stage][j], quant_h, dq_act, scale_w2[stage][j], j);
+                t, w2_tile[stage][j], input.x, input.scale,
+                scale_w2[stage][j], j);
         }
     }
+
 };
 
 struct FusedMoEMxFp4Config {

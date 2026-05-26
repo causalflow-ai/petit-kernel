@@ -31,8 +31,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
 
     struct ShmBuf {
         typename Stage1Op::Shm x;
-        typename QuantizeAndShuffleOp::MaxShm max;
-        typename QuantizeAndShuffleOp::Shm q_h;
+        typename QuantizeAndShuffleOp::Shm stage2_input;
         typename Stage2Op::Shm ret;
     };
 
@@ -62,14 +61,6 @@ struct OnestageFusedMoEBlockScaleFP8 {
         return reinterpret_cast<const float2 &>(u);
     }
 
-    __device__ void QuantizeAndShuffle(
-        uint4 out[QuantizeAndShuffleOp::kElementsPerThreadVec4], float4 *dq_act,
-        ShmBuf &shm, unsigned tid, unsigned wid, unsigned wtid,
-        const float4 h[QuantizeAndShuffleOp::kElementsPerThreadVec4]) const {
-        QuantizeAndShuffleOp::Run(out, dq_act, shm.max, shm.q_h, h, tid, wid,
-                                  wtid);
-    }
-
     __device__ void Stage1(float4 h[Stage1Trait::kAccumFragments], ShmBuf &shm,
                            unsigned wid, unsigned wtid, unsigned tid,
                            const uint2 token_select,
@@ -81,14 +72,12 @@ struct OnestageFusedMoEBlockScaleFP8 {
 
     __device__ void
     Stage2(uint4 *__restrict__ out, ShmBuf &shm,
-           const uint4 quant_h[Stage2Trait::kActivationFragments],
-           float4 dq_act, float2 sorted_weights,
+           const typename Stage2Trait::InputRegs &input, float2 sorted_weights,
            const unsigned tokens[kTokenBatch], unsigned invalid_token_mask,
            unsigned tid, unsigned wid, unsigned wtid) {
         Stage2Trait trait{w2_};
-        Stage2Op::Run(out, shm.ret, trait, dim_, quant_h, dq_act,
-                      sorted_weights, tokens, invalid_token_mask, tid, wid,
-                      wtid);
+        Stage2Op::Run(out, shm.ret, trait, dim_, input, sorted_weights, tokens,
+                      invalid_token_mask, tid, wid, wtid);
     }
 
     __device__ void
@@ -192,13 +181,12 @@ struct OnestageFusedMoEBlockScaleFP8 {
                     invalid_token_mask =
                         __builtin_amdgcn_readfirstlane(invalid_token_mask);
 
-                    uint4 quant_h[QuantizeAndShuffleOp::kElementsPerThreadVec4];
-                    float4 dq_act;
-                    QuantizeAndShuffle(quant_h, &dq_act, shm, tid, wid, wtid,
-                                       h);
+                    typename Stage2Trait::InputRegs stage2_input;
+                    QuantizeAndShuffleOp::Run(stage2_input, shm.stage2_input, h,
+                                              tid, wid, wtid);
 
-                    Stage2(out, shm, quant_h, dq_act, sorted_weights,
-                           safe_tokens, invalid_token_mask, tid, wid, wtid);
+                    Stage2(out, shm, stage2_input, sorted_weights, safe_tokens,
+                           invalid_token_mask, tid, wid, wtid);
                 }
             }
             __syncthreads();

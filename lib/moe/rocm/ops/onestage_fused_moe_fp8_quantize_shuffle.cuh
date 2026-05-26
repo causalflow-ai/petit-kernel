@@ -23,18 +23,22 @@ struct QuantizeAndShuffleFp8 {
     using Quantized = uint4[kElementsPerThreadVec4];
     using FragPacked = unsigned[kElementsPerThread / 4];
     using MaxShm = float2[kThreads];
-    using Shm = unsigned[kThreads * kElementsPerThreadVec4];
+    using QHiddenShm = unsigned[kThreads * kElementsPerThreadVec4];
+    struct Shm {
+        MaxShm max;
+        QHiddenShm q_h;
+    };
 
-    __device__ static void Run(Quantized out, float4 *dq_act, MaxShm &shm_max,
-                               Shm &shm_q_h, const FragH h, unsigned tid,
-                               unsigned wid, unsigned wtid) {
+    template <class InputRegs>
+    __device__ static void Run(InputRegs &out, Shm &shm, const FragH h,
+                               unsigned tid, unsigned wid, unsigned wtid) {
         float4 quant_scale;
-        ComputeRowMax(shm_max, h, tid, quant_scale, *dq_act);
+        ComputeRowMax(shm.max, h, tid, quant_scale, out.scale);
         FragPacked q;
         Quantize(q, h, quant_scale);
-        WriteShm(shm_q_h, q, wid, wtid);
+        WriteShm(shm.q_h, q, wid, wtid);
         __syncthreads();
-        ReadShm(out, shm_q_h, wid, wtid);
+        ReadShm(out.x, shm.q_h, wid, wtid);
         __syncthreads();
     }
 
@@ -97,7 +101,7 @@ struct QuantizeAndShuffleFp8 {
         }
     }
 
-    __device__ static void WriteShm(Shm &shm_q_h, const FragPacked q,
+    __device__ static void WriteShm(QHiddenShm &shm_q_h, const FragPacked q,
                                     unsigned wid, unsigned wtid) {
         using namespace causalflow::tal;
         using ShmShape = Shape<Shape<C<2>, C<kElementsPerThreadVec4 / 2>>,
@@ -113,8 +117,8 @@ struct QuantizeAndShuffleFp8 {
         }
     }
 
-    __device__ static void ReadShm(Quantized out, Shm &shm_q_h, unsigned wid,
-                                   unsigned wtid) {
+    __device__ static void ReadShm(Quantized out, QHiddenShm &shm_q_h,
+                                   unsigned wid, unsigned wtid) {
         using namespace causalflow::tal;
         ShmReadLayout layout;
         const uint2 *s = reinterpret_cast<const uint2 *>(shm_q_h);
