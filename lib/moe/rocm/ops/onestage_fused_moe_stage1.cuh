@@ -10,6 +10,7 @@ template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
 struct OnestageFusedMoEStage1DoubleBufferOp {
     static constexpr unsigned kStage = 2;
     using Input = typename Trait::Input;
+    using ActivationOp = typename Trait::ActivationOp;
     static constexpr unsigned kAccumFragments = Trait::kAccumFragments;
 
     struct Shm {
@@ -54,8 +55,9 @@ struct OnestageFusedMoEStage1DoubleBufferOp {
             }
         }
 
+        trait.AddBias(t_gate, t_up, wid, wtid);
         for (unsigned i = 0; i < kAccumFragments; i++) {
-            h[i] = SiluDot(t_gate[i], t_up[i]);
+            h[i] = ActivationOp::Apply(t_gate[i], t_up[i]);
         }
     }
 };
@@ -64,6 +66,7 @@ template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
 struct OnestageFusedMoEStage1SingleBufferOp {
     static constexpr unsigned kStage = 1;
     using Input = typename Trait::Input;
+    using ActivationOp = typename Trait::ActivationOp;
     static constexpr unsigned kAccumFragments = Trait::kAccumFragments;
 
     struct Shm {
@@ -88,8 +91,9 @@ struct OnestageFusedMoEStage1SingleBufferOp {
             trait.Matmul(t_gate, t_up, x, tid, wid, wtid);
         }
 
+        trait.AddBias(t_gate, t_up, wid, wtid);
         for (unsigned i = 0; i < kAccumFragments; i++) {
-            h[i] = SiluDot(t_gate[i], t_up[i]);
+            h[i] = ActivationOp::Apply(t_gate[i], t_up[i]);
         }
     }
 };

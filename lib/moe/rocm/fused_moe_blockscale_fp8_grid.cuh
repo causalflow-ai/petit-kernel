@@ -75,13 +75,14 @@ MatmulBlockScaleFp8(float4 t[8], const uint4 w[8], const uint4 x[8],
     }
 }
 
-template <class Config, unsigned kTokenBatch>
+template <class Config, class ActivationOp_, unsigned kTokenBatch>
 struct FusedMoEBlockScaleFP8Stage1Trait {
     using Scalar = __hip_fp8_e4m3;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kActivationFragments = 8;
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
     using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
+    using ActivationOp = ActivationOp_;
 
     struct Shm {
         unsigned act[Input::kShmInputElements];
@@ -148,6 +149,9 @@ struct FusedMoEBlockScaleFP8Stage1Trait {
         }
     }
 
+    __device__ void AddBias(float4 t_gate[kAccumFragments],
+                            float4 t_up[kAccumFragments], unsigned wid,
+                            unsigned wtid) const {}
 };
 
 template <class Config> struct FusedMoEBlockScaleFP8Stage2Trait {
@@ -185,9 +189,13 @@ template <class Config> struct FusedMoEBlockScaleFP8Stage2Trait {
             t, w2_tile[stage][1], input.x, input.scale, scale_w2[stage], 1);
     }
 
+    __device__ void AddBias(float4 t[kAccumFragments], unsigned tile_d,
+                            unsigned wid, unsigned wtid) const {}
+
 };
 
-template <class Config> struct FusedMoEBlockScaleFP8KernelTrait {
+template <class Config, class ActivationOp = SiluDotOp>
+struct FusedMoEBlockScaleFP8KernelTrait {
     using Scalar = __hip_fp8_e4m3;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
@@ -195,7 +203,8 @@ template <class Config> struct FusedMoEBlockScaleFP8KernelTrait {
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
     using W2 = W2Layout<Scalar, kNumWarps, Config::kGroupN>;
     using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
-    using Stage1Trait = FusedMoEBlockScaleFP8Stage1Trait<Config, kTokenBatch>;
+    using Stage1Trait =
+        FusedMoEBlockScaleFP8Stage1Trait<Config, ActivationOp, kTokenBatch>;
     using Stage1Op =
         OnestageFusedMoEStage1DoubleBufferOp<Stage1Trait,
                                              Config::kGroupDim, kTokenBatch>;

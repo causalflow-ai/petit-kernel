@@ -162,6 +162,7 @@ struct OnestageFusedMoEStage2Op {
                 uint2 ret[kTokenBatch];
                 ReadShm(shm, next, ret, wid, wtid);
                 trait.Matmul(t, input, curr, wtid);
+                trait.AddBias(t, tile_d, wid, wtid);
                 MultRouteWeights<kAccumFragments>(t, sorted_weights);
                 uint2 o[kAccumFragments];
                 for (unsigned i = 0; i < kAccumFragments; i++) {
