@@ -75,7 +75,7 @@ MatmulBlockScaleFp8(float4 t[8], const uint4 w[8], const uint4 x[8],
     }
 }
 
-template <class Config, class ActivationOp_, unsigned kTokenBatch>
+template <class Config, class ActivationOp_, class BiasOp_, unsigned kTokenBatch>
 struct FusedMoEBlockScaleFP8Stage1Trait {
     using Scalar = __hip_fp8_e4m3;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
@@ -83,6 +83,7 @@ struct FusedMoEBlockScaleFP8Stage1Trait {
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
     using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
     using ActivationOp = ActivationOp_;
+    using BiasOp = BiasOp_;
 
     struct Shm {
         unsigned act[Input::kShmInputElements];
@@ -154,8 +155,10 @@ struct FusedMoEBlockScaleFP8Stage1Trait {
                             unsigned wtid) const {}
 };
 
-template <class Config> struct FusedMoEBlockScaleFP8Stage2Trait {
+template <class Config, class BiasOp_>
+struct FusedMoEBlockScaleFP8Stage2Trait {
     static constexpr unsigned kNumWarps = Config::kNumWarps;
+    using BiasOp = BiasOp_;
     using W2 = W2Layout<__hip_fp8_e4m3, kNumWarps, Config::kGroupN>;
     W2 &w2;
     uint4 w2_tile[2][2][W2::kLoadGlobal];
@@ -188,13 +191,9 @@ template <class Config> struct FusedMoEBlockScaleFP8Stage2Trait {
         MatmulBlockScaleFp8<Stage2ScaleDppCtrl>(
             t, w2_tile[stage][1], input.x, input.scale, scale_w2[stage], 1);
     }
-
-    __device__ void AddBias(float4 t[kAccumFragments], unsigned tile_d,
-                            unsigned wid, unsigned wtid) const {}
-
 };
 
-template <class Config, class ActivationOp = SiluDotOp>
+template <class Config, class ActivationOp, class BiasOp_>
 struct FusedMoEBlockScaleFP8KernelTrait {
     using Scalar = __hip_fp8_e4m3;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
@@ -203,12 +202,14 @@ struct FusedMoEBlockScaleFP8KernelTrait {
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
     using W2 = W2Layout<Scalar, kNumWarps, Config::kGroupN>;
     using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
+    using BiasOp = BiasOp_;
     using Stage1Trait =
-        FusedMoEBlockScaleFP8Stage1Trait<Config, ActivationOp, kTokenBatch>;
+        FusedMoEBlockScaleFP8Stage1Trait<Config, ActivationOp,
+                                         BiasOp, kTokenBatch>;
     using Stage1Op =
         OnestageFusedMoEStage1DoubleBufferOp<Stage1Trait,
                                              Config::kGroupDim, kTokenBatch>;
-    using Stage2Trait = FusedMoEBlockScaleFP8Stage2Trait<Config>;
+    using Stage2Trait = FusedMoEBlockScaleFP8Stage2Trait<Config, BiasOp>;
     using Stage2Op =
         OnestageFusedMoEStage2Op<Stage2Trait, Config::kGroupDim,
                                  kTokenBatch>;
@@ -276,8 +277,8 @@ struct FusedMoEBlockScaleFP8KernelTrait {
 
 template <class Config>
 using FusedMoEBlockScaleFP8Kernel =
-    OnestageFusedMoEBlockScaleFP8<Config,
-                                  FusedMoEBlockScaleFP8KernelTrait<Config>>;
+    OnestageFusedMoEBlockScaleFP8<
+        Config, FusedMoEBlockScaleFP8KernelTrait<Config, SiluDotOp, NoBiasOp>>;
 
 struct FusedMoEConfig {
     static constexpr unsigned kGroupM = 32;

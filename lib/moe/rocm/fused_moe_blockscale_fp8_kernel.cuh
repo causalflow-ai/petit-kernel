@@ -28,6 +28,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
     using Stage1Op = typename KernelTrait::Stage1Op;
     using Stage2Trait = typename KernelTrait::Stage2Trait;
     using Stage2Op = typename KernelTrait::Stage2Op;
+    using BiasOp = typename KernelTrait::BiasOp;
 
     struct ShmBuf {
         typename Stage1Op::Shm x;
@@ -64,20 +65,21 @@ struct OnestageFusedMoEBlockScaleFP8 {
     __device__ void Stage1(float4 h[Stage1Trait::kAccumFragments], ShmBuf &shm,
                            unsigned wid, unsigned wtid, unsigned tid,
                            const uint2 token_select,
-                           const unsigned tokens[kTokenBatch], unsigned m) {
+                           const unsigned tokens[kTokenBatch], unsigned m,
+                           BiasOp &bias_op) {
         Stage1Trait trait{input_, w1_, w3_};
         Stage1Op::Run(h, shm.x, trait, dim_, tid, wid, wtid, token_select,
-                      tokens, m);
+                      tokens, m, bias_op);
     }
 
     __device__ void
     Stage2(uint4 *__restrict__ out, ShmBuf &shm,
            const typename Stage2Trait::InputRegs &input, float2 sorted_weights,
            const unsigned tokens[kTokenBatch], unsigned invalid_token_mask,
-           unsigned tid, unsigned wid, unsigned wtid) {
+           unsigned tid, unsigned wid, unsigned wtid, BiasOp &bias_op) {
         Stage2Trait trait{w2_};
         Stage2Op::Run(out, shm.ret, trait, dim_, input, sorted_weights, tokens,
-                      invalid_token_mask, tid, wid, wtid);
+                      invalid_token_mask, tid, wid, wtid, bias_op);
     }
 
     __device__ void
@@ -135,6 +137,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
                         tile_k, n_blocks, k_blocks);
                     sorted_token_br_ = MakeBufferResource(
                         sorted_token_ids + route_base, kRefBufferRange);
+                    bias_op_.Initialize(*this);
 
                     uint2 token_select;
                     token_select.x =
@@ -171,7 +174,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
                         LoadSortedWeights(sorted_weights_ptr, tid, route_base);
                     float4 h[Stage1Trait::kAccumFragments];
                     Stage1(h, shm, wid, wtid, tid, safe_token_select,
-                           safe_tokens, m);
+                           safe_tokens, m, bias_op_);
                     __syncthreads();
 
                     unsigned invalid_token_mask = 0;
@@ -186,7 +189,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
                                               tid, wid, wtid);
 
                     Stage2(out, shm, stage2_input, sorted_weights, safe_tokens,
-                           invalid_token_mask, tid, wid, wtid);
+                           invalid_token_mask, tid, wid, wtid, bias_op_);
                 }
             }
             __syncthreads();
@@ -196,6 +199,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
     unsigned dim_;
     unsigned inter_dim_;
     Input input_;
+    BiasOp bias_op_;
     BufferResource sorted_token_br_;
     W2 w2_;
     W13 w1_, w3_;

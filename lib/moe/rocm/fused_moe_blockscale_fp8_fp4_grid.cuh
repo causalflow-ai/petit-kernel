@@ -19,7 +19,8 @@
 
 namespace causalflow::petit::rocm::moe {
 
-template <class Config> struct FusedMoEBlockScaleFP8Fp4Stage2Trait;
+template <class Config, class BiasOp_>
+struct FusedMoEBlockScaleFP8Fp4Stage2Trait;
 
 __device__ static inline float4 Fma4(float4 a, float4 s, float4 c) {
     const auto *a2 = reinterpret_cast<const float2 *>(&a);
@@ -97,7 +98,7 @@ MatmulBlockScaleFp4(float4 t[2 * kLoadGlobal], const uint4 w[kLoadGlobal],
     }
 }
 
-template <class Config, class ActivationOp_, unsigned kTokenBatch>
+template <class Config, class ActivationOp_, class BiasOp_, unsigned kTokenBatch>
 struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kActivationFragments = Config::kGroupDim / 32;
@@ -105,6 +106,7 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
     using W13 = MxFp4WeightLayout<kNumWarps, Config::kGroupDim>;
     using ActivationOp = ActivationOp_;
+    using BiasOp = BiasOp_;
 
     struct Shm {
         unsigned act[Input::kShmInputElements];
@@ -171,13 +173,9 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
                 t_up, w3_tile[j], regs.x, regs.scale_x, scale_w3[j], j);
         }
     }
-
-    __device__ void AddBias(float4 t_gate[kAccumFragments],
-                            float4 t_up[kAccumFragments], unsigned wid,
-                            unsigned wtid) const {}
 };
 
-template <class Config, class ActivationOp = SiluDotOp>
+template <class Config, class ActivationOp, class BiasOp_>
 struct FusedMoEBlockScaleFP8Fp4KernelTrait {
     using Scalar = __hip_fp8_e4m3;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
@@ -186,13 +184,15 @@ struct FusedMoEBlockScaleFP8Fp4KernelTrait {
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
     using W13 = MxFp4WeightLayout<kNumWarps, Config::kGroupDim>;
     using W2 = MxFp4WeightLayout<kNumWarps, Config::kGroupN>;
+    using BiasOp = BiasOp_;
     using Stage1Trait =
-        FusedMoEBlockScaleFP8Fp4Stage1Trait<Config, ActivationOp, kTokenBatch>;
+        FusedMoEBlockScaleFP8Fp4Stage1Trait<Config, ActivationOp,
+                                            BiasOp, kTokenBatch>;
     using Stage1Op =
         OnestageFusedMoEStage1SingleBufferOp<Stage1Trait,
                                              Config::kGroupDim, kTokenBatch>;
 
-    using Stage2Trait = FusedMoEBlockScaleFP8Fp4Stage2Trait<Config>;
+    using Stage2Trait = FusedMoEBlockScaleFP8Fp4Stage2Trait<Config, BiasOp>;
     using Stage2Op =
         OnestageFusedMoEStage2Op<Stage2Trait, Config::kGroupDim,
                                  kTokenBatch>;
@@ -280,13 +280,15 @@ struct FusedMoEBlockScaleFP8Fp4KernelTrait {
 
 template <class Config>
 using FusedMoEBlockScaleFP8Fp4Kernel =
-    OnestageFusedMoEBlockScaleFP8<Config,
-                                  FusedMoEBlockScaleFP8Fp4KernelTrait<Config>>;
+    OnestageFusedMoEBlockScaleFP8<
+        Config, FusedMoEBlockScaleFP8Fp4KernelTrait<Config, SiluDotOp, NoBiasOp>>;
 
-template <class Config> struct FusedMoEBlockScaleFP8Fp4Stage2Trait {
+template <class Config, class BiasOp_>
+struct FusedMoEBlockScaleFP8Fp4Stage2Trait {
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     using Schedule = WarpSchedule<Config>;
     static constexpr int kKStages = Config::kGroupN / 128;
+    using BiasOp = BiasOp_;
     using W2 = MxFp4WeightLayout<kNumWarps, Config::kGroupN>;
     W2 &w2;
     uint4 w2_tile[2][kKStages][W2::kLoadGlobal];

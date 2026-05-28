@@ -66,6 +66,7 @@ struct OnestageFusedMoEStage2Op {
     static constexpr unsigned kActivationFragments =
         Trait::kActivationFragments;
     static constexpr unsigned kTokenPairs = kTokenBatch / 2;
+    using BiasOp = typename Trait::BiasOp;
 
     static_assert(Trait::kNumWarps == kNumWarps, "");
     static_assert(kTokenBatch % 2 == 0, "");
@@ -135,7 +136,8 @@ struct OnestageFusedMoEStage2Op {
                                float2 sorted_weights,
                                const unsigned tokens[kTokenBatch],
                                unsigned invalid_token_mask, unsigned tid,
-                               unsigned wid, unsigned wtid) {
+                               unsigned wid, unsigned wtid,
+                               BiasOp& bias_op) {
         unsigned curr = 0, next = 1;
         trait.LoadStage(curr, tid, wid, wtid);
         uint2 zeroes[kAccumFragments] = {
@@ -162,7 +164,7 @@ struct OnestageFusedMoEStage2Op {
                 uint2 ret[kTokenBatch];
                 ReadShm(shm, next, ret, wid, wtid);
                 trait.Matmul(t, input, curr, wtid);
-                trait.AddBias(t, tile_d, wid, wtid);
+                bias_op.template AddBiasStage2<kAccumFragments>(t, tile_d, wid, wtid);
                 MultRouteWeights<kAccumFragments>(t, sorted_weights);
                 uint2 o[kAccumFragments];
                 for (unsigned i = 0; i < kAccumFragments; i++) {
