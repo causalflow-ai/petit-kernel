@@ -1,35 +1,31 @@
 #pragma once
 
 #include "causalflow/petit/tal/algorithm.h"
-#include "moe/rocm/mem/bias.cuh"
 #include "moe/rocm/memory_ops.cuh"
-
-#include <hip/hip_runtime.h>
 
 namespace causalflow::petit::rocm::moe {
 
-template <class Config, class KernelTrait>
+template <class Config>
 struct OnestageFusedMoEBlockScaleFP8 {
-    using Scalar = typename KernelTrait::Scalar;
     static constexpr unsigned kGroupM = Config::kGroupM;
     static constexpr unsigned kGroupDim = Config::kGroupDim;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kThreads = kNumWarps * 64;
     static constexpr unsigned kScaleBlockSize = 128;
-    static constexpr unsigned kTokenBatch = KernelTrait::kTokenBatch;
+    static constexpr unsigned kTokenBatch = Config::kTokenBatch;
     static constexpr unsigned kSubGroupSize = 16;
     static constexpr unsigned kRoutesPerBlock = kTokenBatch * kNumWarps;
     static constexpr unsigned kRefBufferRange = static_cast<unsigned>(-16);
 
-    using Input = typename KernelTrait::Input;
-    using W13Weights = typename KernelTrait::W13Weights;
-    using W2Weights = typename KernelTrait::W2Weights;
-    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
-    using QuantizeAndShuffleOp = typename KernelTrait::QuantizeAndShuffleOp;
-    using Stage1Trait = typename KernelTrait::Stage1Trait;
-    using Stage1Op = typename KernelTrait::Stage1Op;
-    using Stage2Trait = typename KernelTrait::Stage2Trait;
-    using Stage2Op = typename KernelTrait::Stage2Op;
+    using Input = typename Config::Input;
+    using W13Weights = typename Config::W13Weights;
+    using W2Weights = typename Config::W2Weights;
+    using Bias = typename Config::Bias;
+    using QuantizeAndShuffleOp = typename Config::QuantizeAndShuffleOp;
+    using Stage1Trait = typename Config::Stage1Trait;
+    using Stage1Op = typename Config::Stage1Op;
+    using Stage2Trait = typename Config::Stage2Trait;
+    using Stage2Op = typename Config::Stage2Op;
 
     struct ShmBuf {
         typename Stage1Op::Shm x;
@@ -134,7 +130,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
                 if (valid_expert) {
                     input_.Initialize(act, scales_act, wid, m, n_blocks, dim_);
 
-                    KernelTrait::InitializeWeights(
+                    Config::InitializeWeights(
                         *this, w13_base, w2, scales_w13, scales_w2, expert_id,
                         tile_k, n_blocks, k_blocks);
 
@@ -191,8 +187,8 @@ struct OnestageFusedMoEBlockScaleFP8 {
     Bias w2_bias_;
 };
 
-template <class Config, class Kernel>
-__global__ static void __launch_bounds__(64 * Config::kNumWarps)
+template <class Kernel>
+__global__ static void __launch_bounds__(64 * Kernel::kNumWarps)
     OnestageFusedMoEBlockScaleFP8Compute(
         uint4 *__restrict__ out, const uint4 *act, const uint4 *w13,
         const uint4 *w2, const uint4 *sorted_token_ids,
@@ -210,43 +206,6 @@ __global__ static void __launch_bounds__(64 * Config::kNumWarps)
         reinterpret_cast<const unsigned *>(scales_w13), scales_w2,
         num_valid_ids, topk, m, n, k, num_experts, persistent_route_step,
         w13_bias, w2_bias);
-}
-
-template <class Config, class Kernel>
-void LaunchOnestageFusedMoEBlockScaleFP8(
-    uint4 *__restrict__ out, const uint4 *act, const uint4 *w13,
-    const uint4 *w2, const uint4 *sorted_token_ids, const uint4 *sorted_weights,
-    const uint4 *sorted_expert_ids, const unsigned *__restrict__ num_valid_ids,
-    unsigned topk, const uint4 *scales_act, const uint4 *scales_w13,
-    const unsigned *__restrict__ scales_w2, unsigned max_num_m_blocks,
-    unsigned m, unsigned n, unsigned k, unsigned num_experts,
-    hipStream_t stream, unsigned num_persistent_tgs,
-    const void *w13_bias = nullptr, const void *w2_bias = nullptr) {
-    if (m == 0 || n == 0 || k == 0 || topk == 0 || max_num_m_blocks == 0) {
-        return;
-    }
-    const unsigned split_k = tal::CeilingDiv<unsigned>(k, Config::kGroupDim);
-    unsigned route_groups = max_num_m_blocks;
-    unsigned persistent_route_step = 0;
-    if (num_persistent_tgs > 0) {
-        unsigned persistent_route_groups =
-            tal::CeilingDiv<unsigned>(num_persistent_tgs, split_k);
-        if (persistent_route_groups == 0) {
-            persistent_route_groups = 1;
-        }
-        route_groups = persistent_route_groups < route_groups
-                           ? persistent_route_groups
-                           : route_groups;
-        persistent_route_step = route_groups;
-    }
-    dim3 blocks(64 * Config::kNumWarps);
-    dim3 grids(split_k, route_groups, 1);
-    OnestageFusedMoEBlockScaleFP8Compute<Config, Kernel>
-        <<<grids, blocks, 0, stream>>>(
-            out, act, w13, w2, sorted_token_ids, sorted_weights,
-            sorted_expert_ids, num_valid_ids, topk, scales_act, scales_w13,
-            scales_w2, m, n, k, num_experts, persistent_route_step, w13_bias,
-            w2_bias);
 }
 
 } // namespace causalflow::petit::rocm::moe

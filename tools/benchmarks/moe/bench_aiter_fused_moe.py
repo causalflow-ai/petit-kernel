@@ -343,6 +343,8 @@ class FusedMoEInputBuilder:
             "input_q": input_q,
             "w1_q_kernel": w1_q_kernel,
             "w2_q_kernel": w2_q_kernel,
+            "topk_ids": topk_ids,
+            "topk_weights": topk_weights,
             "sorted_token_ids": sorted_token_ids,
             "sorted_weights": sorted_weights,
             "sorted_expert_ids": sorted_expert_ids,
@@ -361,6 +363,11 @@ def make_run_fn(
     backend: str, data: Dict[str, torch.Tensor], num_persistent_tgs: int
 ) -> Tuple[Callable[[], torch.Tensor], str]:
     if backend == "petit":
+        out = torch.empty(
+            (data["input_q"].shape[0], data["input_q"].shape[1]),
+            dtype=torch.bfloat16,
+            device=data["input_q"].device,
+        )
         if data["weight_format"] == "mxfp4":
             def run() -> torch.Tensor:
                 return petit_kernel.fused_moe_fp8_blockscale_g1u1_mxfp4(
@@ -373,9 +380,10 @@ def make_run_fn(
                     data["num_valid_ids"],
                     int(data["topk"]),
                     data["input_scale_kernel"],
-                    data["fc1_scale_kernel"],
-                    data["fc2_scale_kernel"],
-                    num_persistent_tgs,
+                    fc1_scale=data["fc1_scale_kernel"],
+                    fc2_scale=data["fc2_scale_kernel"],
+                    num_persistent_tgs=num_persistent_tgs,
+                    out=out,
                 )
         else:
             def run() -> torch.Tensor:
@@ -389,12 +397,13 @@ def make_run_fn(
                     data["num_valid_ids"],
                     int(data["topk"]),
                     data["input_scale_kernel"],
-                    data["fc1_scale_kernel"],
-                    data["fc2_scale_kernel"],
-                    num_persistent_tgs,
+                    fc1_scale=data["fc1_scale_kernel"],
+                    fc2_scale=data["fc2_scale_kernel"],
+                    num_persistent_tgs=num_persistent_tgs,
+                    out=out,
                 )
 
-        return run, "pybind"
+        return run, "matmul_1stage"
 
     if num_persistent_tgs > 0:
         raise RuntimeError(
@@ -411,12 +420,14 @@ def make_run_fn(
     num_rows = torch.tensor([data["input_q"].shape[0]], dtype=torch.int32, device=data["input_q"].device)
     aiter.partial_transpose(input_scale_aiter, data["input_scale"], num_rows=num_rows)
 
+    out = torch.empty(
+        (data["input_q"].shape[0], data["input_q"].shape[1]),
+        dtype=torch.bfloat16,
+        device=data["input_q"].device,
+    )
+
     def run_aiter() -> torch.Tensor:
-        out = torch.zeros(
-            (data["input_q"].shape[0], data["input_q"].shape[1]),
-            dtype=torch.bfloat16,
-            device=data["input_q"].device,
-        )
+        out.zero_()
         aiter.fmoe_fp8_blockscale_g1u1(
             out,
             data["input_q"],

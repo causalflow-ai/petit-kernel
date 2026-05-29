@@ -21,6 +21,7 @@
 #include <vector>
 
 namespace causalflow::petit::rocm::moe {
+
 namespace {
 
 namespace quant = causalflow::petit::rocm::quantization;
@@ -28,6 +29,13 @@ namespace fp4 = causalflow::petit::rocm::quantization::fp4;
 namespace moe_test = causalflow::petit::rocm::moe::test_utils;
 using moe_test::FillParallelIndexed;
 using moe_test::MixU64;
+
+static constexpr FusedMoESolutionId kTestSolutionId = FusedMoESolutionId::Make(
+    FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
+    FusedMoEDataType::kNone, FusedMoEWeightOrdering::kPetitMxFp4,
+    FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
+    FusedMoEActivationFunction::kSiluDot,
+    FusedMoEStage1Buffering::kSingleBuffer);
 
 static inline unsigned MaskNegativeZeroOnNativeFp4Format(unsigned v) {
     unsigned out = 0;
@@ -244,20 +252,28 @@ template <class Config> void TestRunner<Config>::CopyHostToDeviceContext() {
 }
 
 template <class Config> int TestRunner<Config>::RunKernelImpl() {
-    return FusedMoEBlockScaleFP8MXFP4Weight(
-        reinterpret_cast<uint4 *>(d_ctx_->out),
-        reinterpret_cast<const uint4 *>(d_ctx_->q_act),
-        reinterpret_cast<const uint4 *>(d_ctx_->w1),
-        reinterpret_cast<const uint4 *>(d_ctx_->w2),
-        reinterpret_cast<const uint4 *>(d_ctx_->sorted_token_ids),
-        reinterpret_cast<const uint4 *>(d_ctx_->sorted_weights),
-        reinterpret_cast<const uint4 *>(d_ctx_->sorted_expert_ids),
-        d_ctx_->num_valid_ids, Context::kTopK,
-        reinterpret_cast<const uint4 *>(d_ctx_->scale_act_t),
-        reinterpret_cast<const uint4 *>(d_ctx_->scale_fc1),
+    FusedMoE1StageParams params{
+        reinterpret_cast<unsigned *>(d_ctx_->out),
+        reinterpret_cast<const unsigned *>(d_ctx_->q_act),
+        reinterpret_cast<const unsigned *>(d_ctx_->w1),
+        reinterpret_cast<const unsigned *>(d_ctx_->w2),
+        reinterpret_cast<const unsigned *>(d_ctx_->sorted_token_ids),
+        reinterpret_cast<const unsigned *>(d_ctx_->sorted_weights),
+        reinterpret_cast<const unsigned *>(d_ctx_->sorted_expert_ids),
+        d_ctx_->num_valid_ids,
+        Context::kTopK,
+        reinterpret_cast<const unsigned *>(d_ctx_->scale_act_t),
+        reinterpret_cast<const unsigned *>(d_ctx_->scale_fc1),
         reinterpret_cast<const unsigned *>(d_ctx_->scale_fc2),
-        Context::kMaxNumMBlocks, Context::kTokens, Context::kDim,
-        Context::kInterDim, Context::kExperts, nullptr);
+        Context::kMaxNumMBlocks,
+        Context::kTokens,
+        Context::kDim,
+        Context::kInterDim,
+        Context::kExperts,
+        nullptr,
+        0,
+    };
+    return FusedMoEMatmul1Stage(params, kTestSolutionId.Repr());
 }
 
 template <class Config> void TestRunner<Config>::InitializeW13HostData() {
@@ -326,7 +342,7 @@ template <class Config> void TestRunner<Config>::DequantizeWeights() {
     }
 }
 
-class FusedMoEBlockScaleFP8MXFP4WeightTest : public ::testing::Test {
+class FusedMoEBlockScaleFP8MxFp4Test : public ::testing::Test {
   public:
     template <class Config> void RunComparisonTest() {
         TestRunner<Config> runner;
@@ -335,36 +351,36 @@ class FusedMoEBlockScaleFP8MXFP4WeightTest : public ::testing::Test {
     }
 };
 
-TEST_F(FusedMoEBlockScaleFP8MXFP4WeightTest, SmallMatchesPythonStyleReference) {
+TEST_F(FusedMoEBlockScaleFP8MxFp4Test, SmallMatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<4, 256, 512, 4, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MXFP4WeightTest,
+TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
        MediumMatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<8, 256, 512, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MXFP4WeightTest,
+TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
        Large512MatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<512, 4096, 1024, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MXFP4WeightTest,
+TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
        Large1024MatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<1024, 4096, 1024, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MXFP4WeightTest,
+TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
        Large1537MatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<1537, 4096, 1024, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MXFP4WeightTest,
+TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
        DeepSeekLikeMatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<8, 7168, 2048, 33, 9>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MXFP4WeightTest,
+TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
        ReplayLikeSensitiveMatchesPythonStyleReference) {
     RunComparisonTest<ReplayLikeSensitiveConfig>();
 }

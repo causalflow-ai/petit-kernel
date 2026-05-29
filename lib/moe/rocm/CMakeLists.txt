@@ -14,8 +14,7 @@ function(petit_set_moe_hip_architectures target)
 endfunction()
 
 set(MOE_SRCS
-  fused_moe_blockscale_fp8_grid.cc
-  fused_moe_blockscale_fp8_fp4_grid.cc
+  fused_moe.cc
 )
 
 set_source_files_properties(${MOE_SRCS} PROPERTIES

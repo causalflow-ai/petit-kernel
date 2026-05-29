@@ -33,13 +33,6 @@ template <class Config> struct ChannelScaleFp8Input {
     static_assert(
         kShmInputElementsPerWarp % (sizeof(uint4) / sizeof(unsigned)) == 0, "");
 
-    template <class Context>
-    __device__ void Initialize(const Context &context, unsigned wid, unsigned m,
-                               unsigned dim) {
-        Initialize(context.act, context.scales_act, wid, m, context.n_blocks,
-                   dim);
-    }
-
     __device__ void Initialize(const void *value_ptr, const void *scale_ptr,
                                unsigned wid, unsigned m, unsigned n_blocks,
                                unsigned dim) {

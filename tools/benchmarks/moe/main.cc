@@ -57,6 +57,15 @@ constexpr unsigned kPackK = 16;
 constexpr unsigned kKk = kBlockK / kPackK;
 constexpr unsigned kSortedTokenPadding = 32;
 constexpr unsigned kScaleGroup = 128;
+static constexpr moe::FusedMoESolutionId kFusedMoESolutionId =
+    moe::FusedMoESolutionId::Make(
+        moe::FusedMoEDataType::kChannelScaleFp8,
+        moe::FusedMoEDataType::kBlockScaleFp8, moe::FusedMoEDataType::kNone,
+        moe::FusedMoEWeightOrdering::kPetitFp8,
+        moe::FusedMoEMfmaShape::kMfmaFp816x16x32,
+        moe::FusedMoEStages::kOneStage,
+        moe::FusedMoEActivationFunction::kSiluDot,
+        moe::FusedMoEStage1Buffering::kDoubleBuffer);
 
 template <class T> constexpr T CeilingDiv(T x, T y) { return (x + y - 1) / y; }
 
@@ -507,39 +516,36 @@ static bool RunBenchmark(const HostInputs &in, const DeviceBuffers &dev,
     const size_t out_bytes =
         static_cast<size_t>(tokens) * dim * sizeof(unsigned short);
     CheckHIPStatus(hipMemset(dev.out_bf16, 0, out_bytes));
-    const int err = moe::FusedMoEBlockScaleFP8(
-        reinterpret_cast<uint4 *>(dev.out_bf16),
-        reinterpret_cast<const uint4 *>(dev.act_fp8),
-        reinterpret_cast<const uint4 *>(dev.w1_q_shuffled),
-        reinterpret_cast<const uint4 *>(dev.w2_q_shuffled),
-        reinterpret_cast<const uint4 *>(dev.sorted_token_ids),
-        reinterpret_cast<const uint4 *>(dev.sorted_weights),
-        reinterpret_cast<const uint4 *>(dev.sorted_expert_ids),
-        dev.num_valid_ids, topk,
-        reinterpret_cast<const uint4 *>(dev.input_scale_t),
-        reinterpret_cast<const uint4 *>(dev.scale_fc1),
+    moe::FusedMoE1StageParams params{
+        reinterpret_cast<unsigned *>(dev.out_bf16),
+        reinterpret_cast<const unsigned *>(dev.act_fp8),
+        reinterpret_cast<const unsigned *>(dev.w1_q_shuffled),
+        reinterpret_cast<const unsigned *>(dev.w2_q_shuffled),
+        reinterpret_cast<const unsigned *>(dev.sorted_token_ids),
+        reinterpret_cast<const unsigned *>(dev.sorted_weights),
+        reinterpret_cast<const unsigned *>(dev.sorted_expert_ids),
+        dev.num_valid_ids,
+        topk,
+        reinterpret_cast<const unsigned *>(dev.input_scale_t),
+        reinterpret_cast<const unsigned *>(dev.scale_fc1),
         dev.fc2_scale_aiter_bits,
-        static_cast<unsigned>(in.sorted_expert_ids.size()), tokens, dim,
-        inter_dim, nullptr, num_persistent_tgs);
+        static_cast<unsigned>(in.sorted_expert_ids.size()),
+        tokens,
+        dim,
+        inter_dim,
+        0,
+        nullptr,
+        num_persistent_tgs,
+    };
+    const int err =
+        moe::FusedMoEMatmul1Stage(params, kFusedMoESolutionId.Repr());
     if (err != 0) {
         return false;
     }
 
     for (int i = 0; i < FLAGS_warmup; ++i) {
-        const int warmup_err = moe::FusedMoEBlockScaleFP8(
-            reinterpret_cast<uint4 *>(dev.out_bf16),
-            reinterpret_cast<const uint4 *>(dev.act_fp8),
-            reinterpret_cast<const uint4 *>(dev.w1_q_shuffled),
-            reinterpret_cast<const uint4 *>(dev.w2_q_shuffled),
-            reinterpret_cast<const uint4 *>(dev.sorted_token_ids),
-            reinterpret_cast<const uint4 *>(dev.sorted_weights),
-            reinterpret_cast<const uint4 *>(dev.sorted_expert_ids),
-            dev.num_valid_ids, topk,
-            reinterpret_cast<const uint4 *>(dev.input_scale_t),
-            reinterpret_cast<const uint4 *>(dev.scale_fc1),
-            dev.fc2_scale_aiter_bits,
-            static_cast<unsigned>(in.sorted_expert_ids.size()), tokens, dim,
-            inter_dim, nullptr, num_persistent_tgs);
+        const int warmup_err =
+            moe::FusedMoEMatmul1Stage(params, kFusedMoESolutionId.Repr());
         if (warmup_err != 0) {
             return false;
         }
@@ -554,20 +560,7 @@ static bool RunBenchmark(const HostInputs &in, const DeviceBuffers &dev,
 
     CheckHIPStatus(hipEventRecord(ev_start, 0));
     for (int i = 0; i < FLAGS_repeat; ++i) {
-        moe::FusedMoEBlockScaleFP8(
-            reinterpret_cast<uint4 *>(dev.out_bf16),
-            reinterpret_cast<const uint4 *>(dev.act_fp8),
-            reinterpret_cast<const uint4 *>(dev.w1_q_shuffled),
-            reinterpret_cast<const uint4 *>(dev.w2_q_shuffled),
-            reinterpret_cast<const uint4 *>(dev.sorted_token_ids),
-            reinterpret_cast<const uint4 *>(dev.sorted_weights),
-            reinterpret_cast<const uint4 *>(dev.sorted_expert_ids),
-            dev.num_valid_ids, topk,
-            reinterpret_cast<const uint4 *>(dev.input_scale_t),
-            reinterpret_cast<const uint4 *>(dev.scale_fc1),
-            dev.fc2_scale_aiter_bits,
-            static_cast<unsigned>(in.sorted_expert_ids.size()), tokens, dim,
-            inter_dim, nullptr, num_persistent_tgs);
+        moe::FusedMoEMatmul1Stage(params, kFusedMoESolutionId.Repr());
     }
     CheckHIPStatus(hipEventRecord(ev_stop, 0));
     CheckHIPStatus(hipEventSynchronize(ev_stop));

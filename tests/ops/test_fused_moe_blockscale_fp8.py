@@ -55,6 +55,7 @@ def _run_petit_fp8_kernel(
     kernel_data: dict[str, torch.Tensor],
     data: dict[str, torch.Tensor],
     topk: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return petit_kernel.fused_moe_fp8_blockscale_g1u1(
         kernel_data["input_q"],
@@ -68,6 +69,7 @@ def _run_petit_fp8_kernel(
         kernel_data["input_scale_aiter"],
         kernel_data["fc1_scale_aiter"],
         kernel_data["fc2_scale_aiter"],
+        out=out,
     )
 
 
@@ -674,6 +676,51 @@ def test_fmoe_blockscale_fp8_reference_matches_aiter_kernel(
         atol=PER_ELEMENT_ATOL,
         msg="petit and aiter outputs differ",
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Petit kernel requires a GPU")
+def test_fmoe_matmul_1stage_validates_output_tensor():
+    tokens = 32
+    model_dim = 512
+    inter_dim = 512
+    experts = 1
+    topk = 1
+
+    device = torch.device("cuda")
+    _native_fp8_dtype_or_skip(device)
+    dtype = torch.bfloat16
+
+    torch.manual_seed(7)
+    builder = FmoeBlockscaleFp8AiterTestDataBuilder(
+        device=device,
+        dtype=dtype,
+        tokens=tokens,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+    )
+    data = builder.build_ultra_harsh()
+    kernel_data = builder.to_aiter_kernel_layout(
+        input_q=data["input_q"],
+        w1_q=data["w1_q"],
+        w2_q=data["w2_q"],
+        input_scale=data["input_scale"],
+        fc1_scale=data["fc1_scale"],
+        fc2_scale=data["fc2_scale"],
+    )
+
+    bad_dtype = torch.empty((tokens, model_dim), dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="out must be bfloat16"):
+        _run_petit_fp8_kernel(kernel_data, data, topk, out=bad_dtype)
+
+    bad_shape = torch.empty((tokens, model_dim + 128), dtype=dtype, device=device)
+    with pytest.raises(RuntimeError, match="out must be \\[tokens, dim\\]"):
+        _run_petit_fp8_kernel(kernel_data, data, topk, out=bad_shape)
+
+    non_contiguous = torch.empty((model_dim, tokens), dtype=dtype, device=device).t()
+    with pytest.raises(RuntimeError, match="out must be contiguous"):
+        _run_petit_fp8_kernel(kernel_data, data, topk, out=non_contiguous)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Petit kernel requires a GPU")

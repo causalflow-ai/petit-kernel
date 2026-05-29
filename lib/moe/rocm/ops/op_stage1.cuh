@@ -7,9 +7,13 @@
 
 namespace causalflow::petit::rocm::moe {
 
-template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
+template <class Trait>
 struct OnestageFusedMoEStage1DoubleBufferOp {
+    using Config = typename Trait::Config;
+    using ActivationOp = typename Config::ActivationOp;
     static constexpr unsigned kStage = 2;
+    static constexpr unsigned kGroupDim = Config::kGroupDim;
+    static constexpr unsigned kTokenBatch = Config::kTokenBatch;
     using Input = typename Trait::Input;
     static constexpr unsigned kAccumFragments = Trait::kAccumFragments;
 
@@ -57,14 +61,18 @@ struct OnestageFusedMoEStage1DoubleBufferOp {
 
         trait.AddBias(t_gate, t_up, tid);
         for (unsigned i = 0; i < kAccumFragments; i++) {
-            h[i] = SiluDotOp::Apply(t_gate[i], t_up[i]);
+            h[i] = ActivationOp::Apply(t_gate[i], t_up[i]);
         }
     }
 };
 
-template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
+template <class Trait>
 struct OnestageFusedMoEStage1SingleBufferOp {
+    using Config = typename Trait::Config;
+    using ActivationOp = typename Config::ActivationOp;
     static constexpr unsigned kStage = 1;
+    static constexpr unsigned kGroupDim = Config::kGroupDim;
+    static constexpr unsigned kTokenBatch = Config::kTokenBatch;
     using Input = typename Trait::Input;
     static constexpr unsigned kAccumFragments = Trait::kAccumFragments;
 
@@ -92,7 +100,7 @@ struct OnestageFusedMoEStage1SingleBufferOp {
 
         trait.AddBias(t_gate, t_up, tid);
         for (unsigned i = 0; i < kAccumFragments; i++) {
-            h[i] = SiluDotOp::Apply(t_gate[i], t_up[i]);
+            h[i] = ActivationOp::Apply(t_gate[i], t_up[i]);
         }
     }
 };

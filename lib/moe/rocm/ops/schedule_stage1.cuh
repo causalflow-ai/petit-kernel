@@ -131,14 +131,14 @@ MatmulBlockScaleFp4(float4 t[2 * kLoadGlobal], const uint4 w[kLoadGlobal],
     }
 }
 
-template <class Config, unsigned kTokenBatch>
+template <class Config_>
 struct BlockScaleFp8Stage1Schedule {
-    using Scalar = __hip_fp8_e4m3;
+    using Config = Config_;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kActivationFragments = 8;
-    using Input = ChannelScaleFp8Input<Config>;
-    using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
-    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
+    using Input = typename Config::Input;
+    using W13 = typename Config::W13;
+    using Bias = typename Config::Bias;
 
     struct Shm {
         unsigned act[Input::kShmInputElements];
@@ -230,14 +230,15 @@ struct BlockScaleFp8Stage1Schedule {
     }
 };
 
-template <class Config, unsigned kTokenBatch>
+template <class Config_>
 struct PetitMxFp4Stage1Schedule {
+    using Config = Config_;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kActivationFragments = Config::kGroupDim / 32;
     static constexpr unsigned kKStages = Config::kGroupDim / 128;
-    using Input = ChannelScaleFp8Input<Config>;
-    using W13 = MxFp4WeightLayout<kNumWarps, Config::kGroupDim>;
-    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
+    using Input = typename Config::Input;
+    using W13 = typename Config::W13;
+    using Bias = typename Config::Bias;
 
     struct Shm {
         unsigned act[Input::kShmInputElements];

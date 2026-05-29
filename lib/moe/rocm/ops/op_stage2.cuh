@@ -54,11 +54,14 @@ __device__ static inline uint2 ToBf16Rn(float4 m) {
     return o;
 }
 
-template <class Trait, unsigned kGroupDim, unsigned kTokenBatch>
+template <class Trait>
 struct OnestageFusedMoEStage2Op {
+    using Config = typename Trait::Config;
     static constexpr unsigned kNumWarps = 4;
     static constexpr unsigned kStage = 2;
     static constexpr unsigned kSubGroupSize = 16;
+    static constexpr unsigned kGroupDim = Config::kGroupDim;
+    static constexpr unsigned kTokenBatch = Config::kTokenBatch;
     static constexpr unsigned kSubGroupPadding = 2;
     static constexpr unsigned kSubGroupRowWords =
         2 * kSubGroupSize + kSubGroupPadding;

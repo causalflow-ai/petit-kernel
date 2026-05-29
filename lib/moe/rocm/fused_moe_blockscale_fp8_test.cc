@@ -25,6 +25,13 @@ namespace moe_test = causalflow::petit::rocm::moe::test_utils;
 using moe_test::FillParallelIndexed;
 using moe_test::FillWeightsParallel;
 
+static constexpr FusedMoESolutionId kTestSolutionId = FusedMoESolutionId::Make(
+    FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kBlockScaleFp8,
+    FusedMoEDataType::kNone, FusedMoEWeightOrdering::kPetitFp8,
+    FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
+    FusedMoEActivationFunction::kSiluDot,
+    FusedMoEStage1Buffering::kDoubleBuffer);
+
 template <unsigned kTokens_, unsigned kDim_, unsigned kInterDim_,
           unsigned kExperts_, unsigned kTopK_>
 struct TestConfig {
@@ -175,20 +182,28 @@ template <class Config> void TestRunner<Config>::CopyHostToDeviceContext() {
 }
 
 template <class Config> int TestRunner<Config>::RunKernelImpl() {
-    return FusedMoEBlockScaleFP8(
-        reinterpret_cast<uint4 *>(d_ctx_->out),
-        reinterpret_cast<const uint4 *>(d_ctx_->q_act),
-        reinterpret_cast<const uint4 *>(d_ctx_->w1),
-        reinterpret_cast<const uint4 *>(d_ctx_->w2),
-        reinterpret_cast<const uint4 *>(d_ctx_->sorted_token_ids),
-        reinterpret_cast<const uint4 *>(d_ctx_->sorted_weights),
-        reinterpret_cast<const uint4 *>(d_ctx_->sorted_expert_ids),
-        d_ctx_->num_valid_ids, Context::kTopK,
-        reinterpret_cast<const uint4 *>(d_ctx_->scale_act_t),
-        reinterpret_cast<const uint4 *>(d_ctx_->scale_fc1),
+    FusedMoE1StageParams params{
+        reinterpret_cast<unsigned *>(d_ctx_->out),
+        reinterpret_cast<const unsigned *>(d_ctx_->q_act),
+        reinterpret_cast<const unsigned *>(d_ctx_->w1),
+        reinterpret_cast<const unsigned *>(d_ctx_->w2),
+        reinterpret_cast<const unsigned *>(d_ctx_->sorted_token_ids),
+        reinterpret_cast<const unsigned *>(d_ctx_->sorted_weights),
+        reinterpret_cast<const unsigned *>(d_ctx_->sorted_expert_ids),
+        d_ctx_->num_valid_ids,
+        Context::kTopK,
+        reinterpret_cast<const unsigned *>(d_ctx_->scale_act_t),
+        reinterpret_cast<const unsigned *>(d_ctx_->scale_fc1),
         reinterpret_cast<const unsigned *>(d_ctx_->scale_fc2),
-        Context::kMaxNumMBlocks, Context::kTokens, Context::kDim,
-        Context::kInterDim, nullptr);
+        Context::kMaxNumMBlocks,
+        Context::kTokens,
+        Context::kDim,
+        Context::kInterDim,
+        Context::kExperts,
+        nullptr,
+        0,
+    };
+    return FusedMoEMatmul1Stage(params, kTestSolutionId.Repr());
 }
 
 template <class Config> void TestRunner<Config>::InitializeW13HostData() {

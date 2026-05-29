@@ -14,10 +14,11 @@ __host__ __device__ static constexpr int Stage2ScaleDppCtrl(int stage,
     return (stage << 1) + (col >> 1);
 }
 
-template <class Config> struct BlockScaleFp8Stage2Schedule {
+template <class Config_> struct BlockScaleFp8Stage2Schedule {
+    using Config = Config_;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
-    using W2 = W2Layout<__hip_fp8_e4m3, kNumWarps, Config::kGroupN>;
-    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
+    using W2 = typename Config::W2;
+    using Bias = typename Config::Bias;
     W2 &w2;
     Bias &w2_bias;
     uint4 w2_tile[2][2][W2::kLoadGlobal];
@@ -59,11 +60,12 @@ template <class Config> struct BlockScaleFp8Stage2Schedule {
 
 };
 
-template <class Config> struct PetitMxFp4Stage2Schedule {
+template <class Config_> struct PetitMxFp4Stage2Schedule {
+    using Config = Config_;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr int kKStages = Config::kGroupN / 128;
-    using W2 = MxFp4WeightLayout<kNumWarps, Config::kGroupN>;
-    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
+    using W2 = typename Config::W2;
+    using Bias = typename Config::Bias;
     W2 &w2;
     Bias &w2_bias;
     uint4 w2_tile[2][kKStages][W2::kLoadGlobal];

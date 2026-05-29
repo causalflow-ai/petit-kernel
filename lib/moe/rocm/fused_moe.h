@@ -4,44 +4,126 @@
 
 namespace causalflow::petit::rocm::moe {
 
-static constexpr int kFusedMoEErrorInvalidShape = 1;
-static constexpr int kFusedMoEErrorInvalidArgument = 2;
-static constexpr int kFusedMoEErrorUnsupportedArch = 3;
+enum {
+    kFusedMoEErrorInvalidSolution = 1,
+    kFusedMoEErrorInvalidArgument = 2,
+    kFusedMoEErrorUnsupported = 3,
+};
 
-// Fused-MoE FP8 block-scale kernel (single solution: 32x128x256 thread-group).
-//
-// Tensor layouts:
-// - out:             [m, n] float
-// - act:             [m, n] fp8_e4m3
-// - w13:             [experts, 2 * k, n] fp8_e4m3
-// - w2:              [experts, n, k] fp8_e4m3
-// - sorted_token_ids:[max_num_tokens_padded] uint32 token ids
-// - sorted_weights:  [max_num_tokens_padded] float route weights
-// - sorted_expert_ids:[max_num_m_blocks] uint32 expert ids
-// - num_valid_ids:   [2] uint32 = {num_valid_sorted_ids, token_count}
-// - scales_act:      [m, n / 128] float
-// - scales_w13:      [experts, (2 * k / 128) * (n / 128)] float
-// - scales_w2:       [experts, (k / 128) * (n / 128)] float-bitcast-u32
-//
-// m = token count, n = model dim, k = inter dim.
-int FusedMoEBlockScaleFP8(uint4 *__restrict__ out, const uint4 *act,
-                          const uint4 *w13, const uint4 *w2,
-                          const uint4 *sorted_token_ids,
-                          const uint4 *sorted_weights,
-                          const uint4 *sorted_expert_ids,
-                          const unsigned *num_valid_ids, unsigned topk,
-                          const uint4 *scales_act, const uint4 *scales_w13,
-                          const unsigned *scales_w2, unsigned max_num_m_blocks,
-                          unsigned m, unsigned n, unsigned k,
-                          hipStream_t stream, unsigned num_persistent_tgs = 0);
+enum class FusedMoEDataType : unsigned {
+    kNone,
+    kMxFp4,
+    kNvFp4,
+    kChannelScaleFp8,
+    kBlockScaleFp8,
+    kBf16,
+};
 
-int FusedMoEBlockScaleFP8MXFP4Weight(
-    uint4 *__restrict__ out, const uint4 *act, const uint4 *w13,
-    const uint4 *w2, const uint4 *sorted_token_ids, const uint4 *sorted_weights,
-    const uint4 *sorted_expert_ids, const unsigned *num_valid_ids,
-    unsigned topk, const uint4 *scales_act, const uint4 *scales_w13,
-    const unsigned *scales_w2, unsigned max_num_m_blocks, unsigned m,
-    unsigned n, unsigned k, unsigned num_experts, hipStream_t stream,
-    unsigned num_persistent_tgs = 0);
+enum class FusedMoEWeightOrdering : unsigned {
+    kNativeMxFp4,
+    kPetitMxFp4,
+    kPetitFp8,
+};
+
+enum class FusedMoEStages : unsigned {
+    kOneStage,
+    kTwoStage,
+};
+
+enum class FusedMoEMfmaShape : unsigned {
+    kMfmaFp816x16x32,
+};
+
+enum class FusedMoEActivationFunction : unsigned {
+    kSiluDot,
+    kOpenAISwiGLU,
+};
+
+enum class FusedMoEStage1Buffering : unsigned {
+    kSingleBuffer,
+    kDoubleBuffer,
+};
+
+struct FusedMoESolutionId {
+    FusedMoEDataType act_dtype : 4;
+    FusedMoEDataType weight_dtype : 4;
+    FusedMoEDataType bias_dtype : 4;
+    FusedMoEWeightOrdering weight_ordering : 2;
+    FusedMoEMfmaShape mfma : 2;
+    FusedMoEStages stages : 4;
+    FusedMoEActivationFunction activation : 3;
+    FusedMoEStage1Buffering stage1_buffering : 1;
+    unsigned long padding : 40;
+
+    constexpr unsigned long Repr() const {
+        return (static_cast<unsigned long>(act_dtype) << 0) |
+               (static_cast<unsigned long>(weight_dtype) << 4) |
+               (static_cast<unsigned long>(bias_dtype) << 8) |
+               (static_cast<unsigned long>(weight_ordering) << 12) |
+               (static_cast<unsigned long>(mfma) << 14) |
+               (static_cast<unsigned long>(stages) << 16) |
+               (static_cast<unsigned long>(activation) << 20) |
+               (static_cast<unsigned long>(stage1_buffering) << 23);
+    }
+
+    static constexpr FusedMoESolutionId FromRepr(unsigned long repr) {
+        return FusedMoESolutionId{
+            static_cast<FusedMoEDataType>((repr >> 0) & 0xf),
+            static_cast<FusedMoEDataType>((repr >> 4) & 0xf),
+            static_cast<FusedMoEDataType>((repr >> 8) & 0xf),
+            static_cast<FusedMoEWeightOrdering>((repr >> 12) & 0x3),
+            static_cast<FusedMoEMfmaShape>((repr >> 14) & 0x3),
+            static_cast<FusedMoEStages>((repr >> 16) & 0xf),
+            static_cast<FusedMoEActivationFunction>((repr >> 20) & 0x7),
+            static_cast<FusedMoEStage1Buffering>((repr >> 23) & 0x1),
+            0,
+        };
+    }
+
+    static constexpr FusedMoESolutionId
+    Make(FusedMoEDataType act_dtype, FusedMoEDataType weight_dtype,
+         FusedMoEDataType bias_dtype, FusedMoEWeightOrdering weight_ordering,
+         FusedMoEMfmaShape mfma, FusedMoEStages stages,
+         FusedMoEActivationFunction activation,
+         FusedMoEStage1Buffering stage1_buffering) {
+        return FusedMoESolutionId{
+            act_dtype, weight_dtype, bias_dtype, weight_ordering,
+            mfma,      stages,       activation,  stage1_buffering,
+            0,
+        };
+    }
+};
+static_assert(sizeof(FusedMoESolutionId) == 8, "");
+
+struct FusedMoE1StageParams {
+    unsigned *out;
+    const unsigned *act;
+    const unsigned *w13;
+    const unsigned *w2;
+    const unsigned *sorted_token_ids;
+    const unsigned *sorted_weights;
+    const unsigned *sorted_expert_ids;
+    const unsigned *num_valid_ids;
+    unsigned topk;
+    const unsigned *scales_act;
+    const unsigned *scales_w13;
+    const unsigned *scales_w2;
+    unsigned max_num_m_blocks;
+    unsigned m;
+    unsigned n;
+    unsigned k;
+    unsigned num_experts;
+    hipStream_t stream;
+    unsigned num_persistent_tgs;
+    const void *w13_bias = nullptr;
+    const void *w2_bias = nullptr;
+};
+
+int FusedMoEMatmul1Stage(FusedMoE1StageParams params,
+                         unsigned long solution_id);
+
+template <unsigned long kRepr> struct FusedMoESolutionAdapter {
+    static int Invoke(FusedMoE1StageParams params);
+};
 
 } // namespace causalflow::petit::rocm::moe
