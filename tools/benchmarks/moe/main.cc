@@ -296,8 +296,8 @@ static HostInputs MakeInputs(unsigned tokens, unsigned dim, unsigned inter_dim,
                                    n_blocks);
 
     std::mt19937 gen(seed);
-    std::normal_distribution<float> input_dist(0.0f, 1.0f);
-    std::normal_distribution<float> spike_dist(0.0f, 16.0f);
+    std::normal_distribution<float> input_dist(0.0f, 0.5f);
+    std::normal_distribution<float> spike_dist(0.0f, 8.0f);
     std::normal_distribution<float> scale_dist(1.0e-4f, 2.0e-5f);
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
     std::uniform_real_distribution<float> rw_dist(0.0f, 1.0f);
@@ -316,7 +316,7 @@ static HostInputs MakeInputs(unsigned tokens, unsigned dim, unsigned inter_dim,
             }
             reinterpret_cast<float *>(&values)[i] = x;
         }
-        return __hip_fp8x4_e4m3(values).__x;
+        return __hip_fp8x4_e4m3_fnuz(values).__x;
     });
     FillWeightsParallel(&in.w13_fp8, weight_sampler, seed, 0x913u);
     FillWeightsParallel(&in.w2_fp8, weight_sampler, seed, 0x2d5u);

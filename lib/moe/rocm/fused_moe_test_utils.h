@@ -311,10 +311,10 @@ class TestRunnerBase {
   public:
     static constexpr unsigned kSeed = 42;
     static constexpr float kWeightStd = 40.0f;
-    static constexpr float kInputStd = 1.0f;
-    static constexpr float kInputMean = 0.1f;
+    static constexpr float kInputStd = 0.5f;
+    static constexpr float kInputMean = 0.05f;
     static constexpr float kInputSpikeProb = 0.002f;
-    static constexpr float kInputSpikeStd = 16.0f;
+    static constexpr float kInputSpikeStd = 8.0f;
 
     explicit TestRunnerBase(TestRunnerConfig config);
     virtual ~TestRunnerBase();

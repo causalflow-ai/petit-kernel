@@ -574,7 +574,7 @@ void TestRunnerBase::InitializeHostData() {
             }
             reinterpret_cast<float *>(&values)[i] = x;
         }
-        return __hip_fp8x4_e4m3(values).__x;
+        return __hip_fp8x4_e4m3_fnuz(values).__x;
     };
     auto gen_scale = [&]() { return SampleScale(gen); };
 
