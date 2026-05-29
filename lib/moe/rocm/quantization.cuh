@@ -11,7 +11,11 @@
 namespace causalflow::petit::rocm::moe {
 
 static constexpr unsigned kQuantBlockK = 128;
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+static constexpr float kFp8E4m3Max = 448.0f;
+#else
 static constexpr float kFp8E4m3Max = 240.0f;
+#endif
 static constexpr float kQuantFloor = 1e-6f;
 
 __host__ __device__ static inline float ClampQuantAbsmax(float absmax) {

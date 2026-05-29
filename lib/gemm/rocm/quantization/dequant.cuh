@@ -68,9 +68,13 @@ struct DequantizerForFp8ScaleImpl {
     static constexpr unsigned kScaleBias = (1 << (kScaleEx - 1)) - 1;
     static constexpr unsigned kFp16Bias = (1 << (kFp16Ex - 1)) - 1;
     // This compensates the effect that CDNA3 uses fp8e5m2fnuz where the bias is
-    // 16 instead of 15.
+    // 16 instead of 15. gfx950 and newer use OCP BF8 with bias 15.
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+    static constexpr unsigned kIntermediateConvertBias = 0;
+#else
     static constexpr unsigned kIntermediateConvertBias =
         kIntermediateDataType == kDataTypeFp8e5m2Fnuz ? 1 : 0;
+#endif
 
     // The MatrixCore might flush all the denorms to zeros for bf16, therefore
     // we upscale the scales before the mfma instructions.
@@ -330,9 +334,14 @@ UnifiedDequantizerForFp4Bf16<kHighPrecision>::DequantWithScaleImplBf8Fnuz(
 #if HAS_AMD_BF8_PACK_CONVERSION
     // Since internally it is FP16, the bias is the same as the FP16 bias.
     // For high precision we divide by 2 ** 7 to undo preprocessing of scales.
-    // The additional 1 in bias is to compensate fnuz bias offset (16 vs 15).
+    // CDNA3 BF8 is FNUZ (bias 16), while gfx950 BF8 is OCP (bias 15).
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+    static constexpr unsigned kBias = kHighPrecision ? 0x43000000  // 2 ** 7
+                                                     : 0x46800000; // 2 ** 14
+#else
     static constexpr unsigned kBias = kHighPrecision ? 0x43800000  // 2 ** 8
                                                      : 0x46800000; // 2 ** 14
+#endif
     const float2 bias_f32_2{reinterpret_cast<const float &>(kBias),
                             reinterpret_cast<const float &>(kBias)};
 
@@ -378,7 +387,11 @@ struct UnifiedDequantizerForMxFp4Bf16
         if constexpr (kHighPrecision) {
             return 1.0f;
         } else {
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+            return 16384.0f;
+#else
             return 32768.0f;
+#endif
         }
     }
 };

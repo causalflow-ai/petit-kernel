@@ -209,7 +209,9 @@ double FP8E4M3DiscreteSampler::realized_sigma() const {
                      slope_ * ArithmeticGain());
 }
 
-float FP8E4M3DiscreteSampler::Decode(uint8_t value) {
+namespace {
+
+float DecodeOcp(uint8_t value) {
     const int sign = (value >> 7) ? -1 : 1;
     const int exponent = (value >> 3) & 0xF;
     const int mantissa = value & 0x7;
@@ -232,8 +234,61 @@ float FP8E4M3DiscreteSampler::Decode(uint8_t value) {
     return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, e);
 }
 
+float DecodeFnuz(uint8_t value) {
+    if (value == 0x80) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    if (value == 0) {
+        return 0.0f;
+    }
+
+    const int sign = (value >> 7) ? -1 : 1;
+    int exponent = (value >> 3) & 0xF;
+    int mantissa = value & 0x7;
+    if (exponent == 0) {
+        const int shift =
+            1 + __builtin_clz(static_cast<unsigned>(mantissa)) - (32 - 3);
+        mantissa <<= shift;
+        exponent += 1 - shift;
+        mantissa &= 0x7;
+    }
+
+    const int e = exponent - 8;
+    return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, e);
+}
+
+bool IsFiniteCode(uint8_t code, FP8E4M3Format format) {
+    switch (format) {
+    case FP8E4M3Format::kOcp:
+        return (code & 0x7f) != 0x7f && code != 0x80;
+    case FP8E4M3Format::kFnuz:
+        return code != 0x80;
+    }
+    return false;
+}
+
+} // namespace
+
+float FP8E4M3DiscreteSampler::Decode(uint8_t value, FP8E4M3Format format) {
+    switch (format) {
+    case FP8E4M3Format::kOcp:
+        return DecodeOcp(value);
+    case FP8E4M3Format::kFnuz:
+        return DecodeFnuz(value);
+    }
+    return std::numeric_limits<float>::quiet_NaN();
+}
+
+float FP8E4M3DiscreteSampler::Decode(uint8_t value) {
+    return Decode(value, FP8E4M3Format::kOcp);
+}
+
 FP8E4M3QuantizedNormalSampler::FP8E4M3QuantizedNormalSampler(double mean,
-                                                             double sigma) {
+                                                             double sigma)
+    : FP8E4M3QuantizedNormalSampler(mean, sigma, FP8E4M3Format::kOcp) {}
+
+FP8E4M3QuantizedNormalSampler::FP8E4M3QuantizedNormalSampler(
+    double mean, double sigma, FP8E4M3Format format) {
     if (!std::isfinite(mean)) {
         throw std::invalid_argument("mean must be finite");
     }
@@ -249,13 +304,15 @@ FP8E4M3QuantizedNormalSampler::FP8E4M3QuantizedNormalSampler(double mean,
     std::vector<CodePoint> points;
     points.reserve(254);
     for (unsigned code = 0; code < 256; ++code) {
-        if ((code & 0x7f) == 0x7f || code == 0x80) {
+        const auto fp8_code = static_cast<uint8_t>(code);
+        if (!IsFiniteCode(fp8_code, format)) {
             continue;
         }
-        points.push_back(
-            {.value = static_cast<double>(
-                 FP8E4M3DiscreteSampler::Decode(static_cast<uint8_t>(code))),
-             .code = static_cast<uint8_t>(code)});
+        points.push_back({
+            .value = static_cast<double>(
+                FP8E4M3DiscreteSampler::Decode(fp8_code, format)),
+            .code = fp8_code,
+        });
     }
 
     std::sort(points.begin(), points.end(),

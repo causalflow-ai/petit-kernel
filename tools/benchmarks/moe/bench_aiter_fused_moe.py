@@ -14,6 +14,15 @@ BLOCK_K = 128
 SORTED_TOKEN_PADDING = 32
 
 
+def native_fp8_e4m3_dtype(device: torch.device) -> torch.dtype:
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    if arch.startswith(("gfx950", "gfx1200", "gfx1201")) and hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    if hasattr(torch, "float8_e4m3fnuz"):
+        return torch.float8_e4m3fnuz
+    return torch.float8_e4m3fn
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark Fused MoE FP8 blockscale kernel (petit or aiter)."
@@ -269,20 +278,21 @@ class FusedMoEInputBuilder:
         model_blocks = dim // BLOCK_K
         w2_row_blocks = dim // BLOCK_N
         inter_blocks = inter_dim // BLOCK_K
+        fp8_dtype = native_fp8_e4m3_dtype(self.device)
 
-        input_q = self._sample_spiky_input((self.tokens, dim)).to(torch.float8_e4m3fnuz)
+        input_q = self._sample_spiky_input((self.tokens, dim)).to(fp8_dtype)
         input_scale = self._rand_positive_normal((self.tokens, model_blocks), self.SCALE_INV_MEAN, self.SCALE_INV_STD)
         if self.weight_format == "fp8":
             w1_q = (
                 torch.randn((experts, inter_dim * 2, dim), dtype=torch.float32, device=self.device)
                 * self.WEIGHT_STD
                 + self.WEIGHT_MEAN
-            ).to(torch.float8_e4m3fnuz)
+            ).to(fp8_dtype)
             w2_q = (
                 torch.randn((experts, dim, inter_dim), dtype=torch.float32, device=self.device)
                 * self.WEIGHT_STD
                 + self.WEIGHT_MEAN
-            ).to(torch.float8_e4m3fnuz)
+            ).to(fp8_dtype)
             fc1_scale = self._rand_positive_normal(
                 (experts, ((inter_dim * 2) // BLOCK_N) * model_blocks), self.SCALE_INV_MEAN, self.SCALE_INV_STD
             )
@@ -512,8 +522,8 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA/HIP device is not available.", file=sys.stderr)
         return 1
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        print("torch.float8_e4m3fnuz is required for this benchmark.", file=sys.stderr)
+    if not (hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e4m3fnuz")):
+        print("torch float8_e4m3 dtype is required for this benchmark.", file=sys.stderr)
         return 1
 
     torch.manual_seed(args.seed)

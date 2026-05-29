@@ -47,7 +47,11 @@ struct QuantizeAndShuffleFp8 {
                                          unsigned tid, float4 &quant_scale,
                                          float4 &dequant_scale) {
         static constexpr float kLocalMaxFloor = 1e-6;
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+        static constexpr float kFp8e4m3Max = 448;
+#else
         static constexpr float kFp8e4m3Max = 240;
+#endif
         auto qs2 = reinterpret_cast<float2 *>(&quant_scale);
         auto ds2 = reinterpret_cast<float2 *>(&dequant_scale);
         quant_scale = {0, 0, 0, 0};

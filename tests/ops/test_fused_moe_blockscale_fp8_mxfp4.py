@@ -35,8 +35,27 @@ def _quantize_input(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     absmax = blocks.abs().amax(dim=-1).clamp_min(1e-6)
     q_scale = 240.0 / absmax
     input_scale = absmax / 240.0
-    input_q = (blocks * q_scale.unsqueeze(-1)).to(torch.float8_e4m3fnuz).view(tokens, model_dim)
+    input_q = (
+        (blocks * q_scale.unsqueeze(-1))
+        .to(_native_fp8_dtype_or_skip(x.device))
+        .view(tokens, model_dim)
+    )
     return input_q.contiguous(), input_scale.contiguous()
+
+
+def _native_fp8_dtype_or_skip(device: torch.device) -> torch.dtype:
+    if not (hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e4m3fnuz")):
+        pytest.skip("torch float8_e4m3 dtype is required")
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    if arch.startswith(("gfx950", "gfx1200", "gfx1201")) and hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    if hasattr(torch, "float8_e4m3fnuz"):
+        return torch.float8_e4m3fnuz
+    return torch.float8_e4m3fn
+
+
+def _require_fp8_e4m3() -> None:
+    _native_fp8_dtype_or_skip(torch.device("cuda"))
 
 
 def _rand_moment_mxfp4_tensor(
@@ -224,9 +243,8 @@ def _run_petit_moe_kernel(
     fc2_scale_packed: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    input_q_arg = input_q if input_q.dtype == torch.uint8 else input_q.view(torch.uint8)
     return petit_kernel.fused_moe_fp8_blockscale_g1u1_mxfp4(
-        input_q_arg,
+        input_q,
         w13_q_packed,
         w2_q_packed,
         sorted_token_ids,
@@ -294,8 +312,7 @@ def _run_fused_moe_case(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HIP/CUDA device required")
 def test_fused_moe_blockscale_fp8_mxfp4_reuses_output_buffer() -> None:
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required")
+    _require_fp8_e4m3()
 
     torch.manual_seed(20260430)
     device = torch.device("cuda")
@@ -385,8 +402,7 @@ def test_fused_moe_blockscale_fp8_mxfp4_reuses_output_buffer() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HIP/CUDA device required")
 def test_fused_moe_blockscale_fp8_mxfp4_skips_invalid_expert_group() -> None:
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required")
+    _require_fp8_e4m3()
 
     torch.manual_seed(20260502)
     device = torch.device("cuda")
@@ -461,8 +477,7 @@ def test_fused_moe_blockscale_fp8_mxfp4_skips_invalid_expert_group() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HIP/CUDA device required")
 def test_fused_moe_blockscale_fp8_mxfp4_cuda_graph_replay_updates_output() -> None:
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required")
+    _require_fp8_e4m3()
 
     torch.manual_seed(20260501)
     device = torch.device("cuda")
@@ -583,8 +598,7 @@ def test_fused_moe_blockscale_fp8_mxfp4_cuda_graph_replay_updates_output() -> No
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HIP/CUDA device required")
 def test_fused_moe_blockscale_fp8_mxfp4_matches_reference() -> None:
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required")
+    _require_fp8_e4m3()
 
     torch.manual_seed(1234)
     device = torch.device("cuda")
@@ -639,8 +653,7 @@ def test_fused_moe_blockscale_fp8_mxfp4_matches_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HIP/CUDA device required")
 def test_fused_moe_blockscale_fp8_mxfp4_dump_replay_matches_reference() -> None:
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required")
+    _require_fp8_e4m3()
 
     dump_paths = _collect_dump_paths()
     if not dump_paths:
@@ -651,7 +664,7 @@ def test_fused_moe_blockscale_fp8_mxfp4_dump_replay_matches_reference() -> None:
 
     atol = float(os.environ.get("PETIT_MOE_DUMP_ATOL", "2.5e-2"))
     rtol = float(os.environ.get("PETIT_MOE_DUMP_RTOL", "0.0"))
-    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_dtype = _native_fp8_dtype_or_skip(torch.device("cuda"))
 
     for dump_path in dump_paths:
         obj = torch.load(dump_path, map_location="cuda")

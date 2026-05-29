@@ -40,6 +40,17 @@ ULTRA_HARSH_PER_ELEMENT_ATOL = 1.0
 ULTRA_HARSH_PER_ELEMENT_RTOL = 5e-2
 
 
+def _native_fp8_dtype_or_skip(device: torch.device) -> torch.dtype:
+    if not (hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e4m3fnuz")):
+        pytest.skip("a torch float8_e4m3 dtype is required for this kernel")
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    if arch.startswith(("gfx950", "gfx1200", "gfx1201")) and hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    if hasattr(torch, "float8_e4m3fnuz"):
+        return torch.float8_e4m3fnuz
+    return torch.float8_e4m3fn
+
+
 def _run_petit_fp8_kernel(
     kernel_data: dict[str, torch.Tensor],
     data: dict[str, torch.Tensor],
@@ -457,8 +468,9 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
 
     def build_ultra_harsh(self) -> dict[str, torch.Tensor]:
         block_n, block_k = BLOCK_SHAPE
+        fp8_dtype = _native_fp8_dtype_or_skip(self.device)
         input_q = self._sample_spiky_input((self.tokens, self.model_dim)).to(
-            torch.float8_e4m3fnuz
+            fp8_dtype
         )
         input_scale = self._rand_positive_normal(
             (self.tokens, self.model_dim // block_k),
@@ -473,7 +485,7 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
             )
             * self.ULTRA_HARSH_WEIGHT_STD
             + self.ULTRA_HARSH_WEIGHT_MEAN
-        ).to(torch.float8_e4m3fnuz)
+        ).to(fp8_dtype)
         w2_q = (
             torch.randn(
                 (self.experts, self.model_dim, self.inter_dim),
@@ -482,7 +494,7 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
             )
             * self.ULTRA_HARSH_WEIGHT_STD
             + self.ULTRA_HARSH_WEIGHT_MEAN
-        ).to(torch.float8_e4m3fnuz)
+        ).to(fp8_dtype)
 
         token_idx = torch.arange(self.tokens, dtype=torch.int64, device=self.device).unsqueeze(1)
         slot_idx = torch.arange(self.topk, dtype=torch.int64, device=self.device).unsqueeze(0)
@@ -527,6 +539,7 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
 
     def build_replay_like_sensitive(self) -> dict[str, torch.Tensor]:
         block_n, block_k = BLOCK_SHAPE
+        fp8_dtype = _native_fp8_dtype_or_skip(self.device)
         assert self.tokens == 2
         assert self.model_dim == 7168
         assert self.inter_dim == 2048
@@ -534,7 +547,7 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
         assert self.topk == 8
 
         input_q = self._sample_spiky_input((self.tokens, self.model_dim)).to(
-            torch.float8_e4m3fnuz
+            fp8_dtype
         )
         input_scale = self._rand_positive_normal(
             (self.tokens, self.model_dim // block_k), 0.10, 0.02
@@ -546,14 +559,14 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
                 dtype=torch.float32,
                 device=self.device,
             )
-        ).to(torch.float8_e4m3fnuz)
+        ).to(fp8_dtype)
         w2_q = (
             torch.randn(
                 (self.experts, self.model_dim, self.inter_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
-        ).to(torch.float8_e4m3fnuz)
+        ).to(fp8_dtype)
         fc1_scale = self._rand_positive_normal(
             (self.experts, ((self.inter_dim * 2) // block_n) * (self.model_dim // block_k)),
             0.020,
@@ -587,10 +600,8 @@ def test_fmoe_blockscale_fp8_reference_matches_aiter_kernel(
     topk: int,
 ):
     aiter = pytest.importorskip("aiter")
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required for this kernel")
-
     device = torch.device("cuda")
+    _native_fp8_dtype_or_skip(device)
     dtype = torch.bfloat16
     ref_impl = FusedMoESiluTorchOps(
         out_dtype=dtype,
@@ -667,9 +678,6 @@ def test_fmoe_blockscale_fp8_reference_matches_aiter_kernel(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Petit kernel requires a GPU")
 def test_fmoe_blockscale_fp8_replay_like_sensitive_matches_reference():
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required for this kernel")
-
     tokens = 2
     model_dim = DEEPSEEK_V32_EXP["dim"]
     inter_dim = DEEPSEEK_V32_EXP["moe_inter_dim"]
@@ -677,6 +685,7 @@ def test_fmoe_blockscale_fp8_replay_like_sensitive_matches_reference():
     topk = 8
 
     device = torch.device("cuda")
+    _native_fp8_dtype_or_skip(device)
     dtype = torch.bfloat16
     ref_impl = FusedMoESiluTorchOps(out_dtype=dtype)
 
@@ -724,9 +733,6 @@ def test_fmoe_blockscale_fp8_replay_like_sensitive_matches_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="AITER kernel requires a GPU")
 def test_fmoe_blockscale_fp8_petit_supports_preallocated_out_and_cuda_graph():
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required for this kernel")
-
     tokens = 40
     model_dim = DEEPSEEK_V32_EXP["dim"]
     inter_dim = DEEPSEEK_V32_EXP["moe_inter_dim"]
@@ -734,6 +740,7 @@ def test_fmoe_blockscale_fp8_petit_supports_preallocated_out_and_cuda_graph():
     topk = DEEPSEEK_TOPK
 
     device = torch.device("cuda")
+    _native_fp8_dtype_or_skip(device)
     dtype = torch.bfloat16
 
     torch.manual_seed(42)
@@ -827,21 +834,22 @@ def _build_zero_route_smoke_repro_case(
     model_dim = DEEPSEEK_V32_EXP["dim"]
     inter_dim = DEEPSEEK_V32_EXP["moe_inter_dim"]
     topk = DEEPSEEK_V32_EXP["n_activated_experts"]
+    fp8_dtype = _native_fp8_dtype_or_skip(device)
 
     return {
         "input_q": torch.zeros(
             (tokens, model_dim),
-            dtype=torch.float8_e4m3fnuz,
+            dtype=fp8_dtype,
             device=device,
         ),
         "w13_q": torch.empty(
             (0, inter_dim * 2, model_dim),
-            dtype=torch.float8_e4m3fnuz,
+            dtype=fp8_dtype,
             device=device,
         ),
         "w2_q": torch.empty(
             (0, model_dim, inter_dim),
-            dtype=torch.float8_e4m3fnuz,
+            dtype=fp8_dtype,
             device=device,
         ),
         "sorted_token_ids": torch.empty((0,), dtype=torch.int32, device=device),
@@ -869,10 +877,8 @@ def _build_zero_route_smoke_repro_case(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Petit kernel requires a GPU")
 def test_fmoe_blockscale_fp8_zero_route_smoke_repro_supports_cuda_graph():
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required for this kernel")
-
     device = torch.device("cuda")
+    _native_fp8_dtype_or_skip(device)
     case = _build_zero_route_smoke_repro_case(device)
     out = torch.zeros(
         (int(case["num_valid_ids"][1].item()), case["input_q"].shape[1]),
@@ -925,9 +931,6 @@ def test_fmoe_blockscale_fp8_zero_route_smoke_repro_supports_cuda_graph():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="AITER kernel requires a GPU")
 def test_fmoe_blockscale_fp8_single_expert_ultra_harsh_scale_matches_reference():
     aiter = pytest.importorskip("aiter")
-    if not hasattr(torch, "float8_e4m3fnuz"):
-        pytest.skip("torch.float8_e4m3fnuz is required for this kernel")
-
     tokens = 32
     model_dim = 512
     inter_dim = 512
@@ -935,6 +938,7 @@ def test_fmoe_blockscale_fp8_single_expert_ultra_harsh_scale_matches_reference()
     topk = 1
 
     device = torch.device("cuda")
+    _native_fp8_dtype_or_skip(device)
     dtype = torch.bfloat16
     ref_impl = FusedMoESiluTorchOps(out_dtype=dtype)
 

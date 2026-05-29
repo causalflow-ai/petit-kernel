@@ -2,14 +2,14 @@
 
 #include "causalflow/petit/tal/algorithm.h"
 #include "causalflow/petit/tal/tensor/layout.h"
+#include "fused_moe_blockscale_fp8_kernel.cuh"
 #include "gemm/rocm/amd_intrinsics.cuh"
 #include "gemm/rocm/quantization/fp4/quantization_utils.cuh"
 #include "memory_ops.cuh"
 #include "moe/rocm/fused_moe.cuh"
+#include "moe/rocm/ops/onestage_fused_moe_fp8_quantize_shuffle.cuh"
 #include "moe/rocm/ops/onestage_fused_moe_stage1.cuh"
 #include "moe/rocm/ops/onestage_fused_moe_stage2.cuh"
-#include "moe/rocm/ops/onestage_fused_moe_fp8_quantize_shuffle.cuh"
-#include "fused_moe_blockscale_fp8_kernel.cuh"
 #include "moe/rocm/quantization.cuh"
 #include "moe/rocm/warp_schedule.cuh"
 
@@ -53,8 +53,13 @@ __device__ static inline float4 LoadFp8E8m0Scale(unsigned packed) {
     //     "src0_sel:DWORD src1_sel:BYTE_3\r\n"
     //     : "=v"(u[0]), "=v"(u[1]), "=v"(u[2]), "=v"(u[3])
     //     : "v"(packed));
-    // BF8 conversion of FP4 data needs 2^15 compensation
+    // FP4 payloads are embedded into BF8 lanes before MFMA. CDNA3 BF8 uses
+    // FNUZ (bias 16), while gfx950 uses OCP BF8 (bias 15).
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+    static const v4f kExpBias = {16384.0f, 16384.0f, 16384.0f, 16384.0f};
+#else
     static const v4f kExpBias = {32768.0f, 32768.0f, 32768.0f, 32768.0f};
+#endif
     f *= kExpBias;
 
     return reinterpret_cast<const float4 &>(f);
@@ -152,9 +157,8 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
     }
 
     __device__ void Matmul(float4 t_gate[kAccumFragments],
-                           float4 t_up[kAccumFragments],
-                           const InputRegs &regs, unsigned tid, unsigned wid,
-                           unsigned wtid) {
+                           float4 t_up[kAccumFragments], const InputRegs &regs,
+                           unsigned tid, unsigned wid, unsigned wtid) {
         uint4 w3_tile[kKStages][W13::kLoadGlobal];
         unsigned scale_w3[kKStages];
         for (unsigned j = 0; j < kKStages; j++) {
@@ -172,7 +176,6 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
                 t_up, w3_tile[j], regs.x, regs.scale_x, scale_w3[j], j);
         }
     }
-
 };
 
 template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
@@ -186,13 +189,12 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
     using Stage1Trait =
         FusedMoEBlockScaleFP8Fp4Stage1Trait<Config, kTokenBatch>;
     using Stage1Op =
-        OnestageFusedMoEStage1SingleBufferOp<Stage1Trait,
-                                             Config::kGroupDim, kTokenBatch>;
+        OnestageFusedMoEStage1SingleBufferOp<Stage1Trait, Config::kGroupDim,
+                                             kTokenBatch>;
 
     using Stage2Trait = FusedMoEBlockScaleFP8Fp4Stage2Trait<Config>;
     using Stage2Op =
-        OnestageFusedMoEStage2Op<Stage2Trait, Config::kGroupDim,
-                                 kTokenBatch>;
+        OnestageFusedMoEStage2Op<Stage2Trait, Config::kGroupDim, kTokenBatch>;
 
     static constexpr unsigned kElementsPerThread =
         (Config::kGroupM * Config::kGroupN) / kThreads;
@@ -317,11 +319,10 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4Stage2Trait {
         (void)wtid;
         for (unsigned j = 0; j < kKStages; ++j) {
             MatmulBlockScaleFp4<W2::kLoadGlobal, kActivationFragments>(
-                t, w2_tile[stage][j], input.x, input.scale,
-                scale_w2[stage][j], j);
+                t, w2_tile[stage][j], input.x, input.scale, scale_w2[stage][j],
+                j);
         }
     }
-
 };
 
 struct FusedMoEMxFp4Config {

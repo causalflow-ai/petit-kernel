@@ -2,6 +2,7 @@
 
 #include "causalflow/petit/tal/algorithm.h"
 #include "gemm/rocm/quantization/types.h"
+#include "tests/fp8_sampler.h"
 
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
@@ -284,6 +285,7 @@ struct TestRunnerConfig {
     float scale_inv_std;
     float scale_inv_mean;
     float per_element_atol;
+    float ocp_fp8_per_element_atol;
     float per_element_rtol;
 };
 
@@ -303,6 +305,7 @@ constexpr TestRunnerConfig MakeTestRunnerConfig() {
         .scale_inv_std = Config::kScaleInvStd,
         .scale_inv_mean = Config::kScaleInvMean,
         .per_element_atol = Config::kPerElementAtol,
+        .ocp_fp8_per_element_atol = Config::kOcpFp8PerElementAtol,
         .per_element_rtol = Config::kPerElementRtol,
     };
 }
@@ -347,6 +350,7 @@ class TestRunnerBase {
     void ComputeReferences();
 
     TestRunnerConfig config_;
+    causalflow::petit::tests::fp8_sampler::FP8E4M3Format fp8_format_;
     std::vector<unsigned short> reference_out_;
 };
 

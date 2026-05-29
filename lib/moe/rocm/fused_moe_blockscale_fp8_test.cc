@@ -39,6 +39,7 @@ struct TestConfig {
     static constexpr float kScaleInvStd = 8.0e-4f;
     static constexpr float kScaleInvMean = 5.0e-3f;
     static constexpr float kPerElementAtol = 2.5e-2f;
+    static constexpr float kOcpFp8PerElementAtol = 1.3e-1f;
     static constexpr float kPerElementRtol = 0.0f;
 
     template <class Context> static void AdjustScalePatterns(Context &) {}
@@ -48,6 +49,7 @@ struct TestConfig {
 
 struct ReplayLikeSensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
     static constexpr float kPerElementAtol = moe_test::kReplayLikeSensitiveAtol;
+    static constexpr float kOcpFp8PerElementAtol = 1.3e-1f;
     static constexpr float kScaleInvStd = 2.0e-2f;
     static constexpr float kScaleInvMean = 1.0e-1f;
 

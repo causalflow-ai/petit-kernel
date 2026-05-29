@@ -7,6 +7,11 @@
 
 namespace causalflow::petit::tests::fp8_sampler {
 
+enum class FP8E4M3Format {
+    kOcp,
+    kFnuz,
+};
+
 // FP8E4M3DiscreteSampler
 // ----------------------
 // This class generates raw FP8 E4M3 bytes directly, without first generating
@@ -77,6 +82,7 @@ class FP8E4M3DiscreteSampler {
 
     // Decodes a raw FP8 E4M3 byte to float.
     static float Decode(uint8_t value);
+    static float Decode(uint8_t value, FP8E4M3Format format);
 
   private:
     uint8_t SampleFromU32(uint32_t random_u32) const;
@@ -91,6 +97,8 @@ class FP8E4M3QuantizedNormalSampler {
     using result_type = uint8_t;
 
     FP8E4M3QuantizedNormalSampler(double mean, double sigma);
+    FP8E4M3QuantizedNormalSampler(double mean, double sigma,
+                                  FP8E4M3Format format);
 
     template <typename UniformRandomNumberGenerator>
     result_type operator()(UniformRandomNumberGenerator &rng) const {

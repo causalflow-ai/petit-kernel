@@ -7,14 +7,32 @@
 #include "utils/hip_helper.h"
 #include "utils/test_utils.h"
 
+#include <cstring>
+
 namespace causalflow::petit::rocm::moe::test_utils {
 namespace {
+
+namespace fp8_sampler = causalflow::petit::tests::fp8_sampler;
 
 void CheckHipblasStatus(hipblasStatus_t status) {
     if (status != HIPBLAS_STATUS_SUCCESS) {
         std::cerr << "HipBLASLt status: " << status << std::endl;
         throw std::runtime_error("HipBLASLt failure");
     }
+}
+
+fp8_sampler::FP8E4M3Format CurrentDeviceFp8Format() {
+    int dev = 0;
+    CheckHIPStatus(hipGetDevice(&dev));
+    hipDeviceProp_t props;
+    CheckHIPStatus(hipGetDeviceProperties(&props, dev));
+    const char *arch = props.gcnArchName;
+    if (std::strncmp(arch, "gfx950", 6) == 0 ||
+        std::strncmp(arch, "gfx1200", 7) == 0 ||
+        std::strncmp(arch, "gfx1201", 7) == 0) {
+        return fp8_sampler::FP8E4M3Format::kOcp;
+    }
+    return fp8_sampler::FP8E4M3Format::kFnuz;
 }
 
 float BitsAsFloat(unsigned u) {
@@ -237,7 +255,11 @@ DequantizeShuffledBlockScaleFp8Kernel(const unsigned char *q,
     auto o = Store::Ptr(output_ptr);
     for (unsigned idx = tid; idx < kTileRows * kTileCols / 4;
          idx += kBlockSize) {
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+        __hip_fp8x4_e4m3 packed;
+#else
         __hip_fp8x4_e4m3_fnuz packed;
+#endif
         packed.__x = shm[idx];
         const float4 out_fp4 = static_cast<float4>(packed);
         v4f out = reinterpret_cast<const v4f &>(out_fp4);
@@ -530,7 +552,8 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
     }
 }
 
-TestRunnerBase::TestRunnerBase(TestRunnerConfig config) : config_(config) {
+TestRunnerBase::TestRunnerBase(TestRunnerConfig config)
+    : config_(config), fp8_format_(CurrentDeviceFp8Format()) {
     reference_out_.resize(static_cast<size_t>(config_.tokens) * config_.dim,
                           0u);
 }
@@ -555,8 +578,8 @@ void TestRunnerBase::InitializeHostData() {
     std::normal_distribution<float> rw_logit_dist(0.0f, 4.0f);
     std::uniform_int_distribution<unsigned> expert_dist(0, config_.experts - 1);
 
-    causalflow::petit::tests::fp8_sampler::FP8E4M3QuantizedNormalSampler
-        input_sampler(kInputMean, kInputStd);
+    fp8_sampler::FP8E4M3QuantizedNormalSampler input_sampler(
+        kInputMean, kInputStd, fp8_format_);
     auto gen_input4 = [&](size_t idx) {
         float4 values;
         for (int i = 0; i < 4; ++i) {
@@ -564,8 +587,8 @@ void TestRunnerBase::InitializeHostData() {
             FixedU32Rng base_rng{
                 static_cast<uint32_t>(IndexedSeed(kSeed, 0x11du, element_idx))};
             unsigned char value = input_sampler(base_rng);
-            float x = causalflow::petit::tests::fp8_sampler::
-                FP8E4M3DiscreteSampler::Decode(value);
+            float x =
+                fp8_sampler::FP8E4M3DiscreteSampler::Decode(value, fp8_format_);
             const float spike_prob = U32ToOpenUnitFloat(
                 static_cast<uint32_t>(IndexedSeed(kSeed, 0x3c7u, element_idx)));
             if (spike_prob < kInputSpikeProb) {
@@ -573,6 +596,9 @@ void TestRunnerBase::InitializeHostData() {
                                           kSeed, 0x4d9u, element_idx));
             }
             reinterpret_cast<float *>(&values)[i] = x;
+        }
+        if (fp8_format_ == fp8_sampler::FP8E4M3Format::kOcp) {
+            return __hip_fp8x4_e4m3(values).__x;
         }
         return __hip_fp8x4_e4m3_fnuz(values).__x;
     };
@@ -629,10 +655,17 @@ void TestRunnerBase::PrepareDequantizedActivations() {
             const float s =
                 scale_act_t[(col / config_.act_scale_group) * config_.tokens +
                             token];
-            __hip_fp8_e4m3_fnuz value;
-            value.__x = q_act[token * config_.dim + col];
-            dq_act[token * config_.dim + col] =
-                FloatAsBf16(static_cast<float>(value) * s);
+            if (fp8_format_ == fp8_sampler::FP8E4M3Format::kOcp) {
+                __hip_fp8_e4m3 value;
+                value.__x = q_act[token * config_.dim + col];
+                dq_act[token * config_.dim + col] =
+                    FloatAsBf16(static_cast<float>(value) * s);
+            } else {
+                __hip_fp8_e4m3_fnuz value;
+                value.__x = q_act[token * config_.dim + col];
+                dq_act[token * config_.dim + col] =
+                    FloatAsBf16(static_cast<float>(value) * s);
+            }
         }
     }
 }
@@ -676,8 +709,12 @@ void TestRunnerBase::RunTest() {
         actual[i] = Bf16BitsAsFloat(actual_bits[i]);
     }
 
+    const float per_element_atol =
+        fp8_format_ == fp8_sampler::FP8E4M3Format::kOcp
+            ? config_.ocp_fp8_per_element_atol
+            : config_.per_element_atol;
     const ErrorStats stats = ComputeErrorStats(
-        actual, expected, config_.per_element_atol, config_.per_element_rtol);
+        actual, expected, per_element_atol, config_.per_element_rtol);
     if (stats.rel_max >= 1.0f) {
         struct Mismatch {
             size_t idx;
@@ -688,9 +725,8 @@ void TestRunnerBase::RunTest() {
         mm.reserve(actual.size());
         for (size_t i = 0; i < actual.size(); ++i) {
             const float ae = std::abs(actual[i] - expected[i]);
-            const float denom =
-                config_.per_element_atol +
-                config_.per_element_rtol * std::abs(expected[i]);
+            const float denom = per_element_atol + config_.per_element_rtol *
+                                                       std::abs(expected[i]);
             const float re = ae / std::max(denom, 1.0e-12f);
             mm.push_back({i, ae, re});
         }
@@ -710,7 +746,7 @@ void TestRunnerBase::RunTest() {
     }
     EXPECT_LT(stats.rel_max, 1.0f)
         << "normalized relative max too large: " << stats.rel_max
-        << " (atol=" << config_.per_element_atol
+        << " (atol=" << per_element_atol
         << ", rtol=" << config_.per_element_rtol
         << ", abs_max=" << stats.abs_max << ")";
 }
