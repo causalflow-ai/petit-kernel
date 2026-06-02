@@ -21,8 +21,8 @@ struct OnestageFusedMoEBlockScaleFP8 {
     static constexpr unsigned kRefBufferRange = static_cast<unsigned>(-16);
 
     using Input = typename KernelTrait::Input;
-    using W13 = typename KernelTrait::W13;
-    using W2 = typename KernelTrait::W2;
+    using W13Weights = typename KernelTrait::W13Weights;
+    using W2Weights = typename KernelTrait::W2Weights;
     using QuantizeAndShuffleOp = typename KernelTrait::QuantizeAndShuffleOp;
     using Stage1Trait = typename KernelTrait::Stage1Trait;
     using Stage1Op = typename KernelTrait::Stage1Op;
@@ -65,7 +65,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
                            unsigned wid, unsigned wtid, unsigned tid,
                            const uint2 token_select,
                            const unsigned tokens[kTokenBatch], unsigned m) {
-        Stage1Trait trait{input_, w1_, w3_};
+        Stage1Trait trait{input_, w13_weights_.w1_, w13_weights_.w3_};
         Stage1Op::Run(h, shm.x, trait, dim_, tid, wid, wtid, token_select,
                       tokens, m);
     }
@@ -75,7 +75,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
            const typename Stage2Trait::InputRegs &input, float2 sorted_weights,
            const unsigned tokens[kTokenBatch], unsigned invalid_token_mask,
            unsigned tid, unsigned wid, unsigned wtid) {
-        Stage2Trait trait{w2_};
+        Stage2Trait trait{w2_weights_.w2_};
         Stage2Op::Run(out, shm.ret, trait, dim_, input, sorted_weights, tokens,
                       invalid_token_mask, tid, wid, wtid);
     }
@@ -197,8 +197,8 @@ struct OnestageFusedMoEBlockScaleFP8 {
     unsigned inter_dim_;
     Input input_;
     BufferResource sorted_token_br_;
-    W2 w2_;
-    W13 w1_, w3_;
+    W13Weights w13_weights_;
+    W2Weights w2_weights_;
 };
 
 template <class Config, class Kernel>

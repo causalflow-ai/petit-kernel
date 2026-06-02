@@ -11,6 +11,7 @@
 #include "fused_moe_blockscale_fp8_kernel.cuh"
 #include "moe/rocm/quantization.cuh"
 #include "moe/rocm/warp_schedule.cuh"
+#include "moe/rocm/mem/weight_blockscale_fp8.cuh"
 
 #include <cmath>
 #include <hip/hip_fp8.h>
@@ -187,14 +188,18 @@ template <class Config> struct FusedMoEBlockScaleFP8Stage2Trait {
 
 };
 
-template <class Config> struct FusedMoEBlockScaleFP8KernelTrait {
+template <class Config_> struct FusedMoEBlockScaleFP8KernelTrait {
+    using Config = Config_;
     using Scalar = __hip_fp8_e4m3;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kTokenBatch = 8;
+    using Weights = BlockScaleFp8Weights<Config>;
+    using W13Weights = typename Weights::W13Weights;
+    using W2Weights = typename Weights::W2Weights;
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
-    using W2 = W2Layout<Scalar, kNumWarps, Config::kGroupN>;
-    using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
+    using W2 = typename W2Weights::W2;
+    using W13 = typename W13Weights::W13;
     using Stage1Trait = FusedMoEBlockScaleFP8Stage1Trait<Config, kTokenBatch>;
     using Stage1Op =
         OnestageFusedMoEStage1DoubleBufferOp<Stage1Trait,
@@ -223,45 +228,12 @@ template <class Config> struct FusedMoEBlockScaleFP8KernelTrait {
                       const unsigned *scales_w13, const unsigned *scales_w2,
                       unsigned expert_id, unsigned tile_k, unsigned n_blocks,
                       unsigned k_blocks) {
-        static constexpr unsigned kVecSize = sizeof(uint4) / sizeof(Scalar);
-        const uint4 *w1_ptr =
-            w13_base +
-            expert_id * (2 * kernel.inter_dim_ * kernel.dim_) / kVecSize +
-            tile_k * Config::kGroupDim * kernel.dim_ / kVecSize;
-        const unsigned *scale_w1_ptr =
-            scales_w13 + expert_id * (2 * k_blocks * n_blocks) +
-            tile_k * (Config::kGroupDim / Kernel::kScaleBlockSize) *
-                (kernel.dim_ / Kernel::kScaleBlockSize);
-        const unsigned w13_value_range = Config::kGroupDim * kernel.dim_;
-        const unsigned w13_scale_range =
-            (Config::kGroupDim / Kernel::kScaleBlockSize) * n_blocks *
-            sizeof(float);
-        kernel.w1_.Initialize(w1_ptr, w13_value_range, scale_w1_ptr,
-                              w13_scale_range, kernel.dim_);
-        kernel.w3_.Initialize(
-            w1_ptr + kernel.inter_dim_ * kernel.dim_ / kVecSize,
-            w13_value_range, scale_w1_ptr + k_blocks * n_blocks,
-            w13_scale_range, kernel.dim_);
-
-        // w2 is pre-shuffled as [rbi][cbi][kki][bni][kpi] with
-        // blockN=16/blockK=32. Advancing logical K by 256 (= 8 * 32)
-        // means advancing cbi by 8 blocks, i.e. 8 * (2 * 16 * 16) =
-        // 4096 fp8 elements.
-        const uint4 *w2_ptr =
-            w2 + expert_id * (kernel.dim_ * kernel.inter_dim_) / kVecSize +
-            tile_k * (Config::kGroupDim * 16) / kVecSize;
-
-        const unsigned *scale_w2_ptr =
-            scales_w2 + expert_id * (n_blocks * k_blocks) +
-            tile_k * (Config::kGroupDim / Kernel::kScaleBlockSize);
-        const unsigned w2_value_range =
-            kernel.dim_ * kernel.inter_dim_ - tile_k * Config::kGroupDim * 16;
-        const unsigned w2_scale_range =
-            n_blocks * k_blocks * sizeof(unsigned) -
-            tile_k * (Config::kGroupDim / Kernel::kScaleBlockSize) *
-                sizeof(unsigned);
-        kernel.w2_.Initialize(w2_ptr, w2_value_range, scale_w2_ptr,
-                              w2_scale_range, kernel.inter_dim_);
+        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id,
+                                       tile_k, n_blocks, k_blocks,
+                                       kernel.dim_, kernel.inter_dim_);
+        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k,
+                                      n_blocks, k_blocks, kernel.dim_,
+                                      kernel.inter_dim_);
     }
 };
 
@@ -275,6 +247,7 @@ struct FusedMoEConfig {
     static constexpr unsigned kGroupN = 256;
     static constexpr unsigned kGroupDim = 256;
     static constexpr unsigned kNumWarps = 4;
+    static constexpr unsigned kStage2GroupInterDim = kGroupDim;
 };
 
 } // namespace causalflow::petit::rocm::moe

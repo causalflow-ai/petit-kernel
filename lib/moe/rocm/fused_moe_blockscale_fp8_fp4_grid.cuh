@@ -2,16 +2,17 @@
 
 #include "causalflow/petit/tal/algorithm.h"
 #include "causalflow/petit/tal/tensor/layout.h"
-#include "fused_moe_blockscale_fp8_kernel.cuh"
 #include "gemm/rocm/amd_intrinsics.cuh"
 #include "gemm/rocm/quantization/fp4/quantization_utils.cuh"
 #include "memory_ops.cuh"
 #include "moe/rocm/fused_moe.cuh"
-#include "moe/rocm/ops/onestage_fused_moe_fp8_quantize_shuffle.cuh"
 #include "moe/rocm/ops/onestage_fused_moe_stage1.cuh"
 #include "moe/rocm/ops/onestage_fused_moe_stage2.cuh"
+#include "moe/rocm/ops/onestage_fused_moe_fp8_quantize_shuffle.cuh"
+#include "fused_moe_blockscale_fp8_kernel.cuh"
 #include "moe/rocm/quantization.cuh"
 #include "moe/rocm/warp_schedule.cuh"
+#include "moe/rocm/mem/weight_mxfp4.cuh"
 
 #include <cmath>
 #include <hip/hip_fp8.h>
@@ -157,8 +158,9 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
     }
 
     __device__ void Matmul(float4 t_gate[kAccumFragments],
-                           float4 t_up[kAccumFragments], const InputRegs &regs,
-                           unsigned tid, unsigned wid, unsigned wtid) {
+                           float4 t_up[kAccumFragments],
+                           const InputRegs &regs, unsigned tid, unsigned wid,
+                           unsigned wtid) {
         uint4 w3_tile[kKStages][W13::kLoadGlobal];
         unsigned scale_w3[kKStages];
         for (unsigned j = 0; j < kKStages; j++) {
@@ -176,6 +178,7 @@ struct FusedMoEBlockScaleFP8Fp4Stage1Trait {
                 t_up, w3_tile[j], regs.x, regs.scale_x, scale_w3[j], j);
         }
     }
+
 };
 
 template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
@@ -183,9 +186,12 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kTokenBatch = 8;
+    using Weights = MxFp4Weights<Config>;
+    using W13Weights = typename Weights::W13Weights;
+    using W2Weights = typename Weights::W2Weights;
     using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
-    using W13 = MxFp4WeightLayout<kNumWarps, Config::kGroupDim>;
-    using W2 = MxFp4WeightLayout<kNumWarps, Config::kGroupN>;
+    using W13 = typename W13Weights::W13;
+    using W2 = typename W2Weights::W2;
     using Stage1Trait =
         FusedMoEBlockScaleFP8Fp4Stage1Trait<Config, kTokenBatch>;
     using Stage1Op =
@@ -214,66 +220,12 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4KernelTrait {
     InitializeWeights(Kernel &kernel, const uint4 *w13_base, const uint4 *w2,
                       const unsigned *scales_w13, const unsigned *scales_w2,
                       unsigned expert_id, unsigned tile_k,
-                      unsigned unused_input_scale_blocks,
-                      unsigned unused_inter_dim_scale_blocks) {
-        (void)unused_input_scale_blocks;
-        (void)unused_inter_dim_scale_blocks;
-        static_assert(Config::kGroupN == 256,
-                      "The scale requires 256 elements per group dim");
-        // 1 warp loads 4x64x128 blocks of scales (256B), 4 warps load
-        // collectively
-        static constexpr unsigned kScaleGroupK = 128;
-        static constexpr unsigned kScaleGroupN = 64;
-        static constexpr unsigned kLayoutN = 16;
-        static constexpr unsigned kWeightVecSize = sizeof(uint4) * 2;
-        static constexpr unsigned kRowGroupSize = W2::kRowGroupSize;
-        const uint4 *w1_ptr =
-            w13_base +
-            expert_id * (2 * kernel.inter_dim_ * kernel.dim_) / kWeightVecSize +
-            tile_k * Config::kGroupDim * kernel.dim_ / kWeightVecSize;
-        const unsigned w13_scale_words_per_expert =
-            (2 * kernel.dim_ * kernel.inter_dim_) / kRowGroupSize /
-            (sizeof(unsigned) / sizeof(unsigned char));
-        const unsigned w13_scale_words_per_col =
-            (kernel.dim_ / kScaleGroupK) * (Config::kGroupN / kScaleGroupN) *
-            kWarpSize;
-        const unsigned *scale_w1_ptr = scales_w13 +
-                                       expert_id * w13_scale_words_per_expert +
-                                       tile_k * w13_scale_words_per_col;
-        const unsigned w13_value_range = Config::kGroupDim * kernel.dim_ / 2;
-        const unsigned w13_scale_range =
-            w13_scale_words_per_col * sizeof(unsigned);
-        kernel.w1_.Initialize(w1_ptr, w13_value_range, scale_w1_ptr,
-                              w13_scale_range, kernel.dim_);
-
-        kernel.w3_.Initialize(
-            w1_ptr + kernel.inter_dim_ * kernel.dim_ / kWeightVecSize,
-            w13_value_range, scale_w1_ptr + w13_scale_words_per_expert / 2,
-            w13_scale_range, kernel.dim_);
-
-        const unsigned w2_value_k_tile_offset =
-            tile_k * Config::kStage2GroupInterDim * kLayoutN / kWeightVecSize;
-        const uint4 *w2_ptr =
-            w2 +
-            expert_id * (kernel.dim_ * kernel.inter_dim_) / kWeightVecSize +
-            w2_value_k_tile_offset;
-        const unsigned w2_scale_words_per_expert =
-            (kernel.dim_ * kernel.inter_dim_) / W2::kRowGroupSize /
-            (sizeof(unsigned) / sizeof(unsigned char));
-        const unsigned w2_scale_k_tile_offset =
-            tile_k * (Config::kStage2GroupInterDim / kScaleGroupK) *
-            (Config::kGroupN / kScaleGroupN) * kWarpSize;
-        const unsigned *scale_w2_ptr = scales_w2 +
-                                       expert_id * w2_scale_words_per_expert +
-                                       w2_scale_k_tile_offset;
-        const unsigned w2_value_range = (kernel.inter_dim_ * kernel.dim_) / 2 -
-                                        w2_value_k_tile_offset * sizeof(uint4);
-        const unsigned w2_scale_range =
-            w2_scale_words_per_expert * sizeof(unsigned) -
-            w2_scale_k_tile_offset * sizeof(unsigned);
-
-        kernel.w2_.Initialize(w2_ptr, w2_value_range, scale_w2_ptr,
-                              w2_scale_range, kernel.inter_dim_);
+                      unsigned, unsigned) {
+        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id,
+                                       tile_k, kernel.dim_,
+                                       kernel.inter_dim_);
+        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, 0, tile_k,
+                                      kernel.dim_, kernel.inter_dim_);
     }
 };
 
@@ -323,6 +275,7 @@ template <class Config> struct FusedMoEBlockScaleFP8Fp4Stage2Trait {
                 j);
         }
     }
+
 };
 
 struct FusedMoEMxFp4Config {
