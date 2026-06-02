@@ -11,6 +11,7 @@
 #include "fused_moe_blockscale_fp8_kernel.cuh"
 #include "moe/rocm/quantization.cuh"
 #include "moe/rocm/warp_schedule.cuh"
+#include "moe/rocm/mem/input_channel_scale_fp8.cuh"
 #include "moe/rocm/mem/weight_blockscale_fp8.cuh"
 
 #include <cmath>
@@ -81,7 +82,7 @@ struct FusedMoEBlockScaleFP8Stage1Trait {
     using Scalar = __hip_fp8_e4m3;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kActivationFragments = 8;
-    using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
+    using Input = ChannelScaleFp8Input<Config>;
     using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
 
     struct Shm {
@@ -197,7 +198,7 @@ template <class Config_> struct FusedMoEBlockScaleFP8KernelTrait {
     using Weights = BlockScaleFp8Weights<Config>;
     using W13Weights = typename Weights::W13Weights;
     using W2Weights = typename Weights::W2Weights;
-    using Input = InputLayout<kTokenBatch, kNumWarps, Config::kGroupDim>;
+    using Input = ChannelScaleFp8Input<Config>;
     using W2 = typename W2Weights::W2;
     using W13 = typename W13Weights::W13;
     using Stage1Trait = FusedMoEBlockScaleFP8Stage1Trait<Config, kTokenBatch>;

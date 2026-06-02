@@ -121,14 +121,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
                     num_experts == 0 || expert_id < num_experts;
 
                 if (valid_expert) {
-                    const unsigned *scale_act_ptr =
-                        reinterpret_cast<const unsigned *>(scales_act) +
-                        (wid / 2) * m;
-                    const unsigned input_value_range = m * dim_;
-                    const unsigned input_scale_range =
-                        (n_blocks - (wid / 2)) * m * sizeof(float);
-                    input_.Initialize(act, input_value_range, scale_act_ptr,
-                                      input_scale_range, dim_);
+                    input_.Initialize(act, scales_act, wid, m, n_blocks, dim_);
 
                     KernelTrait::InitializeWeights(
                         *this, w13_base, w2, scales_w13, scales_w2, expert_id,
