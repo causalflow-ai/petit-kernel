@@ -1,5 +1,6 @@
 #pragma once
 
+#include "moe/rocm/ops/activation.cuh"
 #include "moe/rocm/fused_moe.cuh"
 
 #include <hip/hip_runtime.h>
@@ -55,7 +56,7 @@ struct OnestageFusedMoEStage1DoubleBufferOp {
         }
 
         for (unsigned i = 0; i < kAccumFragments; i++) {
-            h[i] = SiluDot(t_gate[i], t_up[i]);
+            h[i] = SiluDotOp::Apply(t_gate[i], t_up[i]);
         }
     }
 };
@@ -89,7 +90,7 @@ struct OnestageFusedMoEStage1SingleBufferOp {
         }
 
         for (unsigned i = 0; i < kAccumFragments; i++) {
-            h[i] = SiluDot(t_gate[i], t_up[i]);
+            h[i] = SiluDotOp::Apply(t_gate[i], t_up[i]);
         }
     }
 };
