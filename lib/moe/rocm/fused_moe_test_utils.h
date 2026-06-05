@@ -60,6 +60,18 @@ inline uint64_t IndexedSeed(uint64_t seed, uint64_t stream, size_t idx) {
     return MixU64(seed ^ MixU64(stream) ^ MixU64(idx));
 }
 
+inline unsigned MaskNegativeZeroOnNativeFp4Format(unsigned v) {
+    unsigned out = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        unsigned nibble = (v >> (i * 4)) & 0xfu;
+        if (nibble == 0x8u) {
+            nibble = 0u;
+        }
+        out |= nibble << (i * 4);
+    }
+    return out;
+}
+
 static constexpr float kReplayLikeSensitiveAtol = 2.05e-2f;
 static constexpr unsigned kReplayLikeSensitiveTokens = 2;
 static constexpr unsigned kReplayLikeSensitiveTopK = 8;
@@ -125,6 +137,67 @@ void FillWeightsParallel(std::span<T, kN> data, const Sampler &sampler,
         value = sampler(rng);
     });
 }
+
+template <class Config>
+struct MxFp4TestData {
+    static constexpr unsigned kW13Rows = 2 * Config::kInterDim;
+    static constexpr unsigned kW13Words =
+        Config::kExperts * kW13Rows * Config::kDim / sizeof(unsigned) / 2;
+    static constexpr unsigned kW2Words =
+        Config::kExperts * Config::kDim * Config::kInterDim /
+        sizeof(unsigned) / 2;
+    static constexpr unsigned kScaleW13Bytes =
+        Config::kExperts * kW13Rows * Config::kDim / Config::kMxScaleGroup;
+    static constexpr unsigned kScaleW2Bytes =
+        Config::kExperts * Config::kDim * Config::kInterDim /
+        Config::kMxScaleGroup;
+
+    std::vector<unsigned> w1;
+    std::vector<unsigned> w2;
+    std::vector<unsigned char> scale_fc1;
+    std::vector<unsigned char> scale_fc2;
+
+    static const MxFp4TestData &Get() {
+        static const MxFp4TestData dataset = [] {
+            static constexpr unsigned kSeed = 42;
+            MxFp4TestData d;
+            d.w1.resize(kW13Words);
+            d.w2.resize(kW2Words);
+            d.scale_fc1.resize(kScaleW13Bytes);
+            d.scale_fc2.resize(kScaleW2Bytes);
+
+            FillParallelIndexed(std::span(d.w1), [&](size_t idx) {
+                return MaskNegativeZeroOnNativeFp4Format(static_cast<unsigned>(
+                    MixU64(kSeed ^ (0x2d5ULL << 32) ^ idx)));
+            });
+            FillParallelIndexed(std::span(d.w2), [&](size_t idx) {
+                return MaskNegativeZeroOnNativeFp4Format(static_cast<unsigned>(
+                    MixU64(kSeed ^ (0x2d5ULL << 32) ^ idx)));
+            });
+
+            // Keep end-to-end MoE outputs in a range where fixed absolute
+            // tolerances test math/packing errors instead of BF16 codepoint
+            // differences in route/split-K accumulation.
+            static constexpr unsigned kMxScaleMin = 1;
+            static constexpr unsigned kMxScaleMax = 122;
+            std::mt19937 gen(kSeed);
+            std::uniform_int_distribution<unsigned> dist(kMxScaleMin,
+                                                         kMxScaleMax);
+            std::generate(d.scale_fc1.begin(), d.scale_fc1.end(), [&]() {
+                return static_cast<unsigned char>(dist(gen));
+            });
+            std::generate(d.scale_fc2.begin(), d.scale_fc2.end(), [&]() {
+                return static_cast<unsigned char>(dist(gen));
+            });
+
+            if constexpr (requires { Config::AdjustScalePatterns(d); }) {
+                Config::AdjustScalePatterns(d);
+            }
+            return d;
+        }();
+        return dataset;
+    }
+};
 
 template <class Config> struct ReferenceDeviceContext {
     static constexpr unsigned kSortedTokenPadding = Config::kSortedTokenPadding;
@@ -236,10 +309,24 @@ hipError_t DequantizeShuffledBlockScaleFp8(const unsigned char *q,
                                            unsigned cols, unsigned experts,
                                            hipStream_t stream = nullptr);
 
-int DequantMxFp4WithGroup4(unsigned *output, const unsigned *input,
-                           const unsigned *scales, float global_scale,
-                           quantization::DataType out_type, unsigned m,
-                           unsigned n, hipStream_t stream = nullptr);
+hipError_t ApplyElementwiseMultiply(const __hip_bfloat16 *a,
+                                    const __hip_bfloat16 *b,
+                                    __hip_bfloat16 *out, unsigned count,
+                                    hipStream_t stream = nullptr);
+
+hipError_t ScatterWeightedRoutes(const __hip_bfloat16 *route_out,
+                                 const unsigned *route_tokens,
+                                 const float *route_weights, float *token_out,
+                                 unsigned routes, unsigned cols,
+                                 hipStream_t stream = nullptr);
+
+hipError_t RepackMoeMxFp4Weights(unsigned *output, const unsigned *input,
+                                 unsigned rows, unsigned cols,
+                                 hipStream_t stream = nullptr);
+
+hipError_t RepackMoeMxFp4Scales(unsigned *output, const unsigned *input,
+                                unsigned rows, unsigned scale_cols,
+                                hipStream_t stream = nullptr);
 
 class HipBlasLtRunner {
   public:
@@ -336,17 +423,18 @@ class TestRunnerBase {
     virtual void CopyHostToDeviceContext() = 0;
     virtual void InitializeW13HostData() = 0;
     virtual void InitializeW2HostData() = 0;
+    virtual void InitializeInputHostData(std::mt19937 &gen);
     virtual void AdjustScalePatterns() = 0;
     virtual void AdjustTopKPatterns(std::vector<unsigned> &,
                                     std::vector<float> &) {}
     virtual int RunKernelImpl() = 0;
     virtual void DequantizeWeights() = 0;
+    virtual void PrepareDequantizedActivations();
 
     HipBlasLtRunner gemm_;
 
   private:
     void InitializeHostData();
-    void PrepareDequantizedActivations();
     void ComputeReferences();
 
     TestRunnerConfig config_;

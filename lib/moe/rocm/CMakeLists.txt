@@ -30,9 +30,10 @@ target_link_libraries(causalflow-petit-rocm-moe hip::host)
 
 add_executable(fused_moe_blockscale_fp8_test
   fused_moe_blockscale_fp8_test.cc
+  fused_moe_test_utils.cc
   fused_moe_test_utils.cu
 )
-set_source_files_properties(fused_moe_blockscale_fp8_test.cc fused_moe_test_utils.cu PROPERTIES
+set_source_files_properties(fused_moe_blockscale_fp8_test.cc fused_moe_test_utils.cc fused_moe_test_utils.cu PROPERTIES
   LANGUAGE HIP
 )
 target_link_libraries(fused_moe_blockscale_fp8_test
@@ -45,14 +46,15 @@ target_link_libraries(fused_moe_blockscale_fp8_test
 petit_set_moe_hip_architectures(fused_moe_blockscale_fp8_test)
 add_test(fused_moe_blockscale_fp8_test fused_moe_blockscale_fp8_test)
 
-add_executable(fused_moe_blockscale_fp8_fp4_test
-  fused_moe_blockscale_fp8_fp4_test.cc
+add_executable(fused_moe_mxfp4_test
+  fused_moe_mxfp4_test.cc
+  fused_moe_test_utils.cc
   fused_moe_test_utils.cu
 )
-set_source_files_properties(fused_moe_blockscale_fp8_fp4_test.cc fused_moe_test_utils.cu PROPERTIES
+set_source_files_properties(fused_moe_mxfp4_test.cc fused_moe_test_utils.cc fused_moe_test_utils.cu PROPERTIES
   LANGUAGE HIP
 )
-target_link_libraries(fused_moe_blockscale_fp8_fp4_test
+target_link_libraries(fused_moe_mxfp4_test
   causalflow-petit-rocm-moe
   causalflow-petit-rocm-quantization
   causalflow-petit-tests
@@ -60,5 +62,5 @@ target_link_libraries(fused_moe_blockscale_fp8_fp4_test
   GTest::gtest_main
   TBB::tbb
 )
-petit_set_moe_hip_architectures(fused_moe_blockscale_fp8_fp4_test)
-add_test(fused_moe_blockscale_fp8_fp4_test fused_moe_blockscale_fp8_fp4_test)
+petit_set_moe_hip_architectures(fused_moe_mxfp4_test)
+add_test(fused_moe_mxfp4_test fused_moe_mxfp4_test)

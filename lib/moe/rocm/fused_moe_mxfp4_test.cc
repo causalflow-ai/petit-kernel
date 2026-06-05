@@ -1,23 +1,15 @@
-#include "causalflow/petit/tal/algorithm.h"
 #include "gemm/rocm/quantization/fp4/gemm_fp4.h"
-#include "gemm/rocm/quantization/gemm.h"
 #include "gemm/rocm/quantization/types.h"
 #include "moe/rocm/fused_moe.h"
 #include "moe/rocm/fused_moe_test_utils.h"
-#include "moe/rocm/quantization.cuh"
-#include "tests/fp8_sampler.h"
 #include "utils/hip_helper.h"
-#include "utils/test_utils.h"
 
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <cmath>
-#include <cstdint>
+#include <iterator>
 #include <memory>
-#include <random>
-#include <span>
 #include <vector>
 
 namespace causalflow::petit::rocm::moe {
@@ -27,8 +19,6 @@ namespace {
 namespace quant = causalflow::petit::rocm::quantization;
 namespace fp4 = causalflow::petit::rocm::quantization::fp4;
 namespace moe_test = causalflow::petit::rocm::moe::test_utils;
-using moe_test::FillParallelIndexed;
-using moe_test::MixU64;
 
 static constexpr FusedMoESolutionId kTestSolutionId = FusedMoESolutionId::Make(
     FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
@@ -36,80 +26,6 @@ static constexpr FusedMoESolutionId kTestSolutionId = FusedMoESolutionId::Make(
     FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
     FusedMoEActivationFunction::kSiluDot,
     FusedMoEStage1Buffering::kSingleBuffer);
-
-static inline unsigned MaskNegativeZeroOnNativeFp4Format(unsigned v) {
-    unsigned out = 0;
-    for (unsigned i = 0; i < 8; ++i) {
-        unsigned nibble = (v >> (i * 4)) & 0xfu;
-        if (nibble == 0x8u) {
-            nibble = 0u;
-        }
-        out |= nibble << (i * 4);
-    }
-    return out;
-}
-
-static inline unsigned PetitFormatWord(unsigned v) {
-    static constexpr unsigned kSignOffsets[8] = {7, 15, 23, 31, 24, 16, 8, 0};
-    static constexpr unsigned kValueOffsets[8] = {1, 9, 17, 25, 28, 20, 12, 4};
-    unsigned out = 0;
-    for (unsigned lane = 0; lane < 8; ++lane) {
-        const unsigned u = (v >> (lane * 4)) & 0xfu;
-        unsigned val = u & 0x7u;
-        const unsigned sign = val == 0 ? 0 : u >> 3;
-        if (lane >= 4) {
-            val = __builtin_bitreverse32(val) >> 29;
-        }
-        out |= sign << kSignOffsets[lane];
-        out |= val << kValueOffsets[lane];
-    }
-    return out;
-}
-
-static inline unsigned SampleMomentFp4Nibble(uint64_t seed, float zero_prob,
-                                             float magnitude_mean,
-                                             float magnitude_std) {
-    const float zero_draw = moe_test::U32ToOpenUnitFloat(
-        static_cast<uint32_t>(MixU64(seed ^ 0x243f6a8885a308d3ULL)));
-    if (zero_draw < zero_prob) {
-        return 0;
-    }
-    const float mag_sample =
-        magnitude_mean + magnitude_std * moe_test::HashToStandardNormal(seed);
-    const unsigned magnitude = static_cast<unsigned>(
-        std::clamp(static_cast<int>(std::lround(mag_sample)), 1, 7));
-    const unsigned sign =
-        static_cast<unsigned>(MixU64(seed ^ 0x13198a2e03707344ULL) & 1ULL);
-    return magnitude | (sign << 3);
-}
-
-static inline unsigned MakeMomentFp4Word(size_t idx, uint64_t stream,
-                                         float zero_prob, float magnitude_mean,
-                                         float magnitude_std) {
-    unsigned native_word = 0;
-    for (unsigned lane = 0; lane < 8; ++lane) {
-        const uint64_t seed = moe_test::IndexedSeed(42, stream, idx * 8 + lane);
-        native_word |= SampleMomentFp4Nibble(seed, zero_prob, magnitude_mean,
-                                             magnitude_std)
-                       << (4 * lane);
-    }
-    return native_word;
-}
-
-static inline unsigned MakeMomentW13NativeWord(size_t idx) {
-    return MakeMomentFp4Word(idx, 0xbb67ae8584caa73bULL, 0.119f, 3.10f, 1.76f);
-}
-
-static inline unsigned MakeMomentW2NativeWord(size_t idx) {
-    return MakeMomentFp4Word(idx, 0x6a09e667f3bcc909ULL, 0.299f, 2.58f, 1.77f);
-}
-
-static inline unsigned char SampleMomentScale(uint64_t seed, float mean,
-                                              float stddev) {
-    const float sample = mean + stddev * moe_test::HashToStandardNormal(seed);
-    return static_cast<unsigned char>(
-        std::clamp(static_cast<int>(std::lround(sample)), 1, 237));
-}
 
 template <unsigned kTokens_, unsigned kDim_, unsigned kInterDim_,
           unsigned kExperts_, unsigned kTopK_>
@@ -140,24 +56,6 @@ struct ReplayLikeSensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
     static constexpr float kOcpFp8PerElementAtol = kPerElementAtol;
     static constexpr float kScaleInvStd = 2.0e-2f;
     static constexpr float kScaleInvMean = 1.0e-1f;
-    template <class Context> static void AdjustScalePatterns(Context &ctx) {
-        FillParallelIndexed(std::span(ctx.w1), [&](size_t idx) {
-            return PetitFormatWord(MakeMomentW13NativeWord(idx));
-        });
-        FillParallelIndexed(std::span(ctx.w2), [&](size_t idx) {
-            return PetitFormatWord(MakeMomentW2NativeWord(idx));
-        });
-        FillParallelIndexed(std::span(ctx.scale_fc1), [&](size_t idx) {
-            return SampleMomentScale(
-                moe_test::IndexedSeed(42, 0x3c6ef372fe94f82bULL, idx), 117.0f,
-                1.45f);
-        });
-        FillParallelIndexed(std::span(ctx.scale_fc2), [&](size_t idx) {
-            return SampleMomentScale(
-                moe_test::IndexedSeed(42, 0xa54ff53a5f1d36f1ULL, idx), 122.0f,
-                1.15f);
-        });
-    }
 
     static void AdjustTopKPatterns(std::vector<unsigned> &topk_ids,
                                    std::vector<float> &topk_weights) {
@@ -192,13 +90,14 @@ struct DeviceContext : public moe_test::ReferenceDeviceContext<Config> {
                                         kMxScaleGroup];
 };
 
-template <class Config> class TestRunner : public moe_test::TestRunnerBase {
+template <class Config>
+class Fp8InputMxFp4Runner : public moe_test::TestRunnerBase {
   public:
     using Context = DeviceContext<Config>;
     using Base = moe_test::TestRunnerBase;
 
-    TestRunner();
-    ~TestRunner() override;
+    Fp8InputMxFp4Runner();
+    ~Fp8InputMxFp4Runner() override;
 
     void InitializeW13HostData() override;
     void InitializeW2HostData() override;
@@ -212,9 +111,7 @@ template <class Config> class TestRunner : public moe_test::TestRunnerBase {
         return *d_ctx_accessor_;
     }
     void CopyHostToDeviceContext() override;
-    void AdjustScalePatterns() override {
-        Config::AdjustScalePatterns(*h_ctx_);
-    }
+    void AdjustScalePatterns() override {}
     void AdjustTopKPatterns(std::vector<unsigned> &topk_ids,
                             std::vector<float> &topk_weights) override {
         Config::AdjustTopKPatterns(topk_ids, topk_weights);
@@ -229,7 +126,7 @@ template <class Config> class TestRunner : public moe_test::TestRunnerBase {
 };
 
 template <class Config>
-TestRunner<Config>::TestRunner()
+Fp8InputMxFp4Runner<Config>::Fp8InputMxFp4Runner()
     : Base(moe_test::MakeTestRunnerConfig<Config, Context>()),
       h_ctx_(std::make_unique<Context>()) {
     CheckHIPStatus(
@@ -241,17 +138,18 @@ TestRunner<Config>::TestRunner()
         std::make_unique<moe_test::DeviceContextAccessor<Context>>(d_ctx_);
 }
 
-template <class Config> TestRunner<Config>::~TestRunner() {
+template <class Config> Fp8InputMxFp4Runner<Config>::~Fp8InputMxFp4Runner() {
     CheckHIPStatus(hipFree(d_ctx_));
     d_ctx_ = nullptr;
 }
 
-template <class Config> void TestRunner<Config>::CopyHostToDeviceContext() {
+template <class Config>
+void Fp8InputMxFp4Runner<Config>::CopyHostToDeviceContext() {
     CheckHIPStatus(hipMemcpy(d_ctx_, h_ctx_.get(), sizeof(Context),
                              hipMemcpyHostToDevice));
 }
 
-template <class Config> int TestRunner<Config>::RunKernelImpl() {
+template <class Config> int Fp8InputMxFp4Runner<Config>::RunKernelImpl() {
     FusedMoE1StageParams params{
         reinterpret_cast<unsigned *>(d_ctx_->out),
         reinterpret_cast<const unsigned *>(d_ctx_->q_act),
@@ -276,39 +174,23 @@ template <class Config> int TestRunner<Config>::RunKernelImpl() {
     return FusedMoEMatmul1Stage(params, kTestSolutionId.Repr());
 }
 
-template <class Config> void TestRunner<Config>::InitializeW13HostData() {
-    FillParallelIndexed(std::span(h_ctx_->w1), [&](size_t idx) {
-        return MaskNegativeZeroOnNativeFp4Format(static_cast<unsigned>(
-            MixU64(Base::kSeed ^ (0x2d5ULL << 32) ^ idx)));
-    });
-
-    // Match lib/tests/quantization.cc:GemmMPTestData::GenerateScales for MXFP4.
-    static constexpr unsigned kMxScaleMin = 1;
-    static constexpr unsigned kMxScaleNoOverflowMax = 237;
-    std::mt19937 gen(Base::kSeed);
-    std::uniform_int_distribution<unsigned> dist(kMxScaleMin,
-                                                 kMxScaleNoOverflowMax);
-    std::generate(std::begin(h_ctx_->scale_fc1), std::end(h_ctx_->scale_fc1),
-                  [&]() { return static_cast<unsigned char>(dist(gen)); });
+template <class Config>
+void Fp8InputMxFp4Runner<Config>::InitializeW13HostData() {
+    const auto &dataset = moe_test::MxFp4TestData<Config>::Get();
+    std::copy(dataset.w1.begin(), dataset.w1.end(), std::begin(h_ctx_->w1));
+    std::copy(dataset.scale_fc1.begin(), dataset.scale_fc1.end(),
+              std::begin(h_ctx_->scale_fc1));
 }
 
-template <class Config> void TestRunner<Config>::InitializeW2HostData() {
-    FillParallelIndexed(std::span(h_ctx_->w2), [&](size_t idx) {
-        return MaskNegativeZeroOnNativeFp4Format(static_cast<unsigned>(
-            MixU64(Base::kSeed ^ (0x2d5ULL << 32) ^ idx)));
-    });
-
-    // Match lib/tests/quantization.cc:GemmMPTestData::GenerateScales for MXFP4.
-    static constexpr unsigned kMxScaleMin = 1;
-    static constexpr unsigned kMxScaleNoOverflowMax = 237;
-    std::mt19937 gen(Base::kSeed);
-    std::uniform_int_distribution<unsigned> dist(kMxScaleMin,
-                                                 kMxScaleNoOverflowMax);
-    std::generate(std::begin(h_ctx_->scale_fc2), std::end(h_ctx_->scale_fc2),
-                  [&]() { return static_cast<unsigned char>(dist(gen)); });
+template <class Config>
+void Fp8InputMxFp4Runner<Config>::InitializeW2HostData() {
+    const auto &dataset = moe_test::MxFp4TestData<Config>::Get();
+    std::copy(dataset.w2.begin(), dataset.w2.end(), std::begin(h_ctx_->w2));
+    std::copy(dataset.scale_fc2.begin(), dataset.scale_fc2.end(),
+              std::begin(h_ctx_->scale_fc2));
 }
 
-template <class Config> void TestRunner<Config>::DequantizeWeights() {
+template <class Config> void Fp8InputMxFp4Runner<Config>::DequantizeWeights() {
     int err;
     for (unsigned expert = 0; expert < Context::kExperts; ++expert) {
         auto *dq_w13_expert = d_ctx_->dq_w13 + static_cast<size_t>(expert) * 2 *
@@ -320,7 +202,7 @@ template <class Config> void TestRunner<Config>::DequantizeWeights() {
         auto *scale_fc1_expert =
             d_ctx_->scale_fc1 + static_cast<size_t>(expert) * Context::kW1Rows *
                                     Context::kDim / Context::kMxScaleGroup;
-        err = moe_test::DequantMxFp4WithGroup4(
+        err = fp4::DequantMxFp4(
             reinterpret_cast<unsigned *>(dq_w13_expert), w1_expert,
             reinterpret_cast<const unsigned *>(scale_fc1_expert), 1.0f,
             quant::kDataTypeBf16, Context::kInterDim * 2, Context::kDim);
@@ -334,54 +216,79 @@ template <class Config> void TestRunner<Config>::DequantizeWeights() {
         auto *scale_fc2_expert =
             d_ctx_->scale_fc2 + static_cast<size_t>(expert) * Context::kDim *
                                     Context::kInterDim / Context::kMxScaleGroup;
-        err = moe_test::DequantMxFp4WithGroup4(
+        err = fp4::DequantMxFp4(
             reinterpret_cast<unsigned *>(dq_w2_expert), w2_expert,
             reinterpret_cast<const unsigned *>(scale_fc2_expert), 1.0f,
             quant::kDataTypeBf16, Context::kDim, Context::kInterDim);
         ASSERT_EQ(err, 0) << "DequantMxFp4 failed";
     }
+
+    auto repack_weights = [](unsigned *dst, size_t words, unsigned rows,
+                             unsigned cols) {
+        unsigned *baseline = nullptr;
+        CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&baseline),
+                                 words * sizeof(unsigned)));
+        CheckHIPStatus(hipMemcpy(baseline, dst, words * sizeof(unsigned),
+                                 hipMemcpyDeviceToDevice));
+        CheckHIPStatus(moe_test::RepackMoeMxFp4Weights(dst, baseline, rows,
+                                                       cols, nullptr));
+        CheckHIPStatus(hipFree(baseline));
+    };
+    auto repack_scales = [](unsigned char *dst, size_t bytes, unsigned rows,
+                            unsigned scale_cols) {
+        unsigned *baseline = nullptr;
+        CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&baseline), bytes));
+        CheckHIPStatus(hipMemcpy(baseline, dst, bytes, hipMemcpyDeviceToDevice));
+        CheckHIPStatus(moe_test::RepackMoeMxFp4Scales(
+            reinterpret_cast<unsigned *>(dst), baseline, rows, scale_cols,
+            nullptr));
+        CheckHIPStatus(hipFree(baseline));
+    };
+
+    repack_weights(d_ctx_->w1, std::size(d_ctx_->w1), Context::kW1Rows,
+                   Context::kDim);
+    repack_weights(d_ctx_->w2, std::size(d_ctx_->w2), Context::kDim,
+                   Context::kInterDim);
+    repack_scales(d_ctx_->scale_fc1, std::size(d_ctx_->scale_fc1),
+                  Context::kW1Rows, Context::kDim / Context::kMxScaleGroup);
+    repack_scales(d_ctx_->scale_fc2, std::size(d_ctx_->scale_fc2),
+                  Context::kDim, Context::kInterDim / Context::kMxScaleGroup);
 }
 
-class FusedMoEBlockScaleFP8MxFp4Test : public ::testing::Test {
+class FusedMoEMxFp4Test : public ::testing::Test {
   public:
     template <class Config> void RunComparisonTest() {
-        TestRunner<Config> runner;
+        Fp8InputMxFp4Runner<Config> runner;
         runner.Initialize();
         runner.RunTest();
     }
 };
 
-TEST_F(FusedMoEBlockScaleFP8MxFp4Test, SmallMatchesPythonStyleReference) {
+TEST_F(FusedMoEMxFp4Test, SmallMatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<4, 256, 512, 4, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
-       MediumMatchesPythonStyleReference) {
+TEST_F(FusedMoEMxFp4Test, MediumMatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<8, 256, 512, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
-       Large512MatchesPythonStyleReference) {
+TEST_F(FusedMoEMxFp4Test, Large512MatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<512, 4096, 1024, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
-       Large1024MatchesPythonStyleReference) {
+TEST_F(FusedMoEMxFp4Test, Large1024MatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<1024, 4096, 1024, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
-       Large1537MatchesPythonStyleReference) {
+TEST_F(FusedMoEMxFp4Test, Large1537MatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<1537, 4096, 1024, 8, 2>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
-       DeepSeekLikeMatchesPythonStyleReference) {
+TEST_F(FusedMoEMxFp4Test, DeepSeekLikeMatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<8, 7168, 2048, 33, 9>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8MxFp4Test,
-       ReplayLikeSensitiveMatchesPythonStyleReference) {
+TEST_F(FusedMoEMxFp4Test, ReplayLikeSensitiveMatchesPythonStyleReference) {
     RunComparisonTest<ReplayLikeSensitiveConfig>();
 }
 
