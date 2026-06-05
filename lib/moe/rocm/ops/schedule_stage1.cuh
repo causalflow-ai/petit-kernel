@@ -3,6 +3,7 @@
 #include "gemm/rocm/amd_intrinsics.cuh"
 #include "gemm/rocm/quantization/fp4/quantization_utils.cuh"
 #include "moe/rocm/fused_moe.cuh"
+#include "moe/rocm/mem/bias.cuh"
 #include "moe/rocm/mem/input_channel_scale_fp8.cuh"
 #include "moe/rocm/memory_ops.cuh"
 
@@ -137,6 +138,7 @@ struct BlockScaleFp8Stage1Schedule {
     static constexpr unsigned kActivationFragments = 8;
     using Input = ChannelScaleFp8Input<Config>;
     using W13 = W13Layout<Scalar, kNumWarps, Config::kGroupN>;
+    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
 
     struct Shm {
         unsigned act[Input::kShmInputElements];
@@ -150,6 +152,7 @@ struct BlockScaleFp8Stage1Schedule {
 
     Input &input;
     W13 &w1, &w3;
+    Bias &w1_bias, &w3_bias;
     uint4 w1_tile[2][W13::kTileLoads];
     float scale_w1;
     static constexpr unsigned kAccumFragments = 8;
@@ -157,8 +160,25 @@ struct BlockScaleFp8Stage1Schedule {
     static_assert(W13::kTileLoads == 8, "");
 
     __device__ explicit BlockScaleFp8Stage1Schedule(Input &input, W13 &w1,
-                                                         W13 &w3)
-        : input(input), w1(w1), w3(w3) {}
+                                                    W13 &w3, Bias &w1_bias,
+                                                    Bias &w3_bias)
+        : input(input), w1(w1), w3(w3), w1_bias(w1_bias),
+          w3_bias(w3_bias) {}
+
+    __device__ void InitializeBias(const void *w13_bias, unsigned expert_id,
+                                   unsigned inter_dim, unsigned tile_k) {
+        const unsigned projection_stride = Bias::PackedStride(inter_dim);
+        const unsigned expert_stride = 2 * projection_stride;
+        const void *w3_bias_ptr =
+            w13_bias == nullptr
+                ? nullptr
+                : reinterpret_cast<const char *>(w13_bias) +
+                      projection_stride * Bias::kElementBytes;
+        w1_bias.Initialize(w13_bias, expert_id, inter_dim, tile_k,
+                           expert_stride);
+        w3_bias.Initialize(w3_bias_ptr, expert_id, inter_dim, tile_k,
+                           expert_stride);
+    }
 
     __device__ void PrefetchInput(Shm *shm, unsigned wid, unsigned wtid,
                                   const uint2 token_select,
@@ -203,6 +223,11 @@ struct BlockScaleFp8Stage1Schedule {
         }
     }
 
+    __device__ void AddBias(float4 t_gate[kAccumFragments],
+                            float4 t_up[kAccumFragments], unsigned tid) const {
+        w1_bias.AddToAccumulator(t_gate, 0, tid);
+        w3_bias.AddToAccumulator(t_up, 0, tid);
+    }
 };
 
 template <class Config, unsigned kTokenBatch>
@@ -212,6 +237,7 @@ struct PetitMxFp4Stage1Schedule {
     static constexpr unsigned kKStages = Config::kGroupDim / 128;
     using Input = ChannelScaleFp8Input<Config>;
     using W13 = MxFp4WeightLayout<kNumWarps, Config::kGroupDim>;
+    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
 
     struct Shm {
         unsigned act[Input::kShmInputElements];
@@ -225,15 +251,32 @@ struct PetitMxFp4Stage1Schedule {
 
     Input &input;
     W13 &w1, &w3;
+    Bias &w1_bias, &w3_bias;
     uint4 w1_tile[kKStages][W13::kLoadGlobal];
     unsigned scale_w1[kKStages];
     static constexpr unsigned kAccumFragments = 2 * W13::kLoadGlobal;
 
     static_assert(kAccumFragments == Config::kGroupDim / 32, "");
 
-    __device__ explicit PetitMxFp4Stage1Schedule(Input &input,
-                                                            W13 &w1, W13 &w3)
-        : input(input), w1(w1), w3(w3) {}
+    __device__ explicit PetitMxFp4Stage1Schedule(Input &input, W13 &w1, W13 &w3,
+                                            Bias &w1_bias, Bias &w3_bias)
+        : input(input), w1(w1), w3(w3), w1_bias(w1_bias),
+          w3_bias(w3_bias) {}
+
+    __device__ void InitializeBias(const void *w13_bias, unsigned expert_id,
+                                   unsigned inter_dim, unsigned tile_k) {
+        const unsigned projection_stride = Bias::PackedStride(inter_dim);
+        const unsigned expert_stride = 2 * projection_stride;
+        const void *w3_bias_ptr =
+            w13_bias == nullptr
+                ? nullptr
+                : reinterpret_cast<const char *>(w13_bias) +
+                      projection_stride * Bias::kElementBytes;
+        w1_bias.Initialize(w13_bias, expert_id, inter_dim, tile_k,
+                           expert_stride);
+        w3_bias.Initialize(w3_bias_ptr, expert_id, inter_dim, tile_k,
+                           expert_stride);
+    }
 
     __device__ void PrefetchInput(Shm *shm, unsigned wid, unsigned wtid,
                                   const uint2 token_select,
@@ -279,6 +322,11 @@ struct PetitMxFp4Stage1Schedule {
         }
     }
 
+    __device__ void AddBias(float4 t_gate[kAccumFragments],
+                            float4 t_up[kAccumFragments], unsigned tid) const {
+        w1_bias.AddToAccumulator(t_gate, 0, tid);
+        w3_bias.AddToAccumulator(t_up, 0, tid);
+    }
 };
 
 } // namespace causalflow::petit::rocm::moe

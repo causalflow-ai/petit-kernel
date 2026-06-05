@@ -134,8 +134,8 @@ struct OnestageFusedMoEStage2Op {
                                const typename Trait::InputRegs &input,
                                float2 sorted_weights,
                                const unsigned tokens[kTokenBatch],
-                               unsigned invalid_token_mask, unsigned tid,
-                               unsigned wid, unsigned wtid) {
+                               unsigned invalid_token_mask, unsigned tile_k,
+                               unsigned tid, unsigned wid, unsigned wtid) {
         unsigned curr = 0, next = 1;
         trait.LoadStage(curr, tid, wid, wtid);
         uint2 zeroes[kAccumFragments] = {
@@ -162,6 +162,9 @@ struct OnestageFusedMoEStage2Op {
                 uint2 ret[kTokenBatch];
                 ReadShm(shm, next, ret, wid, wtid);
                 trait.Matmul(t, input, curr, wtid);
+                if (tile_k == 0) {
+                    trait.w2_bias.AddToAccumulator(t, tile_d, tid);
+                }
                 MultRouteWeights<kAccumFragments>(t, sorted_weights);
                 uint2 o[kAccumFragments];
                 for (unsigned i = 0; i < kAccumFragments; i++) {

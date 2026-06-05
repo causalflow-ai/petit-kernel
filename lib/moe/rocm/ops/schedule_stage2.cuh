@@ -1,5 +1,6 @@
 #pragma once
 
+#include "moe/rocm/mem/bias.cuh"
 #include "moe/rocm/ops/schedule_stage1.cuh"
 #include "moe/rocm/memory_ops.cuh"
 
@@ -16,7 +17,9 @@ __host__ __device__ static constexpr int Stage2ScaleDppCtrl(int stage,
 template <class Config> struct BlockScaleFp8Stage2Schedule {
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     using W2 = W2Layout<__hip_fp8_e4m3, kNumWarps, Config::kGroupN>;
+    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
     W2 &w2;
+    Bias &w2_bias;
     uint4 w2_tile[2][2][W2::kLoadGlobal];
     float scale_w2[2];
     static constexpr unsigned kAccumFragments = 8;
@@ -29,7 +32,14 @@ template <class Config> struct BlockScaleFp8Stage2Schedule {
 
     static_assert(W2::kTileLoads == 8, "");
 
-    __device__ explicit BlockScaleFp8Stage2Schedule(W2 &w2) : w2(w2) {}
+    __device__ explicit BlockScaleFp8Stage2Schedule(W2 &w2, Bias &w2_bias)
+        : w2(w2), w2_bias(w2_bias) {}
+
+    __device__ void InitializeBias(const void *w2_bias_ptr, unsigned expert_id,
+                                   unsigned dim, unsigned tile_k) {
+        const unsigned expert_stride = Bias::PackedStride(dim);
+        w2_bias.Initialize(w2_bias_ptr, expert_id, dim, tile_k, expert_stride);
+    }
 
     __device__ void LoadStage(unsigned stage, unsigned tid, unsigned wid,
                               unsigned wtid) {
@@ -53,7 +63,9 @@ template <class Config> struct PetitMxFp4Stage2Schedule {
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr int kKStages = Config::kGroupN / 128;
     using W2 = MxFp4WeightLayout<kNumWarps, Config::kGroupN>;
+    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
     W2 &w2;
+    Bias &w2_bias;
     uint4 w2_tile[2][kKStages][W2::kLoadGlobal];
     unsigned scale_w2[2][kKStages];
     static constexpr unsigned kAccumFragments = 2 * W2::kLoadGlobal;
@@ -70,7 +82,14 @@ template <class Config> struct PetitMxFp4Stage2Schedule {
     static_assert(kActivationFragments == Config::kGroupDim / 32, "");
     static_assert(kOutputPacksPerToken > 0, "");
 
-    __device__ explicit PetitMxFp4Stage2Schedule(W2 &w2) : w2(w2) {}
+    __device__ explicit PetitMxFp4Stage2Schedule(W2 &w2, Bias &w2_bias)
+        : w2(w2), w2_bias(w2_bias) {}
+
+    __device__ void InitializeBias(const void *w2_bias_ptr, unsigned expert_id,
+                                   unsigned dim, unsigned tile_k) {
+        const unsigned expert_stride = Bias::PackedStride(dim);
+        w2_bias.Initialize(w2_bias_ptr, expert_id, dim, tile_k, expert_stride);
+    }
 
     __device__ void LoadStage(unsigned stage, unsigned tid, unsigned wid,
                               unsigned wtid) {

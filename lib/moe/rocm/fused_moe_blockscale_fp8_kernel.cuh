@@ -1,6 +1,7 @@
 #pragma once
 
 #include "causalflow/petit/tal/algorithm.h"
+#include "moe/rocm/mem/bias.cuh"
 #include "moe/rocm/memory_ops.cuh"
 
 #include <hip/hip_runtime.h>
@@ -23,6 +24,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
     using Input = typename KernelTrait::Input;
     using W13Weights = typename KernelTrait::W13Weights;
     using W2Weights = typename KernelTrait::W2Weights;
+    using Bias = NoopBiasLayout<Config::kNumWarps, Config::kGroupN>;
     using QuantizeAndShuffleOp = typename KernelTrait::QuantizeAndShuffleOp;
     using Stage1Trait = typename KernelTrait::Stage1Trait;
     using Stage1Op = typename KernelTrait::Stage1Op;
@@ -64,8 +66,12 @@ struct OnestageFusedMoEBlockScaleFP8 {
     __device__ void Stage1(float4 h[Stage1Trait::kAccumFragments], ShmBuf &shm,
                            unsigned wid, unsigned wtid, unsigned tid,
                            const uint2 token_select,
-                           const unsigned tokens[kTokenBatch], unsigned m) {
-        Stage1Trait trait{input_, w13_weights_.w1_, w13_weights_.w3_};
+                           const unsigned tokens[kTokenBatch], unsigned m,
+                           unsigned expert_id, unsigned tile_k,
+                           const void *w13_bias) {
+        Stage1Trait trait{input_, w13_weights_.w1_, w13_weights_.w3_,
+                          w1_bias_, w3_bias_};
+        trait.InitializeBias(w13_bias, expert_id, inter_dim_, tile_k);
         Stage1Op::Run(h, shm.x, trait, dim_, tid, wid, wtid, token_select,
                       tokens, m);
     }
@@ -74,10 +80,12 @@ struct OnestageFusedMoEBlockScaleFP8 {
     Stage2(uint4 *__restrict__ out, ShmBuf &shm,
            const typename Stage2Trait::InputRegs &input, float2 sorted_weights,
            const unsigned tokens[kTokenBatch], unsigned invalid_token_mask,
-           unsigned tid, unsigned wid, unsigned wtid) {
-        Stage2Trait trait{w2_weights_.w2_};
+           unsigned tile_k, unsigned tid, unsigned wid, unsigned wtid,
+           unsigned expert_id, const void *w2_bias) {
+        Stage2Trait trait{w2_weights_.w2_, w2_bias_};
+        trait.InitializeBias(w2_bias, expert_id, dim_, tile_k);
         Stage2Op::Run(out, shm.ret, trait, dim_, input, sorted_weights, tokens,
-                      invalid_token_mask, tid, wid, wtid);
+                      invalid_token_mask, tile_k, tid, wid, wtid);
     }
 
     __device__ void
@@ -88,7 +96,8 @@ struct OnestageFusedMoEBlockScaleFP8 {
             const unsigned *scales_w13, const unsigned *__restrict__ scales_w2,
             const unsigned *num_valid_ids_ptr, unsigned topk, unsigned m,
             unsigned dim, unsigned inter_dim, unsigned num_experts,
-            unsigned persistent_route_step) {
+            unsigned persistent_route_step, const void *w13_bias,
+            const void *w2_bias) {
         (void)topk;
         dim_ = dim;
         inter_dim_ = inter_dim;
@@ -164,7 +173,7 @@ struct OnestageFusedMoEBlockScaleFP8 {
                         LoadSortedWeights(sorted_weights_ptr, tid, route_base);
                     float4 h[Stage1Trait::kAccumFragments];
                     Stage1(h, shm, wid, wtid, tid, safe_token_select,
-                           safe_tokens, m);
+                           safe_tokens, m, expert_id, tile_k, w13_bias);
                     __syncthreads();
 
                     unsigned invalid_token_mask = 0;
@@ -179,7 +188,8 @@ struct OnestageFusedMoEBlockScaleFP8 {
                                               tid, wid, wtid);
 
                     Stage2(out, shm, stage2_input, sorted_weights, safe_tokens,
-                           invalid_token_mask, tid, wid, wtid);
+                           invalid_token_mask, tile_k, tid, wid, wtid,
+                           expert_id, w2_bias);
                 }
             }
             __syncthreads();
@@ -191,7 +201,9 @@ struct OnestageFusedMoEBlockScaleFP8 {
     Input input_;
     BufferResource sorted_token_br_;
     W13Weights w13_weights_;
+    Bias w1_bias_, w3_bias_;
     W2Weights w2_weights_;
+    Bias w2_bias_;
 };
 
 template <class Config, class Kernel>
@@ -203,14 +215,16 @@ __global__ static void __launch_bounds__(64 * Config::kNumWarps)
         const unsigned *__restrict__ num_valid_ids, unsigned topk,
         const uint4 *scales_act, const uint4 *scales_w13,
         const unsigned *__restrict__ scales_w2, unsigned m, unsigned n,
-        unsigned k, unsigned num_experts, unsigned persistent_route_step) {
+        unsigned k, unsigned num_experts, unsigned persistent_route_step,
+        const void *w13_bias, const void *w2_bias) {
     Kernel kernel;
     kernel.Compute(
         out, act, w13, w2, reinterpret_cast<const unsigned *>(sorted_token_ids),
         reinterpret_cast<const unsigned *>(sorted_weights),
         reinterpret_cast<const unsigned *>(sorted_expert_ids), scales_act,
         reinterpret_cast<const unsigned *>(scales_w13), scales_w2,
-        num_valid_ids, topk, m, n, k, num_experts, persistent_route_step);
+        num_valid_ids, topk, m, n, k, num_experts, persistent_route_step,
+        w13_bias, w2_bias);
 }
 
 template <class Config, class Kernel>
@@ -221,7 +235,8 @@ void LaunchOnestageFusedMoEBlockScaleFP8(
     unsigned topk, const uint4 *scales_act, const uint4 *scales_w13,
     const unsigned *__restrict__ scales_w2, unsigned max_num_m_blocks,
     unsigned m, unsigned n, unsigned k, unsigned num_experts,
-    hipStream_t stream, unsigned num_persistent_tgs) {
+    hipStream_t stream, unsigned num_persistent_tgs,
+    const void *w13_bias = nullptr, const void *w2_bias = nullptr) {
     if (m == 0 || n == 0 || k == 0 || topk == 0 || max_num_m_blocks == 0) {
         return;
     }
@@ -245,7 +260,8 @@ void LaunchOnestageFusedMoEBlockScaleFP8(
         <<<grids, blocks, 0, stream>>>(
             out, act, w13, w2, sorted_token_ids, sorted_weights,
             sorted_expert_ids, num_valid_ids, topk, scales_act, scales_w13,
-            scales_w2, m, n, k, num_experts, persistent_route_step);
+            scales_w2, m, n, k, num_experts, persistent_route_step, w13_bias,
+            w2_bias);
 }
 
 } // namespace causalflow::petit::rocm::moe

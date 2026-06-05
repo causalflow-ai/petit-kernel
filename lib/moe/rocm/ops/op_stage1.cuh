@@ -55,6 +55,7 @@ struct OnestageFusedMoEStage1DoubleBufferOp {
             }
         }
 
+        trait.AddBias(t_gate, t_up, tid);
         for (unsigned i = 0; i < kAccumFragments; i++) {
             h[i] = SiluDotOp::Apply(t_gate[i], t_up[i]);
         }
@@ -89,6 +90,7 @@ struct OnestageFusedMoEStage1SingleBufferOp {
             trait.Matmul(t_gate, t_up, x, tid, wid, wtid);
         }
 
+        trait.AddBias(t_gate, t_up, tid);
         for (unsigned i = 0; i < kAccumFragments; i++) {
             h[i] = SiluDotOp::Apply(t_gate[i], t_up[i]);
         }
