@@ -20,12 +20,29 @@ namespace quant = causalflow::petit::rocm::quantization;
 namespace fp4 = causalflow::petit::rocm::quantization::fp4;
 namespace moe_test = causalflow::petit::rocm::moe::test_utils;
 
-static constexpr FusedMoESolutionId kTestSolutionId = FusedMoESolutionId::Make(
-    FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
-    FusedMoEDataType::kNone, FusedMoEWeightOrdering::kPetitMxFp4,
-    FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
-    FusedMoEActivationFunction::kSiluDot,
-    FusedMoEStage1Buffering::kSingleBuffer);
+static constexpr FusedMoESolutionId kFp8PetitMxFp4SolutionId =
+    FusedMoESolutionId::Make(
+        FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
+        FusedMoEDataType::kNone, FusedMoEWeightOrdering::kPetitMxFp4,
+        FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
+        FusedMoEActivationFunction::kSiluDot,
+        FusedMoEStage1Buffering::kSingleBuffer);
+
+static constexpr FusedMoESolutionId kFp8PetitMxFp4BiasSolutionId =
+    FusedMoESolutionId::Make(
+        FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
+        FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kPetitMxFp4,
+        FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
+        FusedMoEActivationFunction::kOpenAISwiGLU,
+        FusedMoEStage1Buffering::kDoubleBuffer);
+
+static constexpr FusedMoESolutionId kBf16NativeMxFp4BiasSolutionId =
+    FusedMoESolutionId::Make(
+        FusedMoEDataType::kBf16, FusedMoEDataType::kMxFp4,
+        FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kNativeMxFp4,
+        FusedMoEMfmaShape::kMfmaBf16MxFp4, FusedMoEStages::kOneStage,
+        FusedMoEActivationFunction::kOpenAISwiGLU,
+        FusedMoEStage1Buffering::kDoubleBuffer);
 
 template <unsigned kTokens_, unsigned kDim_, unsigned kInterDim_,
           unsigned kExperts_, unsigned kTopK_>
@@ -64,6 +81,26 @@ struct ReplayLikeSensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
     }
 };
 
+template <class Config> struct Bf16InputMxFp4Config : Config {
+    static constexpr auto kReferenceActivation =
+        moe_test::TestRunnerConfig::ReferenceActivation::kOpenAISwiGLU;
+};
+
+template <class Config> struct Fp8InputMxFp4BiasConfig : Config {
+    static constexpr auto kReferenceActivation =
+        moe_test::TestRunnerConfig::ReferenceActivation::kOpenAISwiGLU;
+};
+
+template <> struct Fp8InputMxFp4BiasConfig<ReplayLikeSensitiveConfig>
+    : ReplayLikeSensitiveConfig {
+    static constexpr auto kReferenceActivation =
+        moe_test::TestRunnerConfig::ReferenceActivation::kOpenAISwiGLU;
+    // The FP8 path quantizes the activated hidden state before W2; the
+    // HipBLASLt reference intentionally keeps that intermediate in BF16.
+    static constexpr float kPerElementAtol = 1.2e-1f;
+    static constexpr float kOcpFp8PerElementAtol = kPerElementAtol;
+};
+
 template <class Config>
 struct DeviceContext : public moe_test::ReferenceDeviceContext<Config> {
     using Base = moe_test::ReferenceDeviceContext<Config>;
@@ -90,10 +127,11 @@ struct DeviceContext : public moe_test::ReferenceDeviceContext<Config> {
                                         kMxScaleGroup];
 };
 
-template <class Config>
+template <class Config, class RunnerConfig = Config,
+          unsigned long kSolutionRepr = kFp8PetitMxFp4SolutionId.Repr()>
 class Fp8InputMxFp4Runner : public moe_test::TestRunnerBase {
   public:
-    using Context = DeviceContext<Config>;
+    using Context = DeviceContext<RunnerConfig>;
     using Base = moe_test::TestRunnerBase;
 
     Fp8InputMxFp4Runner();
@@ -125,9 +163,10 @@ class Fp8InputMxFp4Runner : public moe_test::TestRunnerBase {
     std::unique_ptr<moe_test::DeviceContextAccessor<Context>> d_ctx_accessor_;
 };
 
-template <class Config>
-Fp8InputMxFp4Runner<Config>::Fp8InputMxFp4Runner()
-    : Base(moe_test::MakeTestRunnerConfig<Config, Context>()),
+template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
+Fp8InputMxFp4Runner<Config, RunnerConfig,
+                    kSolutionRepr>::Fp8InputMxFp4Runner()
+    : Base(moe_test::MakeTestRunnerConfig<RunnerConfig, Context>()),
       h_ctx_(std::make_unique<Context>()) {
     CheckHIPStatus(
         hipMalloc(reinterpret_cast<void **>(&d_ctx_), sizeof(Context)));
@@ -138,18 +177,22 @@ Fp8InputMxFp4Runner<Config>::Fp8InputMxFp4Runner()
         std::make_unique<moe_test::DeviceContextAccessor<Context>>(d_ctx_);
 }
 
-template <class Config> Fp8InputMxFp4Runner<Config>::~Fp8InputMxFp4Runner() {
+template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
+Fp8InputMxFp4Runner<Config, RunnerConfig,
+                    kSolutionRepr>::~Fp8InputMxFp4Runner() {
     CheckHIPStatus(hipFree(d_ctx_));
     d_ctx_ = nullptr;
 }
 
-template <class Config>
-void Fp8InputMxFp4Runner<Config>::CopyHostToDeviceContext() {
+template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
+void Fp8InputMxFp4Runner<Config, RunnerConfig,
+                         kSolutionRepr>::CopyHostToDeviceContext() {
     CheckHIPStatus(hipMemcpy(d_ctx_, h_ctx_.get(), sizeof(Context),
                              hipMemcpyHostToDevice));
 }
 
-template <class Config> int Fp8InputMxFp4Runner<Config>::RunKernelImpl() {
+template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
+int Fp8InputMxFp4Runner<Config, RunnerConfig, kSolutionRepr>::RunKernelImpl() {
     FusedMoE1StageParams params{
         reinterpret_cast<unsigned *>(d_ctx_->out),
         reinterpret_cast<const unsigned *>(d_ctx_->q_act),
@@ -171,26 +214,30 @@ template <class Config> int Fp8InputMxFp4Runner<Config>::RunKernelImpl() {
         nullptr,
         0,
     };
-    return FusedMoEMatmul1Stage(params, kTestSolutionId.Repr());
+    return FusedMoEMatmul1Stage(params, kSolutionRepr);
 }
 
-template <class Config>
-void Fp8InputMxFp4Runner<Config>::InitializeW13HostData() {
+template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
+void Fp8InputMxFp4Runner<Config, RunnerConfig,
+                         kSolutionRepr>::InitializeW13HostData() {
     const auto &dataset = moe_test::MxFp4TestData<Config>::Get();
     std::copy(dataset.w1.begin(), dataset.w1.end(), std::begin(h_ctx_->w1));
     std::copy(dataset.scale_fc1.begin(), dataset.scale_fc1.end(),
               std::begin(h_ctx_->scale_fc1));
 }
 
-template <class Config>
-void Fp8InputMxFp4Runner<Config>::InitializeW2HostData() {
+template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
+void Fp8InputMxFp4Runner<Config, RunnerConfig,
+                         kSolutionRepr>::InitializeW2HostData() {
     const auto &dataset = moe_test::MxFp4TestData<Config>::Get();
     std::copy(dataset.w2.begin(), dataset.w2.end(), std::begin(h_ctx_->w2));
     std::copy(dataset.scale_fc2.begin(), dataset.scale_fc2.end(),
               std::begin(h_ctx_->scale_fc2));
 }
 
-template <class Config> void Fp8InputMxFp4Runner<Config>::DequantizeWeights() {
+template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
+void Fp8InputMxFp4Runner<Config, RunnerConfig,
+                         kSolutionRepr>::DequantizeWeights() {
     int err;
     for (unsigned expert = 0; expert < Context::kExperts; ++expert) {
         auto *dq_w13_expert = d_ctx_->dq_w13 + static_cast<size_t>(expert) * 2 *
@@ -230,7 +277,7 @@ template <class Config> void Fp8InputMxFp4Runner<Config>::DequantizeWeights() {
                                  words * sizeof(unsigned)));
         CheckHIPStatus(hipMemcpy(baseline, dst, words * sizeof(unsigned),
                                  hipMemcpyDeviceToDevice));
-        CheckHIPStatus(moe_test::RepackMoeMxFp4Weights(dst, baseline, rows,
+        CheckHIPStatus(moe_test::RepackPetitMxFp4Weights(dst, baseline, rows,
                                                        cols, nullptr));
         CheckHIPStatus(hipFree(baseline));
     };
@@ -239,7 +286,7 @@ template <class Config> void Fp8InputMxFp4Runner<Config>::DequantizeWeights() {
         unsigned *baseline = nullptr;
         CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&baseline), bytes));
         CheckHIPStatus(hipMemcpy(baseline, dst, bytes, hipMemcpyDeviceToDevice));
-        CheckHIPStatus(moe_test::RepackMoeMxFp4Scales(
+        CheckHIPStatus(moe_test::RepackPetitMxFp4Scales(
             reinterpret_cast<unsigned *>(dst), baseline, rows, scale_cols,
             nullptr));
         CheckHIPStatus(hipFree(baseline));
@@ -255,12 +302,191 @@ template <class Config> void Fp8InputMxFp4Runner<Config>::DequantizeWeights() {
                   Context::kDim, Context::kInterDim / Context::kMxScaleGroup);
 }
 
+template <class Config>
+class Bf16InputMxFp4Runner : public moe_test::TestRunnerBase {
+  public:
+    using RunnerConfig = Bf16InputMxFp4Config<Config>;
+    using Context = DeviceContext<RunnerConfig>;
+    using Base = moe_test::TestRunnerBase;
+
+    Bf16InputMxFp4Runner()
+        : Base(moe_test::MakeTestRunnerConfig<RunnerConfig, Context>()),
+          h_ctx_(std::make_unique<Context>()) {
+        CheckHIPStatus(
+            hipMalloc(reinterpret_cast<void **>(&d_ctx_), sizeof(Context)));
+        h_ctx_accessor_ =
+            std::make_unique<moe_test::DeviceContextAccessor<Context>>(
+                h_ctx_.get());
+        d_ctx_accessor_ =
+            std::make_unique<moe_test::DeviceContextAccessor<Context>>(d_ctx_);
+    }
+
+    ~Bf16InputMxFp4Runner() override { CheckHIPStatus(hipFree(d_ctx_)); }
+
+    void InitializeInputHostData(std::mt19937 &gen) override {
+        Base::InitializeInputHostData(gen);
+        Base::PrepareDequantizedActivations();
+    }
+
+    void InitializeW13HostData() override {
+        const auto &dataset = moe_test::MxFp4TestData<Config>::Get();
+        std::copy(dataset.w1.begin(), dataset.w1.end(), std::begin(h_ctx_->w1));
+        std::copy(dataset.scale_fc1.begin(), dataset.scale_fc1.end(),
+                  std::begin(h_ctx_->scale_fc1));
+    }
+
+    void InitializeW2HostData() override {
+        const auto &dataset = moe_test::MxFp4TestData<Config>::Get();
+        std::copy(dataset.w2.begin(), dataset.w2.end(), std::begin(h_ctx_->w2));
+        std::copy(dataset.scale_fc2.begin(), dataset.scale_fc2.end(),
+                  std::begin(h_ctx_->scale_fc2));
+    }
+
+    void PrepareDequantizedActivations() override {}
+
+    void DequantizeWeights() override {
+        int err;
+        for (unsigned expert = 0; expert < Context::kExperts; ++expert) {
+            auto *dq_w13_expert =
+                d_ctx_->dq_w13 + static_cast<size_t>(expert) * 2 *
+                                     Context::kDim * Context::kInterDim;
+            auto *w1_expert =
+                d_ctx_->w1 + static_cast<size_t>(expert) * Context::kW1Rows *
+                                  Context::kDim / sizeof(unsigned) / 2;
+            auto *scale_fc1_expert =
+                d_ctx_->scale_fc1 +
+                static_cast<size_t>(expert) * Context::kW1Rows *
+                    Context::kDim / Context::kMxScaleGroup;
+            err = fp4::DequantMxFp4(
+                reinterpret_cast<unsigned *>(dq_w13_expert), w1_expert,
+                reinterpret_cast<const unsigned *>(scale_fc1_expert), 1.0f,
+                quant::kDataTypeBf16, Context::kInterDim * 2, Context::kDim);
+            ASSERT_EQ(err, 0) << "DequantMxFp4 failed";
+
+            auto *dq_w2_expert =
+                d_ctx_->dq_w2 + static_cast<size_t>(expert) *
+                                    Context::kInterDim * Context::kDim;
+            auto *w2_expert =
+                d_ctx_->w2 + static_cast<size_t>(expert) *
+                                  Context::kW2WordsPerExpert;
+            auto *scale_fc2_expert =
+                d_ctx_->scale_fc2 + static_cast<size_t>(expert) *
+                                        Context::kDim * Context::kInterDim /
+                                        Context::kMxScaleGroup;
+            err = fp4::DequantMxFp4(
+                reinterpret_cast<unsigned *>(dq_w2_expert), w2_expert,
+                reinterpret_cast<const unsigned *>(scale_fc2_expert), 1.0f,
+                quant::kDataTypeBf16, Context::kDim, Context::kInterDim);
+            ASSERT_EQ(err, 0) << "DequantMxFp4 failed";
+        }
+
+        RepackWeights(d_ctx_->w1, std::size(d_ctx_->w1),
+                      Context::kExperts * 2 * Context::kInterDim,
+                      Context::kDim);
+        RepackWeights(d_ctx_->w2, std::size(d_ctx_->w2),
+                      Context::kExperts * Context::kDim, Context::kInterDim);
+        RepackScales(d_ctx_->scale_fc1, std::size(d_ctx_->scale_fc1),
+                     Context::kExperts * 2 * Context::kInterDim,
+                     Context::kDim / Context::kMxScaleGroup);
+        RepackScales(d_ctx_->scale_fc2, std::size(d_ctx_->scale_fc2),
+                     Context::kExperts * Context::kDim,
+                     Context::kInterDim / Context::kMxScaleGroup);
+    }
+
+  protected:
+    moe_test::DeviceContextAccessorBase &HostAccessor() override {
+        return *h_ctx_accessor_;
+    }
+    moe_test::DeviceContextAccessorBase &DeviceAccessor() override {
+        return *d_ctx_accessor_;
+    }
+    void CopyHostToDeviceContext() override {
+        CheckHIPStatus(hipMemcpy(d_ctx_, h_ctx_.get(), sizeof(Context),
+                                 hipMemcpyHostToDevice));
+    }
+    void AdjustScalePatterns() override {}
+    void AdjustTopKPatterns(std::vector<unsigned> &topk_ids,
+                            std::vector<float> &topk_weights) override {
+        Config::AdjustTopKPatterns(topk_ids, topk_weights);
+    }
+    int RunKernelImpl() override {
+        FusedMoE1StageParams params{
+            reinterpret_cast<unsigned *>(d_ctx_->out),
+            reinterpret_cast<const unsigned *>(d_ctx_->dq_act),
+            reinterpret_cast<const unsigned *>(d_ctx_->w1),
+            reinterpret_cast<const unsigned *>(d_ctx_->w2),
+            reinterpret_cast<const unsigned *>(d_ctx_->sorted_token_ids),
+            reinterpret_cast<const unsigned *>(d_ctx_->sorted_weights),
+            reinterpret_cast<const unsigned *>(d_ctx_->sorted_expert_ids),
+            d_ctx_->num_valid_ids,
+            Context::kTopK,
+            nullptr,
+            reinterpret_cast<const unsigned *>(d_ctx_->scale_fc1),
+            reinterpret_cast<const unsigned *>(d_ctx_->scale_fc2),
+            Context::kMaxNumMBlocks,
+            Context::kTokens,
+            Context::kDim,
+            Context::kInterDim,
+            Context::kExperts,
+            nullptr,
+            0,
+        };
+        return FusedMoEMatmul1Stage(params, kBf16NativeMxFp4BiasSolutionId.Repr());
+    }
+
+  private:
+    static void RepackWeights(unsigned *dst, size_t words, unsigned rows,
+                              unsigned cols) {
+        unsigned *baseline = nullptr;
+        CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&baseline),
+                                 words * sizeof(unsigned)));
+        CheckHIPStatus(hipMemcpy(baseline, dst, words * sizeof(unsigned),
+                                 hipMemcpyDeviceToDevice));
+        CheckHIPStatus(
+            moe_test::RepackNativeMxFp4Weights(dst, baseline, rows, cols));
+        CheckHIPStatus(hipFree(baseline));
+    }
+
+    static void RepackScales(unsigned char *dst, size_t bytes, unsigned rows,
+                             unsigned scale_cols) {
+        unsigned *baseline = nullptr;
+        CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&baseline), bytes));
+        CheckHIPStatus(hipMemcpy(baseline, dst, bytes, hipMemcpyDeviceToDevice));
+        CheckHIPStatus(moe_test::RepackNativeMxFp4Scales(
+            reinterpret_cast<unsigned *>(dst), baseline, rows, scale_cols));
+        CheckHIPStatus(hipFree(baseline));
+    }
+
+    std::unique_ptr<Context> h_ctx_;
+    Context *d_ctx_ = nullptr;
+    std::unique_ptr<moe_test::DeviceContextAccessor<Context>> h_ctx_accessor_;
+    std::unique_ptr<moe_test::DeviceContextAccessor<Context>> d_ctx_accessor_;
+};
+
 class FusedMoEMxFp4Test : public ::testing::Test {
   public:
     template <class Config> void RunComparisonTest() {
-        Fp8InputMxFp4Runner<Config> runner;
-        runner.Initialize();
-        runner.RunTest();
+        {
+            SCOPED_TRACE("FP8 input MXFP4 MoE");
+            Fp8InputMxFp4Runner<Config> runner;
+            runner.Initialize();
+            runner.RunTest();
+        }
+        {
+            SCOPED_TRACE("FP8 input MXFP4 MoE with BF16 bias layout");
+            Fp8InputMxFp4Runner<
+                Config, Fp8InputMxFp4BiasConfig<Config>,
+                kFp8PetitMxFp4BiasSolutionId.Repr()>
+                runner;
+            runner.Initialize();
+            runner.RunTest();
+        }
+        {
+            SCOPED_TRACE("BF16 input MXFP4 MoE");
+            Bf16InputMxFp4Runner<Config> runner;
+            runner.Initialize();
+            runner.RunTest();
+        }
     }
 };
 

@@ -6,8 +6,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 import petit_kernel
-from fused_moe_replay_like import SENSITIVE_ATOL as REPLAY_LIKE_SENSITIVE_ATOL
-from fused_moe_replay_like import topk_tensors as replay_like_topk_tensors
+from fused_moe_test_data import NUMERICALLY_SENSITIVE_ATOL
+from fused_moe_test_data import numerically_sensitive_topk
+from moe_test_utils import build_padded_sorted_routing
 
 
 BLOCK_K = 128
@@ -23,10 +24,14 @@ FC2_E8M0_MEAN = 122.0
 FC2_E8M0_STD = 1.15
 
 
-def _dequantize_input(input_q: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
+def _dequantize_input(
+    input_q: torch.Tensor, input_scale: torch.Tensor
+) -> torch.Tensor:
     tokens, model_dim = input_q.shape
     blocks = input_q.to(torch.float32).view(tokens, model_dim // BLOCK_K, BLOCK_K)
-    return (blocks * input_scale.to(torch.float32).unsqueeze(-1)).reshape(tokens, model_dim)
+    return (blocks * input_scale.to(torch.float32).unsqueeze(-1)).reshape(
+        tokens, model_dim
+    )
 
 
 def _quantize_input(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -44,10 +49,15 @@ def _quantize_input(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _native_fp8_dtype_or_skip(device: torch.device) -> torch.dtype:
-    if not (hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e4m3fnuz")):
+    if not (
+        hasattr(torch, "float8_e4m3fn")
+        or hasattr(torch, "float8_e4m3fnuz")
+    ):
         pytest.skip("torch float8_e4m3 dtype is required")
     arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
-    if arch.startswith(("gfx950", "gfx1200", "gfx1201")) and hasattr(torch, "float8_e4m3fn"):
+    if arch.startswith(("gfx950", "gfx1200", "gfx1201")) and hasattr(
+        torch, "float8_e4m3fn"
+    ):
         return torch.float8_e4m3fn
     if hasattr(torch, "float8_e4m3fnuz"):
         return torch.float8_e4m3fnuz
@@ -68,9 +78,9 @@ def _rand_moment_mxfp4_tensor(
 ) -> torch.Tensor:
     def sample_nibbles() -> torch.Tensor:
         zero = torch.rand(shape, device=device) < zero_prob
-        magnitude = (
-            magnitude_mean + magnitude_std * torch.randn(shape, device=device)
-        ).round().clamp_(1, 7).to(torch.uint8)
+        magnitude = (magnitude_mean + magnitude_std * torch.randn(
+            shape, device=device
+        )).round().clamp_(1, 7).to(torch.uint8)
         sign = torch.randint(0, 2, shape, device=device, dtype=torch.uint8) << 3
         return torch.where(zero, torch.zeros_like(magnitude), magnitude | sign)
 
@@ -82,34 +92,27 @@ def _rand_moment_mxfp4_tensor(
 def _rand_moment_e8m0_scales(
     shape: tuple[int, ...], device: torch.device, *, mean: float, stddev: float
 ) -> torch.Tensor:
-    return (
-        mean + stddev * torch.randn(shape, device=device)
-    ).round().clamp_(1, 237).to(torch.uint8).contiguous()
+    return (mean + stddev * torch.randn(shape, device=device)).round().clamp_(
+        1, 237
+    ).to(torch.uint8).contiguous()
+
+def _dequantize_mxfp4(
+    qweight_u8: torch.Tensor, scales_e8m0: torch.Tensor
+) -> torch.Tensor:
+    codebook = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=qweight_u8.device,
+    )
+    nibbles = torch.stack(
+        (qweight_u8 & 0xF, qweight_u8 >> 4), dim=-1
+    ).flatten(-2)
+    values = codebook[nibbles.to(torch.long)]
+    scales = (scales_e8m0.to(torch.int32) << 23).view(torch.float32)
+    return (values * scales.repeat_interleave(32, dim=-1)).transpose(0, 1)
 
 
-
-def _dequantize_mxfp4_quark(qweight_u8: torch.Tensor, scales_e8m0: torch.Tensor) -> torch.Tensor:
-    try:
-        from quark.torch.kernel.mx.triton import dq_mxfp4_triton
-    except ImportError as exc:
-        pytest.skip(f"quark Triton MXFP4 dequant is unavailable: {exc}")
-
-    try:
-        return (
-            dq_mxfp4_triton(
-                qweight_u8.contiguous(),
-                scales_e8m0.contiguous(),
-                torch.bfloat16,
-            )
-            .transpose(0, 1)
-            .contiguous()
-            .to(torch.float32)
-        )
-    except Exception as exc:
-        pytest.skip(f"quark Triton MXFP4 dequant failed: {exc}")
-
-
-def _reference_fused_moe_quark_chunked(
+def _reference_fused_moe_chunked(
     input_q: torch.Tensor,
     w13_q: torch.Tensor,
     w2_q: torch.Tensor,
@@ -124,7 +127,9 @@ def _reference_fused_moe_quark_chunked(
     inter_dim = packed_inter * 2
 
     x = _dequantize_input(input_q, input_scale)
-    out = torch.zeros((tokens, model_dim), dtype=torch.float32, device=input_q.device)
+    out = torch.zeros(
+        (tokens, model_dim), dtype=torch.float32, device=input_q.device
+    )
 
     for expert in range(experts):
         expert_mask = topk_ids == expert
@@ -132,14 +137,16 @@ def _reference_fused_moe_quark_chunked(
             continue
 
         token_ids, route_ids = torch.where(expert_mask)
-        w13 = _dequantize_mxfp4_quark(w13_q[expert], fc1_scale[expert])
-        w2 = _dequantize_mxfp4_quark(w2_q[expert], fc2_scale[expert])
+        w13 = _dequantize_mxfp4(w13_q[expert], fc1_scale[expert])
+        w2 = _dequantize_mxfp4(w2_q[expert], fc2_scale[expert])
 
         for idx in range(token_ids.numel()):
             token = int(token_ids[idx].item())
             route = int(route_ids[idx].item())
 
-            stage1_acc = torch.zeros((2 * inter_dim,), dtype=torch.float32, device=x.device)
+            stage1_acc = torch.zeros(
+                (2 * inter_dim,), dtype=torch.float32, device=x.device
+            )
             for k256 in range(0, model_dim, 256):
                 x_256 = x[token, k256 : k256 + 256].to(torch.float32)
                 w13_256 = w13[k256 : k256 + 256, :].to(torch.float32)
@@ -170,13 +177,15 @@ def _prepare_dump_case(
     input_q_u8 = input_q_fp8.view(torch.uint8).contiguous()
     input_scale_layout = input_scale.transpose(0, 1).contiguous()
 
-    w13_q_packed, fc1_scale_packed = petit_kernel.repack_moe_mxfp4_kernel_layout(
+    w13_q_packed, fc1_scale_packed = petit_kernel.repack_moe_kernel_layout(
         reference["w13_q"].contiguous(),
         reference["fc1_scale"].contiguous(),
+        layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
     )
-    w2_q_packed, fc2_scale_packed = petit_kernel.repack_moe_mxfp4_kernel_layout(
+    w2_q_packed, fc2_scale_packed = petit_kernel.repack_moe_kernel_layout(
         reference["w2_q"].contiguous(),
         reference["fc2_scale"].contiguous(),
+        layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
     )
     return (
         input_q_u8,
@@ -224,23 +233,25 @@ def _run_fused_moe_case(
     fc1_scale: torch.Tensor,
     fc2_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    w13_q_packed, fc1_scale_packed = petit_kernel.repack_moe_mxfp4_kernel_layout(
-        w13_q, fc1_scale
+    w13_q_packed, fc1_scale_packed = petit_kernel.repack_moe_kernel_layout(
+        w13_q,
+        fc1_scale,
+        layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
     )
-    w2_q_packed, fc2_scale_packed = petit_kernel.repack_moe_mxfp4_kernel_layout(
-        w2_q, fc2_scale
+    w2_q_packed, fc2_scale_packed = petit_kernel.repack_moe_kernel_layout(
+        w2_q,
+        fc2_scale,
+        layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
     )
-    moe_sorting = pytest.importorskip("aiter.fused_moe").moe_sorting
-    sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
-        topk_ids,
-        topk_weights,
-        w2_q_packed.size(0),
-        input_q.size(1),
-        torch.bfloat16,
-        32,
+    sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids = (
+        build_padded_sorted_routing(
+            topk_ids, topk_weights, w2_q_packed.size(0)
+        )
     )
     out = torch.zeros(
-        (input_q.size(0), input_q.size(1)), dtype=torch.bfloat16, device=input_q.device
+        (input_q.size(0), input_q.size(1)),
+        dtype=torch.bfloat16,
+        device=input_q.device,
     )
     petit_kernel.fused_moe_fp8_blockscale_g1u1_mxfp4(
         input_q,
@@ -256,7 +267,7 @@ def _run_fused_moe_case(
         fc2_scale_packed,
         out=out,
     )
-    ref = _reference_fused_moe_quark_chunked(
+    ref = _reference_fused_moe_chunked(
         input_q,
         w13_q,
         w2_q,
@@ -267,6 +278,7 @@ def _run_fused_moe_case(
         fc2_scale,
     )
     return out, ref
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HIP/CUDA device required")
 def test_fused_moe_blockscale_fp8_mxfp4_matches_reference() -> None:
@@ -281,9 +293,14 @@ def test_fused_moe_blockscale_fp8_mxfp4_matches_reference() -> None:
     experts = 32
     topk = 8
 
-    input_f = torch.randn((tokens, model_dim), device=device, dtype=torch.float32) * 0.12
+    input_f = (
+        torch.randn((tokens, model_dim), device=device, dtype=torch.float32)
+        * 0.12
+    )
     spike_mask = torch.rand((tokens, model_dim), device=device) < 0.002
-    input_f = input_f + spike_mask * torch.randn((tokens, model_dim), device=device) * 5.0
+    input_f += spike_mask * torch.randn(
+        (tokens, model_dim), device=device
+    ) * 5.0
     input_q, input_scale = _quantize_input(input_f)
 
     w13_q = _rand_moment_mxfp4_tensor(
@@ -312,15 +329,24 @@ def test_fused_moe_blockscale_fp8_mxfp4_matches_reference() -> None:
         mean=FC2_E8M0_MEAN,
         stddev=FC2_E8M0_STD,
     )
-    topk_ids, topk_weights = replay_like_topk_tensors(device)
+    topk_ids, topk_weights = numerically_sensitive_topk(device)
 
     out, ref = _run_fused_moe_case(
-        input_q, input_scale, w13_q, w2_q, topk_ids, topk_weights, fc1_scale, fc2_scale
+        input_q,
+        input_scale,
+        w13_q,
+        w2_q,
+        topk_ids,
+        topk_weights,
+        fc1_scale,
+        fc2_scale,
     )
 
     assert torch.isfinite(out.float()).all()
     assert out.abs().max().item() > 0
-    torch.testing.assert_close(out, ref, rtol=0.0, atol=REPLAY_LIKE_SENSITIVE_ATOL)
+    torch.testing.assert_close(
+        out, ref, rtol=0.0, atol=NUMERICALLY_SENSITIVE_ATOL
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="HIP/CUDA device required")
@@ -381,7 +407,7 @@ def test_fused_moe_blockscale_fp8_mxfp4_dump_replay_matches_reference() -> None:
             out=out,
         )
         torch.cuda.synchronize()
-        ref = _reference_fused_moe_quark_chunked(
+        ref = _reference_fused_moe_chunked(
             input_q_u8.view(fp8_dtype).contiguous(),
             reference["w13_q"].contiguous(),
             reference["w2_q"].contiguous(),

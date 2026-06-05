@@ -331,11 +331,21 @@ class FusedMoEInputBuilder:
                 .contiguous()
             )
         else:
-            w1_q_kernel, fc1_scale_kernel = petit_kernel.repack_moe_mxfp4_kernel_layout(
-                w1_q, fc1_scale
+            (
+                w1_q_kernel,
+                fc1_scale_kernel,
+            ) = petit_kernel.repack_moe_kernel_layout(
+                w1_q,
+                fc1_scale,
+                layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
             )
-            w2_q_kernel, fc2_scale_kernel = petit_kernel.repack_moe_mxfp4_kernel_layout(
-                w2_q, fc2_scale
+            (
+                w2_q_kernel,
+                fc2_scale_kernel,
+            ) = petit_kernel.repack_moe_kernel_layout(
+                w2_q,
+                fc2_scale,
+                layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
             )
             input_scale_kernel = input_scale.t().contiguous()
 

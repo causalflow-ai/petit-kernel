@@ -3,7 +3,10 @@ import enum
 import torch
 
 from . import ops
-from .moe_mxfp4 import repack_moe_mxfp4_kernel_layout
+from .moe_mxfp4 import (
+    MoeKernelLayout,
+    repack_moe_kernel_layout,
+)
 from .ops import PetitSolutionHints
 
 
@@ -39,6 +42,7 @@ class _FusedMoeStages(enum.IntEnum):
 
 class _FusedMoeMfmaShape(enum.IntEnum):
     mfma_fp8_16x16x32 = 0
+    mfma_bf16_mxfp4 = 1
 
 
 class _FusedMoeActivationFunction(enum.IntEnum):
@@ -92,6 +96,16 @@ _FUSED_MOE_FP8_BLOCKSCALE_MXFP4_SOLUTION_ID = _make_fused_moe_solution_id(
     _FusedMoeStages.one_stage,
     _FusedMoeActivationFunction.silu_dot,
     _FusedMoeStage1Buffering.single_buffer,
+)
+_FUSED_MOE_BF16_MXFP4_BIAS_SOLUTION_ID = _make_fused_moe_solution_id(
+    _FusedMoeDataType.bf16,
+    _FusedMoeDataType.mxfp4,
+    _FusedMoeDataType.bf16,
+    _FusedMoeWeightOrdering.native_mxfp4,
+    _FusedMoeMfmaShape.mfma_bf16_mxfp4,
+    _FusedMoeStages.one_stage,
+    _FusedMoeActivationFunction.openai_swiglu,
+    _FusedMoeStage1Buffering.double_buffer,
 )
 
 
@@ -498,6 +512,121 @@ def fused_moe_fp8_blockscale_g1u1_mxfp4(
     )
 
 
+def _check_optional_bf16_moe_bias(
+    bias: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+    name: str,
+) -> None:
+    if bias is None:
+        return
+    if bias.device != hidden_states.device:
+        raise RuntimeError(f"{name} device mismatch")
+    if bias.dtype != torch.bfloat16:
+        raise RuntimeError(f"{name} must be bfloat16")
+    if not bias.is_contiguous():
+        raise RuntimeError(f"{name} must be contiguous")
+
+
+def _check_bf16_mxfp4_fmoe_args(
+    hidden_states: torch.Tensor,
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    tokens: int,
+    dim: int,
+    experts: int,
+) -> None:
+    _check_dtype("hidden_states", hidden_states, torch.bfloat16)
+    _check_dtype("w1_q", w1_q, torch.uint8)
+    _check_dtype("w2_q", w2_q, torch.uint8)
+    _check_dtype("w1_scale", w1_scale, torch.uint8)
+    _check_dtype("w2_scale", w2_scale, torch.uint8)
+
+    inter_dim = w2_q.size(2) * 2
+    if w2_q.size(1) != dim:
+        raise RuntimeError("w2_q dim mismatch with hidden_states")
+    if w1_q.size(0) != experts:
+        raise RuntimeError("w1_q experts mismatch with w2_q")
+    if w1_q.size(1) != 2 * inter_dim:
+        raise RuntimeError("w1_q second dim must be 2*inter_dim")
+    if w1_q.size(2) * 2 != dim:
+        raise RuntimeError("w1_q third dim must be dim/2")
+    if inter_dim % 128 != 0:
+        raise RuntimeError("inter_dim must be divisible by 128")
+
+    _check_mxfp4_scale_shape("w1_scale", w1_scale, experts, 2 * inter_dim, dim // 32)
+    _check_mxfp4_scale_shape("w2_scale", w2_scale, experts, dim, inter_dim // 32)
+
+
+def fused_moe_bf16_mxfp4(
+    hidden_states: torch.Tensor,
+    w13_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    topk: int,
+    fc1_scale: torch.Tensor,
+    fc2_scale: torch.Tensor,
+    num_persistent_tgs: int = 0,
+    out: torch.Tensor | None = None,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if out is None:
+        out = torch.zeros(
+            (hidden_states.size(0), hidden_states.size(1)),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+    tokens = hidden_states.size(0)
+    dim = hidden_states.size(1)
+    experts = w2_q.size(0)
+    input_scale = torch.empty((0,), dtype=torch.float32, device=hidden_states.device)
+    _check_bf16_mxfp4_fmoe_args(
+        hidden_states, w13_q, w2_q, fc1_scale, fc2_scale, tokens, dim, experts
+    )
+    _check_optional_bf16_moe_bias(w13_bias, hidden_states, "w13_bias")
+    _check_optional_bf16_moe_bias(w2_bias, hidden_states, "w2_bias")
+    tokens, dim, experts = _check_common_fmoe_matmul_1stage_args(
+        out,
+        hidden_states,
+        w13_q,
+        w2_q,
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        int(topk),
+        input_scale,
+        fc1_scale,
+        fc2_scale,
+        int(num_persistent_tgs),
+    )
+
+    out.zero_()
+    return ops.fmoe_matmul_1stage(
+        out,
+        hidden_states,
+        w13_q,
+        w2_q,
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk,
+        input_scale,
+        fc1_scale,
+        fc2_scale,
+        _FUSED_MOE_BF16_MXFP4_BIAS_SOLUTION_ID,
+        num_persistent_tgs,
+        w13_bias,
+        w2_bias,
+    )
+
+
 def get_fp4_solutions(
     size_m: int, size_n: int, size_k: int, a_type: torch.dtype, c_type: torch.dtype
 ) -> list[int]:
@@ -513,8 +642,10 @@ __all__ = [
     "mul_mxfp4_a16",
     "fused_moe_fp8_blockscale_g1u1",
     "fused_moe_fp8_blockscale_g1u1_mxfp4",
+    "fused_moe_bf16_mxfp4",
     "get_fp4_solutions",
-    "repack_moe_mxfp4_kernel_layout",
+    "MoeKernelLayout",
+    "repack_moe_kernel_layout",
     "DataType",
     "PetitSolutionHints",
 ]

@@ -4,6 +4,7 @@
 #include <torch/python.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace causalflow::petit::rocm::quantization {
 struct PetitSolutionHints;
@@ -37,7 +38,9 @@ torch::Tensor FusedMoeMatmul1Stage(
     const torch::Tensor &sorted_expert_ids, const torch::Tensor &num_valid_ids,
     int64_t topk, const torch::Tensor &input_scale,
     const torch::Tensor &w1_scale, const torch::Tensor &w2_scale,
-    uint64_t solution_id, int64_t num_persistent_tgs = 0);
+    uint64_t solution_id, int64_t num_persistent_tgs = 0,
+    const std::optional<torch::Tensor> &w13_bias = std::nullopt,
+    const std::optional<torch::Tensor> &w2_bias = std::nullopt);
 
 py::list GetNvFp4Solutions(
     const causalflow::petit::rocm::quantization::PetitSolutionHints &hints,

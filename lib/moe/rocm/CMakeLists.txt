@@ -48,10 +48,11 @@ add_test(fused_moe_blockscale_fp8_test fused_moe_blockscale_fp8_test)
 
 add_executable(fused_moe_mxfp4_test
   fused_moe_mxfp4_test.cc
+  fused_moe_bf16_mxfp4_test.cc
   fused_moe_test_utils.cc
   fused_moe_test_utils.cu
 )
-set_source_files_properties(fused_moe_mxfp4_test.cc fused_moe_test_utils.cc fused_moe_test_utils.cu PROPERTIES
+set_source_files_properties(fused_moe_mxfp4_test.cc fused_moe_bf16_mxfp4_test.cc fused_moe_test_utils.cc fused_moe_test_utils.cu PROPERTIES
   LANGUAGE HIP
 )
 target_link_libraries(fused_moe_mxfp4_test

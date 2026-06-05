@@ -168,7 +168,9 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
                                unsigned tokens, unsigned dim,
                                unsigned inter_dim, unsigned experts,
                                unsigned sorted_token_padding,
-                               unsigned max_num_m_blocks) {
+                               unsigned max_num_m_blocks,
+                               TestRunnerConfig::ReferenceActivation
+                                   reference_activation) {
     std::fill(reference_out.begin(), reference_out.end(), 0u);
     const size_t token_out_bytes =
         static_cast<size_t>(tokens) * dim * sizeof(float);
@@ -242,22 +244,44 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
         CheckHIPStatus(hipMemset(device_ctx_accessor.up(), 0, inter_bytes));
         CheckHIPStatus(hipMemset(device_ctx_accessor.act(), 0, inter_bytes));
 
+        const bool use_silu_dot =
+            reference_activation ==
+            TestRunnerConfig::ReferenceActivation::kSiluDot;
         const unsigned elem_count = m_e * inter_dim;
-        auto run_stage1_gemm = [&](const __hip_bfloat16 *d_b,
-                                   __hip_bfloat16 *d_c, bool swish) {
-            if (swish) {
-                gemm.RunRowMajorGemmSwish(device_ctx_accessor.a(), d_b, d_c,
-                                          m_e, inter_dim, dim);
-            } else {
-                gemm.RunRowMajorGemm(device_ctx_accessor.a(), d_b, d_c, m_e,
-                                     inter_dim, dim);
-            }
-        };
-        run_stage1_gemm(d_b_gate, device_ctx_accessor.gate(), true);
-        run_stage1_gemm(d_b_up, device_ctx_accessor.up(), false);
-        CheckHIPStatus(ApplyElementwiseMultiply(
-            device_ctx_accessor.gate(), device_ctx_accessor.up(),
-            device_ctx_accessor.act(), elem_count));
+        if (use_silu_dot) {
+            auto run_stage1_gemm = [&](const __hip_bfloat16 *d_b,
+                                       __hip_bfloat16 *d_c, bool swish) {
+                if (swish) {
+                    gemm.RunRowMajorGemmSwish(device_ctx_accessor.a(), d_b,
+                                              d_c, m_e, inter_dim, dim);
+                } else {
+                    gemm.RunRowMajorGemm(device_ctx_accessor.a(), d_b, d_c,
+                                         m_e, inter_dim, dim);
+                }
+            };
+            run_stage1_gemm(d_b_gate, device_ctx_accessor.gate(), true);
+            run_stage1_gemm(d_b_up, device_ctx_accessor.up(), false);
+            CheckHIPStatus(ApplyElementwiseMultiply(
+                device_ctx_accessor.gate(), device_ctx_accessor.up(),
+                device_ctx_accessor.act(), elem_count));
+        } else {
+            float *d_gate = nullptr;
+            float *d_up = nullptr;
+            CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&d_gate),
+                                     static_cast<size_t>(elem_count) *
+                                         sizeof(float)));
+            CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&d_up),
+                                     static_cast<size_t>(elem_count) *
+                                         sizeof(float)));
+            gemm.RunRowMajorGemmToFloat(device_ctx_accessor.a(), d_b_gate,
+                                        d_gate, m_e, inter_dim, dim);
+            gemm.RunRowMajorGemmToFloat(device_ctx_accessor.a(), d_b_up, d_up,
+                                        m_e, inter_dim, dim);
+            CheckHIPStatus(ApplyOpenAISwiGLU(
+                d_gate, d_up, device_ctx_accessor.act(), elem_count));
+            CheckHIPStatus(hipFree(d_up));
+            CheckHIPStatus(hipFree(d_gate));
+        }
 
         const size_t route_bytes =
             static_cast<size_t>(m_e) * dim * sizeof(__hip_bfloat16);
@@ -338,6 +362,13 @@ void HipBlasLtRunner::RunRowMajorGemm(const __hip_bfloat16 *d_a,
     RunRowMajorGemmWithDesc(default_desc_, d_a, d_b, d_c, m, n, k, 0.0f);
 }
 
+void HipBlasLtRunner::RunRowMajorGemmToFloat(const __hip_bfloat16 *d_a,
+                                             const __hip_bfloat16 *d_b,
+                                             float *d_c, unsigned m,
+                                             unsigned n, unsigned k) const {
+    RunRowMajorGemmToFloatWithDesc(default_desc_, d_a, d_b, d_c, m, n, k);
+}
+
 void HipBlasLtRunner::RunRowMajorGemmAccumulate(const __hip_bfloat16 *d_a,
                                                 const __hip_bfloat16 *d_b,
                                                 __hip_bfloat16 *d_c, unsigned m,
@@ -371,6 +402,31 @@ void HipBlasLtRunner::RunRowMajorGemmWithDesc(hipblasLtMatmulDesc_t desc,
 
     CheckHipblasStatus(hipblasLtMatmul(
         handle_, desc, &kAlpha, d_b, layout_a, d_a, layout_b, &beta, d_c,
+        layout_c, d_c, layout_c, nullptr, workspace_, kWorkspaceSize, nullptr));
+
+    CheckHipblasStatus(hipblasLtMatrixLayoutDestroy(layout_a));
+    CheckHipblasStatus(hipblasLtMatrixLayoutDestroy(layout_b));
+    CheckHipblasStatus(hipblasLtMatrixLayoutDestroy(layout_c));
+}
+
+void HipBlasLtRunner::RunRowMajorGemmToFloatWithDesc(
+    hipblasLtMatmulDesc_t desc, const __hip_bfloat16 *d_a,
+    const __hip_bfloat16 *d_b, float *d_c, unsigned m, unsigned n,
+    unsigned k) const {
+    static constexpr float kAlpha = 1.0f;
+    static constexpr float kBeta = 0.0f;
+
+    hipblasLtMatrixLayout_t layout_a = nullptr, layout_b = nullptr,
+                            layout_c = nullptr;
+    CheckHipblasStatus(
+        hipblasLtMatrixLayoutCreate(&layout_a, HIP_R_16BF, k, n, k));
+    CheckHipblasStatus(
+        hipblasLtMatrixLayoutCreate(&layout_b, HIP_R_16BF, k, m, k));
+    CheckHipblasStatus(
+        hipblasLtMatrixLayoutCreate(&layout_c, HIP_R_32F, n, m, n));
+
+    CheckHipblasStatus(hipblasLtMatmul(
+        handle_, desc, &kAlpha, d_b, layout_a, d_a, layout_b, &kBeta, d_c,
         layout_c, d_c, layout_c, nullptr, workspace_, kWorkspaceSize, nullptr));
 
     CheckHipblasStatus(hipblasLtMatrixLayoutDestroy(layout_a));
@@ -505,7 +561,8 @@ void TestRunnerBase::ComputeReferences() {
     ComputeHipBlasLtReference(
         HostAccessor(), DeviceAccessor(), gemm_, std::span(reference_out_),
         config_.tokens, config_.dim, config_.inter_dim, config_.experts,
-        config_.sorted_token_padding, config_.max_num_m_blocks);
+        config_.sorted_token_padding, config_.max_num_m_blocks,
+        config_.reference_activation);
 }
 
 void TestRunnerBase::RunReferenceOnly() {

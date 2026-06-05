@@ -314,19 +314,43 @@ hipError_t ApplyElementwiseMultiply(const __hip_bfloat16 *a,
                                     __hip_bfloat16 *out, unsigned count,
                                     hipStream_t stream = nullptr);
 
+template <class Input>
+hipError_t ApplyOpenAISwiGLU(const Input *gate, const Input *up,
+                             __hip_bfloat16 *out, unsigned count,
+                             hipStream_t stream = nullptr);
+
+extern template hipError_t
+ApplyOpenAISwiGLU<__hip_bfloat16>(const __hip_bfloat16 *, const __hip_bfloat16 *,
+                                  __hip_bfloat16 *, unsigned, hipStream_t);
+extern template hipError_t ApplyOpenAISwiGLU<float>(
+    const float *, const float *, __hip_bfloat16 *, unsigned, hipStream_t);
+
 hipError_t ScatterWeightedRoutes(const __hip_bfloat16 *route_out,
                                  const unsigned *route_tokens,
                                  const float *route_weights, float *token_out,
                                  unsigned routes, unsigned cols,
                                  hipStream_t stream = nullptr);
 
-hipError_t RepackMoeMxFp4Weights(unsigned *output, const unsigned *input,
-                                 unsigned rows, unsigned cols,
-                                 hipStream_t stream = nullptr);
+hipError_t RepackBf16BiasDppLayout(__hip_bfloat16 *output,
+                                   const __hip_bfloat16 *input, unsigned rows,
+                                   unsigned cols,
+                                   hipStream_t stream = nullptr);
 
-hipError_t RepackMoeMxFp4Scales(unsigned *output, const unsigned *input,
-                                unsigned rows, unsigned scale_cols,
-                                hipStream_t stream = nullptr);
+hipError_t RepackNativeMxFp4Weights(unsigned *output, const unsigned *input,
+                                       unsigned rows, unsigned cols,
+                                       hipStream_t stream = nullptr);
+
+hipError_t RepackNativeMxFp4Scales(unsigned *output, const unsigned *input,
+                                      unsigned rows, unsigned scale_cols,
+                                      hipStream_t stream = nullptr);
+
+hipError_t RepackPetitMxFp4Weights(unsigned *output, const unsigned *input,
+                                     unsigned rows, unsigned cols,
+                                     hipStream_t stream = nullptr);
+
+hipError_t RepackPetitMxFp4Scales(unsigned *output, const unsigned *input,
+                                    unsigned rows, unsigned scale_cols,
+                                    hipStream_t stream = nullptr);
 
 class HipBlasLtRunner {
   public:
@@ -336,6 +360,9 @@ class HipBlasLtRunner {
     void RunRowMajorGemm(const __hip_bfloat16 *d_a, const __hip_bfloat16 *d_b,
                          __hip_bfloat16 *d_c, unsigned m, unsigned n,
                          unsigned k) const;
+    void RunRowMajorGemmToFloat(const __hip_bfloat16 *d_a,
+                                const __hip_bfloat16 *d_b, float *d_c,
+                                unsigned m, unsigned n, unsigned k) const;
     void RunRowMajorGemmAccumulate(const __hip_bfloat16 *d_a,
                                    const __hip_bfloat16 *d_b,
                                    __hip_bfloat16 *d_c, unsigned m, unsigned n,
@@ -350,6 +377,11 @@ class HipBlasLtRunner {
                                  const __hip_bfloat16 *d_b, __hip_bfloat16 *d_c,
                                  unsigned m, unsigned n, unsigned k,
                                  float beta) const;
+    void RunRowMajorGemmToFloatWithDesc(hipblasLtMatmulDesc_t desc,
+                                        const __hip_bfloat16 *d_a,
+                                        const __hip_bfloat16 *d_b, float *d_c,
+                                        unsigned m, unsigned n,
+                                        unsigned k) const;
 
     static constexpr size_t kWorkspaceSize = 16 * 1024 * 1024;
     hipblasLtHandle_t handle_ = nullptr;
@@ -359,6 +391,11 @@ class HipBlasLtRunner {
 };
 
 struct TestRunnerConfig {
+    enum class ReferenceActivation {
+        kSiluDot,
+        kOpenAISwiGLU,
+    };
+
     unsigned tokens;
     unsigned dim;
     unsigned inter_dim;
@@ -374,6 +411,7 @@ struct TestRunnerConfig {
     float per_element_atol;
     float ocp_fp8_per_element_atol;
     float per_element_rtol;
+    ReferenceActivation reference_activation;
 };
 
 template <class Config, class Context>
@@ -394,6 +432,13 @@ constexpr TestRunnerConfig MakeTestRunnerConfig() {
         .per_element_atol = Config::kPerElementAtol,
         .ocp_fp8_per_element_atol = Config::kOcpFp8PerElementAtol,
         .per_element_rtol = Config::kPerElementRtol,
+        .reference_activation = [] {
+            if constexpr (requires { Config::kReferenceActivation; }) {
+                return Config::kReferenceActivation;
+            } else {
+                return TestRunnerConfig::ReferenceActivation::kSiluDot;
+            }
+        }(),
     };
 }
 

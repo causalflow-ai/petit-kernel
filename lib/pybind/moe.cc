@@ -83,7 +83,9 @@ void RunFusedMoEMatmul(
     int64_t topk, const torch::Tensor &input_scale,
     const torch::Tensor &w1_scale, const torch::Tensor &w2_scale,
     uint64_t solution_id, const FusedMoeShape &shape,
-    int64_t num_persistent_tgs) {
+    int64_t num_persistent_tgs,
+    const std::optional<torch::Tensor> &w13_bias,
+    const std::optional<torch::Tensor> &w2_bias) {
     if (shape.max_num_m_blocks == 0) {
         return;
     }
@@ -111,6 +113,8 @@ void RunFusedMoEMatmul(
         static_cast<unsigned>(shape.experts),
         stream,
         static_cast<unsigned>(num_persistent_tgs),
+        w13_bias.has_value() ? w13_bias->data_ptr() : nullptr,
+        w2_bias.has_value() ? w2_bias->data_ptr() : nullptr,
     };
     const int err =
         causalflow::petit::rocm::moe::FusedMoEMatmul1Stage(args, solution_id);
@@ -126,17 +130,33 @@ torch::Tensor FusedMoeMatmul1Stage(
     const torch::Tensor &sorted_expert_ids, const torch::Tensor &num_valid_ids,
     int64_t topk, const torch::Tensor &input_scale,
     const torch::Tensor &w1_scale, const torch::Tensor &w2_scale,
-    uint64_t solution_id, int64_t num_persistent_tgs) {
+    uint64_t solution_id, int64_t num_persistent_tgs,
+    const std::optional<torch::Tensor> &w13_bias,
+    const std::optional<torch::Tensor> &w2_bias) {
     TORCH_CHECK(input_q.device().is_cuda(), "input_q must be on GPU");
     const int dev = input_q.get_device();
     CheckFusedMoEArchSupported(dev, "FusedMoE");
+    if (w13_bias.has_value()) {
+        TORCH_CHECK(w13_bias->device() == input_q.device(),
+                    "w13_bias device mismatch");
+        TORCH_CHECK(w13_bias->dtype() == torch::kBFloat16,
+                    "w13_bias must be bfloat16");
+        TORCH_CHECK(w13_bias->is_contiguous(), "w13_bias must be contiguous");
+    }
+    if (w2_bias.has_value()) {
+        TORCH_CHECK(w2_bias->device() == input_q.device(),
+                    "w2_bias device mismatch");
+        TORCH_CHECK(w2_bias->dtype() == torch::kBFloat16,
+                    "w2_bias must be bfloat16");
+        TORCH_CHECK(w2_bias->is_contiguous(), "w2_bias must be contiguous");
+    }
 
     const FusedMoeShape shape =
         MakeFusedMoEShape(input_q, w2_q, sorted_expert_ids, solution_id);
     RunFusedMoEMatmul(out, input_q, w1_q, w2_q, sorted_token_ids,
                       sorted_weights, sorted_expert_ids, num_valid_ids, topk,
                       input_scale, w1_scale, w2_scale, solution_id, shape,
-                      num_persistent_tgs);
+                      num_persistent_tgs, w13_bias, w2_bias);
     return out;
 }
 

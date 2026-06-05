@@ -2,8 +2,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 import petit_kernel
-from fused_moe_replay_like import SENSITIVE_ATOL as REPLAY_LIKE_SENSITIVE_ATOL
-from fused_moe_replay_like import topk_tensors as replay_like_topk_tensors
+from fused_moe_test_data import NUMERICALLY_SENSITIVE_ATOL
+from fused_moe_test_data import numerically_sensitive_topk
+from moe_test_utils import build_padded_sorted_routing
 
 
 KERNEL_SYMBOL = "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256E"
@@ -274,63 +275,9 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
         topk_weights: torch.Tensor,
         block_size: int = 32,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        max_num_tokens_padded = int(topk_ids.numel() + self.experts * block_size - self.topk)
-        max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
-        init_val = (self.topk << 24) | self.tokens
-
-        sorted_token_ids = torch.full((max_num_tokens_padded,), init_val, dtype=torch.int32)
-        sorted_weights = torch.zeros((max_num_tokens_padded,), dtype=torch.float32)
-        sorted_expert_ids = torch.full((max_num_m_blocks,), -1, dtype=torch.int32)
-
-        topk_ids_cpu = topk_ids.to("cpu", dtype=torch.int32)
-        topk_weights_cpu = topk_weights.to("cpu", dtype=torch.float32)
-        token_ids_cpu = (
-            torch.arange(self.tokens, dtype=torch.int32)
-            .unsqueeze(1)
-            .expand(self.tokens, self.topk)
-            .reshape(-1)
+        return build_padded_sorted_routing(
+            topk_ids, topk_weights, self.experts, block_size
         )
-        slot_ids_cpu = (
-            torch.arange(self.topk, dtype=torch.int32).unsqueeze(0).expand(self.tokens, self.topk).reshape(-1)
-        )
-        expert_ids_cpu = topk_ids_cpu.reshape(-1)
-        route_weights_cpu = topk_weights_cpu.reshape(-1)
-
-        order = torch.argsort(expert_ids_cpu, stable=True)
-        token_ids_cpu = token_ids_cpu[order]
-        slot_ids_cpu = slot_ids_cpu[order]
-        expert_ids_cpu = expert_ids_cpu[order]
-        route_weights_cpu = route_weights_cpu[order]
-
-        expert_counts = torch.bincount(expert_ids_cpu, minlength=self.experts)
-        route_begin = 0
-        sorted_ids_begin = 0
-        sorted_expert_ids_begin = 0
-        for expert in range(self.experts):
-            tokens_num = int(expert_counts[expert].item())
-            if tokens_num == 0:
-                continue
-            route_end = route_begin + tokens_num
-            sorted_token_ids[sorted_ids_begin:sorted_ids_begin + tokens_num] = (
-                (slot_ids_cpu[route_begin:route_end] << 24) | token_ids_cpu[route_begin:route_end]
-            )
-            sorted_weights[sorted_ids_begin:sorted_ids_begin + tokens_num] = route_weights_cpu[
-                route_begin:route_end
-            ]
-
-            sorted_expert_ids_num = (tokens_num + block_size - 1) // block_size
-            tokens_num_pad = sorted_expert_ids_num * block_size
-            sorted_expert_ids[
-                sorted_expert_ids_begin:sorted_expert_ids_begin + sorted_expert_ids_num
-            ] = expert
-
-            route_begin = route_end
-            sorted_ids_begin += tokens_num_pad
-            sorted_expert_ids_begin += sorted_expert_ids_num
-
-        # [num_valid_ids_padded, token_count]
-        num_valid_ids = torch.tensor([sorted_ids_begin, self.tokens], dtype=torch.int32)
-        return sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
     def to_aiter_kernel_layout(
         self,
@@ -543,7 +490,7 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
             fc2_scale=fc2_scale,
         )
 
-    def build_replay_like_sensitive(self) -> dict[str, torch.Tensor]:
+    def build_numerically_sensitive(self) -> dict[str, torch.Tensor]:
         block_n, block_k = BLOCK_SHAPE
         fp8_dtype = _native_fp8_dtype_or_skip(self.device)
         assert self.tokens == 2
@@ -583,7 +530,7 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
             0.025,
             0.004,
         )
-        topk_ids, topk_weights = replay_like_topk_tensors(self.device)
+        topk_ids, topk_weights = numerically_sensitive_topk(self.device)
 
         return self._finalize_routing(
             input_q=input_q,
@@ -683,52 +630,7 @@ def test_fmoe_blockscale_fp8_reference_matches_aiter_kernel(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Petit kernel requires a GPU")
-def test_fmoe_matmul_1stage_validates_output_tensor():
-    tokens = 32
-    model_dim = 512
-    inter_dim = 512
-    experts = 1
-    topk = 1
-
-    device = torch.device("cuda")
-    _native_fp8_dtype_or_skip(device)
-    dtype = torch.bfloat16
-
-    torch.manual_seed(7)
-    builder = FmoeBlockscaleFp8AiterTestDataBuilder(
-        device=device,
-        dtype=dtype,
-        tokens=tokens,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-    )
-    data = builder.build_ultra_harsh()
-    kernel_data = builder.to_aiter_kernel_layout(
-        input_q=data["input_q"],
-        w1_q=data["w1_q"],
-        w2_q=data["w2_q"],
-        input_scale=data["input_scale"],
-        fc1_scale=data["fc1_scale"],
-        fc2_scale=data["fc2_scale"],
-    )
-
-    bad_dtype = torch.empty((tokens, model_dim), dtype=torch.float32, device=device)
-    with pytest.raises(RuntimeError, match="out must be bfloat16"):
-        _run_petit_fp8_kernel(kernel_data, data, topk, out=bad_dtype)
-
-    bad_shape = torch.empty((tokens, model_dim + 128), dtype=dtype, device=device)
-    with pytest.raises(RuntimeError, match="out must be \\[tokens, dim\\]"):
-        _run_petit_fp8_kernel(kernel_data, data, topk, out=bad_shape)
-
-    non_contiguous = torch.empty((model_dim, tokens), dtype=dtype, device=device).t()
-    with pytest.raises(RuntimeError, match="out must be contiguous"):
-        _run_petit_fp8_kernel(kernel_data, data, topk, out=non_contiguous)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Petit kernel requires a GPU")
-def test_fmoe_blockscale_fp8_replay_like_sensitive_matches_reference():
+def test_fmoe_blockscale_fp8_numerically_sensitive_matches_reference():
     tokens = 2
     model_dim = DEEPSEEK_V32_EXP["dim"]
     inter_dim = DEEPSEEK_V32_EXP["moe_inter_dim"]
@@ -750,7 +652,7 @@ def test_fmoe_blockscale_fp8_replay_like_sensitive_matches_reference():
         experts=experts,
         topk=topk,
     )
-    data = builder.build_replay_like_sensitive()
+    data = builder.build_numerically_sensitive()
     kernel_data = builder.to_aiter_kernel_layout(
         input_q=data["input_q"],
         w1_q=data["w1_q"],
@@ -777,7 +679,7 @@ def test_fmoe_blockscale_fp8_replay_like_sensitive_matches_reference():
         out_petit,
         ref_out,
         rtol=0.0,
-        atol=REPLAY_LIKE_SENSITIVE_ATOL,
+        atol=NUMERICALLY_SENSITIVE_ATOL,
         msg="petit sensitive FP8 output differs from torch reference",
     )
 
@@ -813,6 +715,30 @@ def test_fmoe_blockscale_fp8_petit_supports_preallocated_out_and_cuda_graph():
         fc1_scale=data["fc1_scale"],
         fc2_scale=data["fc2_scale"],
     )
+
+    invalid_outputs = (
+        (
+            torch.empty((tokens, model_dim), dtype=torch.float32, device=device),
+            "out must be bfloat16",
+        ),
+        (
+            torch.empty(
+                (tokens, model_dim + 128), dtype=dtype, device=device
+            ),
+            "out must be \\[tokens, dim\\]",
+        ),
+        (
+            torch.empty(
+                (model_dim, tokens), dtype=dtype, device=device
+            ).t(),
+            "out must be contiguous",
+        ),
+    )
+    for invalid_out, error in invalid_outputs:
+        with pytest.raises(RuntimeError, match=error):
+            _run_petit_fp8_kernel(
+                kernel_data, data, topk, out=invalid_out
+            )
 
     def run_kernel(out: torch.Tensor) -> torch.Tensor:
         return petit_kernel.fused_moe_fp8_blockscale_g1u1(

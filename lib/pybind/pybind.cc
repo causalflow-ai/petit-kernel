@@ -19,6 +19,8 @@ PYBIND11_MODULE(ops, m) {
           pybind11::arg("input_scale"), pybind11::arg("w1_scale"),
           pybind11::arg("w2_scale"), pybind11::arg("solution_id"),
           pybind11::arg("num_persistent_tgs") = 0,
+          pybind11::arg("w13_bias") = pybind11::none(),
+          pybind11::arg("w2_bias") = pybind11::none(),
           "Unified one-stage fused MoE matmul dispatcher with caller-provided output");
     m.def("get_nvfp4_solutions", &GetNvFp4Solutions,
           "Get possible fp4 solutions");
