@@ -7,8 +7,7 @@ namespace causalflow::petit::rocm::moe {
 
 struct TokenMetadata {
     unsigned token_topk_idx;
-    unsigned src_rank : 8;
-    unsigned local_combine_slot : 24;
+    unsigned src_rank;
 };
 static_assert(sizeof(TokenMetadata) == sizeof(unsigned long), "");
 

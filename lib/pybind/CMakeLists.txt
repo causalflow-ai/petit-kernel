@@ -1,5 +1,6 @@
 add_library(petit_kernels SHARED
     fp4.cc
+    mega_moe.cc
     moe.cc
     pybind.cc
     vmm_symmetric_heap.cc

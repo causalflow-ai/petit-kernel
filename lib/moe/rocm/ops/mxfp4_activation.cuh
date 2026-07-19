@@ -76,6 +76,7 @@ template <class Config> struct MxFp4ActivationQuantizer {
         return result;
     }
 
+    template <int kStoreScope = BufferResource::kNone>
     TAL_DEVICE static void
     Store(const BufferResource &workspace, unsigned value_base,
           unsigned scale_base,
@@ -91,7 +92,8 @@ template <class Config> struct MxFp4ActivationQuantizer {
         if ((col_lane & 1u) == 0) {
             const unsigned packed = static_cast<unsigned>(quantized.value) |
                                     (partner << 16);
-            workspace.template StoreU32<BufferResource::kNTBit>(
+            workspace.template StoreU32<kStoreScope |
+                                        BufferResource::kNTBit>(
                 value_offset, value_base, packed);
         }
 
@@ -104,7 +106,7 @@ template <class Config> struct MxFp4ActivationQuantizer {
                                     (scale3 << 24);
             const unsigned scale_col =
                 tile_n * (kTileCols / 32) + (col_lane / 32) * 4;
-            workspace.template StoreU32<BufferResource::kNone>(
+            workspace.template StoreU32<kStoreScope>(
                 MxFp4ActivationLayout::ScaleOffset(scale_row, scale_col,
                                                     scale_cols),
                 scale_base, packed);

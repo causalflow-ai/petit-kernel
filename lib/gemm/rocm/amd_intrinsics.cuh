@@ -148,6 +148,10 @@ __device__ int llvm_amdgcn_raw_buffer_atomic_add_i32(
     int data, v4i rsrc, int voffset, int soffset,
     int aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
 
+__device__ int llvm_amdgcn_raw_buffer_atomic_or_i32(
+    int data, v4i rsrc, int voffset, int soffset,
+    int aux) __asm("llvm.amdgcn.raw.buffer.atomic.or.i32");
+
 __device__ long llvm_amdgcn_raw_buffer_atomic_add_i64(
     long data, v4i rsrc, int voffset, int soffset,
     int aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i64");
@@ -455,6 +459,13 @@ union BufferResource {
                                        int data) const {
         return llvm_amdgcn_raw_buffer_atomic_add_i32(data, content, voffset,
                                                      soffset, kAux);
+    }
+
+    template <int kAux>
+    __device__ inline unsigned AtomicOrU32(int voffset, int soffset,
+                                           unsigned data) const {
+        return static_cast<unsigned>(llvm_amdgcn_raw_buffer_atomic_or_i32(
+            static_cast<int>(data), content, voffset, soffset, kAux));
     }
 
     template <int kAux>

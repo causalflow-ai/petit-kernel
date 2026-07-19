@@ -85,6 +85,11 @@ template <class Config> struct TokenShuffle {
             *ws_, sm_id, tid, sync_ticket, [=]() { __syncthreads(); });
 
         PullTokens(sm_id, tid, wid, wtid);
+        // PullTokens ends with per-lane stores into the rank-local L1 pool.
+        // A following block/grid barrier does not drain those VMEM stores.
+        // Every producer lane must complete them before compute can consume
+        // the pooled activation, route weight, and metadata.
+        amdgcn_s_waitcnt<0, -1, 0>();
     }
 
   public:
@@ -94,15 +99,6 @@ template <class Config> struct TokenShuffle {
 
     TAL_DEVICE void ResetRoutingCounters(unsigned sm_id, unsigned tid) {
         Common::ResetRoutingCounters(*ws_, sm_id, tid);
-    }
-
-    TAL_DEVICE void ResetLocalCombineSlot(unsigned sm_id, unsigned tid) {
-        // The publish handoff guarantees that every wave has consumed the old
-        // slot count before CTA 0 clears it for the next invocation.
-        if (sm_id == 0 && tid == 0) {
-            ws_->br_.template StoreU32<BufferResource::kNone>(
-                0, ws_->LocalCombineSlotOffset(), 0);
-        }
     }
 
   private:
@@ -206,20 +202,9 @@ template <class Config> struct TokenShuffle {
                 TokenMetadata d{};
                 d.token_topk_idx = token_topk_idx;
                 d.src_rank = src_rank;
-                if constexpr (!Workspace::kUsesDirectRemoteCombine) {
-                    ws_->br_.template AtomicAddI32<
-                        BufferResource::kAtomicScopeAgent>(
-                        ws_->LocalCombineSlotOffset(), 0, 1);
-                    d.local_combine_slot = route_idx;
-                }
                 ws_->br_.template StoreU64<BufferResource::kNone>(
                     ws_->TokenMetadataOffset(pool_token_idx), 0,
                     __builtin_bit_cast(uint2, d));
-                if constexpr (!Workspace::kUsesDirectRemoteCombine) {
-                    ws_->br_.template StoreU64<BufferResource::kNone>(
-                        ws_->LocalCombinePublishMetadataOffset(route_idx), 0,
-                        __builtin_bit_cast(uint2, d));
-                }
             }
             TransferTokenToLocalAsync(wid, wtid, src_rank, token_topk_idx,
                                       pool_token_idx);

@@ -90,6 +90,17 @@ torch::Tensor FusedMoeMatmul2Stage2(
     uint64_t solution_id, int64_t num_persistent_tgs = 0,
     const std::optional<torch::Tensor> &w2_bias = std::nullopt);
 
+pybind11::tuple MegaMoeWorkspaceInputViews(
+    VmmSymmetricHeap &workspace, int64_t max_tokens, uint64_t solution_id);
+
+torch::Tensor MegaMoe(
+    VmmSymmetricHeap &workspace, const torch::Tensor &w13,
+    const torch::Tensor &w2, const torch::Tensor &scales_w13,
+    const torch::Tensor &scales_w2, int64_t num_tokens, uint64_t solution_id,
+    const std::optional<torch::Tensor> &w13_bias = std::nullopt,
+    const std::optional<torch::Tensor> &w2_bias = std::nullopt,
+    const std::optional<torch::Tensor> &out = std::nullopt);
+
 py::list GetNvFp4Solutions(
     const causalflow::petit::rocm::quantization::PetitSolutionHints &hints,
     int64_t size_m, int64_t size_n, int64_t size_k);

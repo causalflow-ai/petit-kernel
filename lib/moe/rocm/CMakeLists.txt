@@ -15,11 +15,16 @@ endfunction()
 
 set(MOE_SRCS
   fused_moe.cc
+  mega_moe.cc
 )
 
 set_source_files_properties(${MOE_SRCS} PROPERTIES
   LANGUAGE HIP
 )
+if(CMAKE_HIP_COMPILER_VERSION VERSION_GREATER_EQUAL 23)
+  set_property(SOURCE fused_moe.cc mega_moe.cc APPEND PROPERTY
+    COMPILE_OPTIONS "-Wno-error=pass-failed")
+endif()
 
 add_library(causalflow-petit-rocm-moe
   ${MOE_SRCS}

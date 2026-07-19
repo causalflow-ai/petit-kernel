@@ -59,14 +59,41 @@ class _FusedMoeStage1Buffering(enum.IntEnum):
     double_buffer = 1
 
 
+class _FusedMoeWeightLoadPolicy(enum.IntEnum):
+    cached = 0
+    non_temporal = 1
+
+
 class _FusedMoeStage1TileShape(enum.IntEnum):
     m32_n256 = 0
     m64_n512 = 1
 
 
-class _FusedMoeWeightLoadPolicy(enum.IntEnum):
-    cached = 0
-    non_temporal = 1
+class MegaMoeActivation(enum.Enum):
+    bf16 = "bf16"
+    mxfp4 = "mxfp4"
+
+
+class MegaMoeActivationFunction(enum.Enum):
+    silu = "silu"
+    swiglu = "swiglu"
+
+
+class MegaMoeStages(enum.IntEnum):
+    one_stage = 0
+    two_stage = 1
+
+
+class _MegaMoeTileShape(enum.IntEnum):
+    n256 = 0
+    n128 = 1
+
+
+class _MegaMoeProducerGeometry(enum.IntEnum):
+    cta56 = 0
+    cta64 = 1
+    cta128 = 2
+    cta192 = 3
 
 
 def _make_fused_moe_base_solution_id(
@@ -112,21 +139,21 @@ def _with_fused_moe_shape(solution_id: int, dim: int, inter_dim: int) -> int:
     )
 
 
-def _with_fused_moe_stage1_tile_shape(
-    solution_id: int, shape: _FusedMoeStage1TileShape | int
-) -> int:
-    shape_mask = 1 << 41
-    return (int(solution_id) & ~shape_mask) | (
-        (int(_FusedMoeStage1TileShape(shape)) & 0x1) << 41
-    )
-
-
 def _with_fused_moe_weight_load_policy(
     solution_id: int, policy: _FusedMoeWeightLoadPolicy | int
 ) -> int:
     policy_mask = 1 << 40
     return (int(solution_id) & ~policy_mask) | (
         (int(_FusedMoeWeightLoadPolicy(policy)) & 0x1) << 40
+    )
+
+
+def _with_fused_moe_stage1_tile_shape(
+    solution_id: int, shape: _FusedMoeStage1TileShape | int
+) -> int:
+    shape_mask = 1 << 41
+    return (int(solution_id) & ~shape_mask) | (
+        (int(_FusedMoeStage1TileShape(shape)) & 0x1) << 41
     )
 
 
@@ -153,6 +180,270 @@ def _make_fused_moe_solution_id(
         stage1_buffering,
     )
     return _with_fused_moe_shape(base, dim, inter_dim)
+
+
+def _make_mega_moe_solution_id(
+    activation_type: _FusedMoeDataType | int,
+    num_ranks: int,
+    num_experts: int,
+    topk: int,
+    hidden_size: int,
+    *,
+    inter_dim: int,
+    producer_geometry: _MegaMoeProducerGeometry | int,
+    stages: _FusedMoeStages | int = _FusedMoeStages.one_stage,
+    w2_tile_shape: _MegaMoeTileShape | int = _MegaMoeTileShape.n256,
+    activation_function: _FusedMoeActivationFunction | int = (
+        _FusedMoeActivationFunction.openai_swiglu
+    ),
+    has_bias: bool = True,
+) -> int:
+    activation_type = _FusedMoeDataType(activation_type)
+    stages = _FusedMoeStages(stages)
+    w2_tile_shape = _MegaMoeTileShape(w2_tile_shape)
+    producer_geometry = _MegaMoeProducerGeometry(producer_geometry)
+    if activation_type not in (_FusedMoeDataType.bf16, _FusedMoeDataType.mxfp4):
+        raise ValueError("MegaMoE activation type must be bf16 or mxfp4")
+    if num_ranks not in (1, 2, 4, 8):
+        raise ValueError("MegaMoE num_ranks must be one of 1, 2, 4, 8")
+    if (
+        num_experts < 32
+        or num_experts > 512
+        or num_experts % 32
+        or num_experts % num_ranks
+    ):
+        raise ValueError(
+            "MegaMoE num_experts must be a 32 multiple in [32, 512] "
+            "and be divisible by ranks"
+        )
+    if topk <= 0 or topk > 15 or topk > num_experts:
+        raise ValueError("MegaMoE topk must be in [1, min(15, num_experts)]")
+    if hidden_size <= 0 or hidden_size % 64 or hidden_size // 64 > 255:
+        raise ValueError("MegaMoE hidden_size must be a positive 64 multiple")
+    if inter_dim <= 0 or inter_dim % 512 or inter_dim // 512 > 32:
+        raise ValueError(
+            "MegaMoE inter_dim must be a positive 512 multiple at most 16384"
+        )
+    activation_function = _FusedMoeActivationFunction(activation_function)
+    mfma = (
+        _FusedMoeMfmaShape.mfma_bf16_mxfp4
+        if activation_type == _FusedMoeDataType.bf16
+        else _FusedMoeMfmaShape.mfma_scale_fp4_mxfp4
+    )
+    base = _make_fused_moe_base_solution_id(
+        activation_type,
+        _FusedMoeDataType.mxfp4,
+        _FusedMoeDataType.bf16 if has_bias else _FusedMoeDataType.none,
+        _FusedMoeWeightOrdering.native_mxfp4,
+        mfma,
+        _FusedMoeStages(stages),
+        activation_function,
+        _FusedMoeStage1Buffering.double_buffer,
+    )
+    return (
+        base
+        | ((num_ranks.bit_length() - 1) << 24)
+        | ((num_experts // 32 - 1) << 26)
+        | (topk << 30)
+        | ((hidden_size // 64) << 34)
+        | (int(w2_tile_shape) << 42)
+        | ((inter_dim // 512 - 1) << 43)
+        | (int(producer_geometry) << 48)
+    )
+
+
+def _with_mega_moe_producer_geometry(
+    solution_id: int, producer_geometry: _MegaMoeProducerGeometry | int
+) -> int:
+    producer_geometry = _MegaMoeProducerGeometry(producer_geometry)
+    mask = 0x3 << 48
+    return (int(solution_id) & ~mask) | (int(producer_geometry) << 48)
+
+
+def _select_mega_moe_producer_geometry(
+    num_experts: int,
+    activation_function: MegaMoeActivationFunction | str,
+    num_tokens: int,
+) -> _MegaMoeProducerGeometry:
+    MegaMoeActivationFunction(activation_function)
+    if num_experts == 32:
+        return _MegaMoeProducerGeometry.cta128
+    if 12 <= num_tokens < 24:
+        return _MegaMoeProducerGeometry.cta64
+    return _MegaMoeProducerGeometry.cta128
+
+
+def create_vmm_symmetric_heap(world_size: int):
+    """Collectively create an intra-node VMM symmetric heap."""
+    return ops.VmmSymmetricHeap(int(world_size))
+
+
+@dataclass(frozen=True)
+class MegaMoeInputViews:
+    tokens: torch.Tensor
+    scales: torch.Tensor | None
+    expert_ids: torch.Tensor
+    expert_weights: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MegaMoeConfig:
+    world_size: int
+    num_experts: int
+    topk: int
+    model_dim: int
+    activation: MegaMoeActivation
+    activation_function: MegaMoeActivationFunction = (
+        MegaMoeActivationFunction.swiglu
+    )
+    stages: MegaMoeStages = MegaMoeStages.two_stage
+    inter_dim: int = 3072
+    has_bias: bool = True
+    max_tokens_per_rank: int = field(init=False, default=1024)
+    _solution_id: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        activation = MegaMoeActivation(self.activation)
+        activation_function = MegaMoeActivationFunction(self.activation_function)
+        stages = MegaMoeStages(self.stages)
+        object.__setattr__(self, "activation", activation)
+        object.__setattr__(self, "activation_function", activation_function)
+        object.__setattr__(self, "stages", stages)
+        if self.world_size not in (1, 2, 4, 8):
+            raise ValueError("MegaMoE world_size must be one of 1, 2, 4, 8")
+        gpt_oss = (
+            self.num_experts == 32
+            and self.topk == 4
+            and self.model_dim == 2880
+            and self.inter_dim == 3072
+        )
+        gpt_oss_120b = (
+            self.world_size == 8
+            and self.num_experts == 128
+            and self.topk == 4
+            and self.model_dim == 2880
+            and self.inter_dim == 3072
+        )
+        deepseek_v32 = (
+            self.world_size == 8
+            and self.num_experts == 256
+            and self.topk == 8
+            and self.model_dim == 7168
+            and self.inter_dim == 2048
+        )
+        deepseek_v4 = (
+            self.world_size == 8
+            and self.num_experts == 384
+            and self.topk == 6
+            and self.model_dim == 7168
+            and self.inter_dim == 3072
+        )
+        gpt_oss_config = (
+            (gpt_oss or gpt_oss_120b)
+            and activation_function is MegaMoeActivationFunction.swiglu
+            and self.has_bias
+        )
+        deepseek_config = (
+            (deepseek_v32 or deepseek_v4)
+            and activation_function is MegaMoeActivationFunction.silu
+            and not self.has_bias
+        )
+        supported = (
+            stages is MegaMoeStages.two_stage
+            and activation is MegaMoeActivation.mxfp4
+            and (gpt_oss_config or deepseek_config)
+        )
+        if not supported:
+            raise ValueError("unsupported registered MegaMoE configuration")
+        object.__setattr__(
+            self,
+            "_solution_id",
+            _make_mega_moe_solution_id(
+                _FusedMoeDataType.bf16
+                if activation is MegaMoeActivation.bf16
+                else _FusedMoeDataType.mxfp4,
+                self.world_size,
+                self.num_experts,
+                self.topk,
+                self.model_dim,
+                inter_dim=self.inter_dim,
+                producer_geometry=_MegaMoeProducerGeometry.cta128,
+                stages=_FusedMoeStages(stages),
+                w2_tile_shape=_MegaMoeTileShape.n256,
+                activation_function=(
+                    _FusedMoeActivationFunction.silu_dot
+                    if activation_function is MegaMoeActivationFunction.silu
+                    else _FusedMoeActivationFunction.openai_swiglu
+                ),
+                has_bias=self.has_bias,
+            ),
+        )
+
+    @property
+    def compute_model_dim(self) -> int:
+        return ((self.model_dim + 511) // 512) * 512
+
+    def _solution_id_for_tokens(self, num_tokens: int) -> int:
+        return _with_mega_moe_producer_geometry(
+            self._solution_id,
+            _select_mega_moe_producer_geometry(
+                self.num_experts, self.activation_function, num_tokens
+            ),
+        )
+
+    def input_views(self, heap: object, max_tokens: int) -> MegaMoeInputViews:
+        max_tokens = int(max_tokens)
+        if max_tokens <= 0 or max_tokens > self.max_tokens_per_rank:
+            raise ValueError("invalid MegaMoE token capacity")
+        tokens, scales, expert_ids, expert_weights = (
+            ops.mega_moe_workspace_input_views(
+                heap, max_tokens, self._solution_id
+            )
+        )
+        return MegaMoeInputViews(
+            tokens,
+            None if scales is None else scales,
+            expert_ids,
+            expert_weights,
+        )
+
+    def run(
+        self,
+        heap: object,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        fc1_scale: torch.Tensor,
+        fc2_scale: torch.Tensor,
+        num_tokens: int,
+        *,
+        w13_bias: torch.Tensor | None = None,
+        w2_bias: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        num_tokens = int(num_tokens)
+        if num_tokens < 0 or num_tokens > self.max_tokens_per_rank:
+            raise ValueError("invalid MegaMoE token count")
+        valid_output_shapes = (
+            (num_tokens, self.model_dim),
+            (num_tokens, self.compute_model_dim),
+        )
+        if out is not None and out.shape not in valid_output_shapes:
+            raise ValueError(
+                "out must have shape [num_tokens, model_dim] or "
+                "[num_tokens, compute_model_dim]"
+            )
+        return ops.mega_moe(
+            heap,
+            w13,
+            w2,
+            fc1_scale,
+            fc2_scale,
+            num_tokens,
+            self._solution_id_for_tokens(num_tokens),
+            w13_bias,
+            w2_bias,
+            out,
+        )
 
 
 _FUSED_MOE_FP8_BLOCKSCALE_SOLUTION_ID = _make_fused_moe_base_solution_id(
@@ -256,6 +547,11 @@ _FUSED_MOE_TWO_STAGE_PROFILES = {
     ),
     (7168, 2048, 9, "silu"): (
         _FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X2048_SOLUTION_ID
+    ),
+    # DeepSeek-V4 exposes six routed experts to vLLM. The seven-route shape
+    # below is used when the shared expert is fused into the MoE invocation.
+    (7168, 3072, 6, "silu"): (
+        _FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X3072_SOLUTION_ID
     ),
     (7168, 3072, 7, "silu"): (
         _FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X3072_SOLUTION_ID
@@ -1140,10 +1436,15 @@ def get_fp4_solutions(
 
 __all__ = [
     "DataType",
+    "MegaMoeActivation",
+    "MegaMoeConfig",
+    "MegaMoeInputViews",
+    "MegaMoeStages",
     "Moe1StageConfig",
     "Moe2StageConfig",
     "MoeKernelLayout",
     "PetitSolutionHints",
+    "create_vmm_symmetric_heap",
     "fused_moe_bf16_mxfp4",
     "fused_moe_fp8_blockscale_g1u1",
     "fused_moe_fp8_blockscale_g1u1_mxfp4",

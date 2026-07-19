@@ -284,6 +284,7 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
                                      const Shm *shm, unsigned wtid) {
         input.FetchToRegs(regs.x, shm->act, wtid);
         regs.scale[0] = input.FetchScaleToReg(shm->scale, wtid);
+        input.AdvanceScaleStep();
     }
 
     __device__ static void Load(Weight &weight, Tile &tile, unsigned,

@@ -115,7 +115,6 @@ template <class Config> struct MxFp4Input {
             return;
         }
         const unsigned offset = scales_offset_vec_;
-        scales_offset_vec_ += kScaleFragments;
         auto lds_ptr =
             (__attribute__((address_space(3))) unsigned *)shm_scale;
         const unsigned m32_group = route_group_ * kWarpsM + wid;
@@ -151,6 +150,10 @@ template <class Config> struct MxFp4Input {
         const unsigned wid = threadIdx.x / kWarpSize;
         const unsigned wave_m = wid / kWarpsN;
         return shm_scale[wave_m * kScaleWordsPerM32 + wtid];
+    }
+
+    __device__ void AdvanceScaleStep() {
+        scales_offset_vec_ += kScaleFragments;
     }
 
     BufferResource values_;

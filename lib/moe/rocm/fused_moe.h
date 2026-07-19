@@ -48,15 +48,24 @@ enum class FusedMoEStage1Buffering : unsigned {
     kDoubleBuffer,
 };
 
-// W13 names include both gate and up projections. The default local two-stage
-// tile computes M32 x (N128 gate + N128 up); the large tile computes
-// M64 x (N256 gate + N256 up) with the same four waves.
-enum class FusedMoEStage1TileShape : unsigned { kM32N256, kM64N512 };
-
 enum class FusedMoEWeightLoadPolicy : unsigned {
     kCached,
     kNonTemporal,
 };
+
+enum class MegaMoETileShape : unsigned { kN256, kN128 };
+
+enum class MegaMoEProducerGeometry : unsigned {
+    kCta56,
+    kCta64,
+    kCta128,
+    kCta192,
+};
+
+// W13 names include both gate and up projections.  The default local two-stage
+// tile computes M32 x (N128 gate + N128 up); the large tile computes
+// M64 x (N256 gate + N256 up) with the same four waves.
+enum class FusedMoEStage1TileShape : unsigned { kM32N256, kM64N512 };
 
 struct FusedMoESolutionId {
     FusedMoEDataType act_dtype : 4;
@@ -101,7 +110,7 @@ struct FusedMoESolutionId {
             dim / kShapeAlignment,
             inter_dim / kShapeAlignment,
             weight_load_policy,
-            0,
+            padding,
         };
     }
 
@@ -123,6 +132,39 @@ struct FusedMoESolutionId {
         };
     }
 
+    // MegaMoE reuses the common fields in bits [0, 23] and has a compact,
+    // independent layout in bits [24, 49]. Bits [50, 63] are reserved.
+    constexpr unsigned NumRanksLog2() const { return (Repr() >> 24) & 0x3; }
+    constexpr unsigned NumExperts() const {
+        return (((Repr() >> 26) & 0xf) + 1) * 32;
+    }
+    constexpr unsigned TopK() const { return (Repr() >> 30) & 0xf; }
+    constexpr unsigned HiddenSizeDiv64() const {
+        return (Repr() >> 34) & 0xff;
+    }
+    constexpr MegaMoETileShape W2TileShape() const {
+        return static_cast<MegaMoETileShape>((Repr() >> 42) & 0x1);
+    }
+    constexpr unsigned MegaInterDimDiv64() const {
+        return (((Repr() >> 43) & 0x1f) + 1) * 8;
+    }
+    constexpr MegaMoEProducerGeometry ProducerGeometry() const {
+        return static_cast<MegaMoEProducerGeometry>((Repr() >> 48) & 0x3);
+    }
+    constexpr unsigned ProducerBlocks() const {
+        switch (ProducerGeometry()) {
+        case MegaMoEProducerGeometry::kCta56:
+            return 56;
+        case MegaMoEProducerGeometry::kCta64:
+            return 64;
+        case MegaMoEProducerGeometry::kCta128:
+            return 128;
+        case MegaMoEProducerGeometry::kCta192:
+            return 192;
+        }
+        return 0;
+    }
+
     constexpr FusedMoEStage1TileShape Stage1TileShape() const {
         return static_cast<FusedMoEStage1TileShape>((Repr() >> 41) & 0x1);
     }
@@ -140,6 +182,25 @@ struct FusedMoESolutionId {
         constexpr unsigned long kMask = 1ul << 41;
         return FromRepr((Repr() & ~kMask) |
                         (static_cast<unsigned long>(shape) << 41));
+    }
+
+    constexpr FusedMoESolutionId WithMegaMoEConfig(
+        unsigned num_ranks, unsigned experts, unsigned num_topk,
+        unsigned hidden_size, unsigned inter_dim,
+        MegaMoEProducerGeometry producer_geometry,
+        MegaMoETileShape w2_tile_shape = MegaMoETileShape::kN256) const {
+        unsigned rank_log2 = 0;
+        for (; num_ranks > 1; num_ranks >>= 1)
+            ++rank_log2;
+        return FromRepr(
+            (Repr() & 0x00fffffful) |
+            (static_cast<unsigned long>(rank_log2) << 24) |
+            (static_cast<unsigned long>(experts / 32 - 1) << 26) |
+            (static_cast<unsigned long>(num_topk) << 30) |
+            (static_cast<unsigned long>(hidden_size / 64) << 34) |
+            (static_cast<unsigned long>(w2_tile_shape) << 42) |
+            (static_cast<unsigned long>(inter_dim / 512 - 1) << 43) |
+            (static_cast<unsigned long>(producer_geometry) << 48));
     }
 
     constexpr unsigned long Repr() const {
@@ -189,6 +250,16 @@ struct FusedMoESolutionId {
             FusedMoEWeightLoadPolicy::kCached,
             0,
         };
+    }
+
+    static constexpr FusedMoESolutionId MakeMegaBase(
+        FusedMoEDataType act_dtype, FusedMoEDataType weight_dtype,
+        FusedMoEDataType bias_dtype, FusedMoEWeightOrdering weight_ordering,
+        FusedMoEMfmaShape mfma, FusedMoEStages stages,
+        FusedMoEActivationFunction activation,
+        FusedMoEStage1Buffering stage1_buffering) {
+        return MakeBase(act_dtype, weight_dtype, bias_dtype, weight_ordering,
+                        mfma, stages, activation, stage1_buffering);
     }
 
     static constexpr FusedMoESolutionId
