@@ -52,6 +52,7 @@ struct QuantizeAndShuffleFp8 {
 #else
         static constexpr float kFp8e4m3Max = 240;
 #endif
+        static constexpr float kFp8e4m3MaxInv = 1.0f / kFp8e4m3Max;
         auto qs2 = reinterpret_cast<float2 *>(&quant_scale);
         auto ds2 = reinterpret_cast<float2 *>(&dequant_scale);
         quant_scale = {0, 0, 0, 0};
@@ -79,8 +80,8 @@ struct QuantizeAndShuffleFp8 {
             }
             qs2[c].x = kFp8e4m3Max * __builtin_amdgcn_rcpf(lm.x);
             qs2[c].y = kFp8e4m3Max * __builtin_amdgcn_rcpf(lm.y);
-            ds2[c].x = __builtin_amdgcn_rcpf(qs2[c].x);
-            ds2[c].y = __builtin_amdgcn_rcpf(qs2[c].y);
+            ds2[c].x = lm.x * kFp8e4m3MaxInv;
+            ds2[c].y = lm.y * kFp8e4m3MaxInv;
             __syncthreads();
         }
     }
