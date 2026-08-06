@@ -1,17 +1,137 @@
 #!/usr/bin/env python3
 
 import argparse
+from dataclasses import dataclass
 import math
+from pathlib import Path
 import sys
 from typing import Callable, Dict, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import torch
 
 import petit_kernel
+from petit_kernel.moe_mxfp4 import MoeKernelLayout
 
 BLOCK_N = 128
 BLOCK_K = 128
 SORTED_TOKEN_PADDING = 32
+
+
+KERNEL_VARIANTS = (
+    "fp8_blockscale_silu",
+    "fp8_petit_mxfp4_silu",
+    "fp8_petit_mxfp4_openai_bias",
+    "bf16_native_mxfp4_openai_bias",
+    "mxfp4_native_mxfp4_openai_bias",
+    "aiter_fp8_blockscale_silu",
+    "aiter_dynamic_fp8_blockscale_silu",
+    "aiter_dynamic_mxfp4_silu",
+)
+
+
+def make_solution_id(
+    act_dtype: int,
+    weight_dtype: int,
+    bias_dtype: int,
+    weight_ordering: int,
+    mfma: int,
+    stages: int,
+    activation: int,
+    stage1_buffering: int,
+) -> int:
+    return (
+        (act_dtype & 0xF)
+        | ((weight_dtype & 0xF) << 4)
+        | ((bias_dtype & 0xF) << 8)
+        | ((weight_ordering & 0x3) << 12)
+        | ((mfma & 0x3) << 14)
+        | ((stages & 0xF) << 16)
+        | ((activation & 0x7) << 20)
+        | ((stage1_buffering & 0x1) << 23)
+    )
+
+
+@dataclass(frozen=True)
+class KernelVariant:
+    name: str
+    act_format: str
+    weight_kind: str
+    weight_layout: MoeKernelLayout | None
+    solution_id: int
+    has_bias: bool = False
+    aiter_supported: bool = False
+    activation_quantization: str | None = None
+
+
+VARIANTS = {
+    "fp8_blockscale_silu": KernelVariant(
+        name="fp8_blockscale_silu",
+        act_format="fp8",
+        weight_kind="fp8",
+        weight_layout=None,
+        solution_id=make_solution_id(3, 4, 0, 2, 0, 0, 0, 1),
+    ),
+    "fp8_petit_mxfp4_silu": KernelVariant(
+        name="fp8_petit_mxfp4_silu",
+        act_format="fp8",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.petit_mxfp4,
+        solution_id=make_solution_id(3, 1, 0, 1, 0, 0, 0, 0),
+    ),
+    "fp8_petit_mxfp4_openai_bias": KernelVariant(
+        name="fp8_petit_mxfp4_openai_bias",
+        act_format="fp8",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.petit_mxfp4,
+        solution_id=make_solution_id(3, 1, 5, 1, 0, 0, 1, 1),
+        has_bias=True,
+    ),
+    "bf16_native_mxfp4_openai_bias": KernelVariant(
+        name="bf16_native_mxfp4_openai_bias",
+        act_format="bf16",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.native_mxfp4,
+        solution_id=make_solution_id(5, 1, 5, 0, 1, 0, 1, 1),
+        has_bias=True,
+    ),
+    "mxfp4_native_mxfp4_openai_bias": KernelVariant(
+        name="mxfp4_native_mxfp4_openai_bias",
+        act_format="mxfp4",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.native_mxfp4,
+        solution_id=make_solution_id(1, 1, 5, 0, 2, 0, 1, 1),
+        has_bias=True,
+    ),
+    "aiter_fp8_blockscale_silu": KernelVariant(
+        name="aiter_fp8_blockscale_silu",
+        act_format="fp8",
+        weight_kind="aiter_fp8",
+        weight_layout=None,
+        solution_id=0,
+        aiter_supported=True,
+        activation_quantization="static_fp8_blockscale",
+    ),
+    "aiter_dynamic_fp8_blockscale_silu": KernelVariant(
+        name="aiter_dynamic_fp8_blockscale_silu",
+        act_format="bf16",
+        weight_kind="aiter_fp8",
+        weight_layout=None,
+        solution_id=0,
+        aiter_supported=True,
+        activation_quantization="dynamic_fp8_blockscale",
+    ),
+    "aiter_dynamic_mxfp4_silu": KernelVariant(
+        name="aiter_dynamic_mxfp4_silu",
+        act_format="bf16",
+        weight_kind="aiter_mxfp4",
+        weight_layout=None,
+        solution_id=0,
+        aiter_supported=True,
+        activation_quantization="dynamic_mxfp4",
+    ),
+}
 
 
 def native_fp8_e4m3_dtype(device: torch.device) -> torch.dtype:
@@ -24,9 +144,7 @@ def native_fp8_e4m3_dtype(device: torch.device) -> torch.dtype:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Benchmark Fused MoE FP8 blockscale kernel (petit or aiter)."
-    )
+    parser = argparse.ArgumentParser(description="Benchmark Fused MoE kernels.")
     parser.add_argument(
         "--backend",
         type=str,
@@ -35,11 +153,11 @@ def parse_args() -> argparse.Namespace:
         help="Backend implementation to benchmark.",
     )
     parser.add_argument(
-        "--weight-format",
+        "--kernel-variant",
         type=str,
-        default="fp8",
-        choices=["fp8", "mxfp4"],
-        help="Weight format to benchmark. MXFP4 is supported for backend=petit.",
+        default="fp8_blockscale_silu",
+        choices=KERNEL_VARIANTS,
+        help="Unique fused MoE kernel variant to benchmark.",
     )
     parser.add_argument("--tokens", type=int, default=256, help="Number of tokens.")
     parser.add_argument("--dim", type=int, default=4096, help="Model dimension.")
@@ -94,8 +212,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("graph-iters must be positive.")
     if args.num_persistent_tgs < 0 or args.persistent_tgs_per_cu <= 0:
         raise ValueError("num-persistent-tgs must be >= 0 and persistent-tgs-per-cu must be > 0.")
-    if args.weight_format == "mxfp4" and args.backend != "petit":
-        raise ValueError("weight-format=mxfp4 is only supported for backend=petit.")
+    variant = VARIANTS[args.kernel_variant]
+    if args.backend == "aiter" and not variant.aiter_supported:
+        supported = ", ".join(v.name for v in VARIANTS.values() if v.aiter_supported)
+        raise ValueError(
+            f"backend=aiter is only supported for kernel-variant in {{{supported}}}."
+        )
+    if args.backend == "petit" and variant.aiter_supported:
+        supported = ", ".join(v.name for v in VARIANTS.values() if not v.aiter_supported)
+        raise ValueError(
+            f"backend=petit is only supported for kernel-variant in {{{supported}}}."
+        )
 
 
 def resolve_num_persistent_tgs(args: argparse.Namespace) -> int:
@@ -127,7 +254,7 @@ class FusedMoEInputBuilder:
         inter_dim: int,
         experts: int,
         topk: int,
-        weight_format: str,
+        variant: KernelVariant,
     ):
         self.device = device
         self.tokens = tokens
@@ -135,7 +262,7 @@ class FusedMoEInputBuilder:
         self.inter_dim = inter_dim
         self.experts = experts
         self.topk = topk
-        self.weight_format = weight_format
+        self.variant = variant
 
     def _rand_positive_normal(
         self, shape: Tuple[int, ...], mean: float, std: float
@@ -271,18 +398,132 @@ class FusedMoEInputBuilder:
         )
         return w13_q.contiguous(), w2_q.contiguous(), fc1_scale.contiguous(), fc2_scale.contiguous()
 
-    def build(self) -> Dict[str, torch.Tensor]:
+    def _build_aiter_mxfp4_weights(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        try:
+            from aiter import dtypes  # type: ignore
+            from aiter.ops.shuffle import shuffle_weight  # type: ignore
+            from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("AITER MXFP4 weight generation requires aiter.") from exc
+
+        w13 = (
+            torch.randn(
+                (self.experts, self.inter_dim * 2, self.dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            * self.WEIGHT_STD
+            + self.WEIGHT_MEAN
+        ).to(torch.bfloat16)
+        w2 = (
+            torch.randn(
+                (self.experts, self.dim, self.inter_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            * self.WEIGHT_STD
+            + self.WEIGHT_MEAN
+        ).to(torch.bfloat16)
+        w13_q, fc1_scale = downcast_to_mxfp(w13, torch.uint8, axis=-1)
+        w2_q, fc2_scale = downcast_to_mxfp(w2, torch.uint8, axis=-1)
+        w13_q = shuffle_weight(w13_q.view(dtypes.fp4x2), (16, 16), use_int4=True)
+        w2_q = shuffle_weight(w2_q.view(dtypes.fp4x2), (16, 16), use_int4=True)
+        return (
+            w13_q.contiguous(),
+            w2_q.contiguous(),
+            fc1_scale.contiguous().view(dtypes.fp8_e8m0),
+            fc2_scale.contiguous().view(dtypes.fp8_e8m0),
+        )
+
+    def _build_mxfp4_activations(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        act_words = torch.randint(
+            0,
+            1 << 32,
+            (self.tokens, self.dim // 8),
+            dtype=torch.int64,
+            device=self.device,
+        ).to(torch.int32)
+        act_q = self._mask_negative_zero_native_fp4(act_words).view(torch.uint8).reshape(
+            self.tokens, self.dim // 2
+        )
+        act_scale = torch.randint(
+            self.MXFP4_SCALE_MIN,
+            self.MXFP4_SCALE_MAX + 1,
+            (self.tokens, self.dim // 32),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        return act_q.contiguous(), act_scale.contiguous()
+
+    def _pack_aiter_sorted_mxfp4_activation_scales(
+        self,
+        act_scale: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        try:
+            from aiter.utility.fp4_utils import moe_mxfp4_sort  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "MXFP4 activation scale packing requires AITER's moe_mxfp4_sort."
+            ) from exc
+
+        return moe_mxfp4_sort(
+            act_scale.contiguous(),
+            sorted_ids=sorted_token_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=self.tokens,
+            block_size=SORTED_TOKEN_PADDING,
+        ).contiguous()
+
+    def _build_biases(self) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self.variant.has_bias:
+            return None, None
+        if self.variant.weight_layout is None:
+            raise RuntimeError("biased Petit kernels require an MXFP4 layout")
+        w13_bias = torch.randn(
+            (2, self.inter_dim), dtype=torch.float32, device=self.device
+        ).to(torch.bfloat16)
+        w2_bias = torch.randn(
+            (1, self.dim), dtype=torch.float32, device=self.device
+        ).to(torch.bfloat16)
+        return (
+            petit_kernel.repack_moe_kernel_layout(
+                w13_bias.contiguous(),
+                layout=self.variant.weight_layout,
+            ),
+            petit_kernel.repack_moe_kernel_layout(
+                w2_bias.contiguous(),
+                layout=self.variant.weight_layout,
+            ),
+        )
+
+    def build(self) -> Dict[str, object]:
         experts = self.experts
         dim = self.dim
         inter_dim = self.inter_dim
         model_blocks = dim // BLOCK_K
         w2_row_blocks = dim // BLOCK_N
         inter_blocks = inter_dim // BLOCK_K
-        fp8_dtype = native_fp8_e4m3_dtype(self.device)
+        fp8_dtype = (
+            native_fp8_e4m3_dtype(self.device)
+            if self.variant.act_format == "fp8" or self.variant.weight_kind in ("fp8", "aiter_fp8")
+            else None
+        )
 
-        input_q = self._sample_spiky_input((self.tokens, dim)).to(fp8_dtype)
-        input_scale = self._rand_positive_normal((self.tokens, model_blocks), self.SCALE_INV_MEAN, self.SCALE_INV_STD)
-        if self.weight_format == "fp8":
+        if self.variant.act_format == "bf16":
+            input_q = self._sample_spiky_input((self.tokens, dim)).to(torch.bfloat16)
+            input_scale = torch.empty((0,), dtype=torch.float32, device=self.device)
+        elif self.variant.act_format == "mxfp4":
+            input_q, input_scale = self._build_mxfp4_activations()
+        else:
+            assert fp8_dtype is not None
+            input_q = self._sample_spiky_input((self.tokens, dim)).to(fp8_dtype)
+            input_scale = self._rand_positive_normal(
+                (self.tokens, model_blocks), self.SCALE_INV_MEAN, self.SCALE_INV_STD
+            )
+        if self.variant.weight_kind in ("fp8", "aiter_fp8"):
+            assert fp8_dtype is not None
             w1_q = (
                 torch.randn((experts, inter_dim * 2, dim), dtype=torch.float32, device=self.device)
                 * self.WEIGHT_STD
@@ -299,11 +540,15 @@ class FusedMoEInputBuilder:
             fc2_scale = self._rand_positive_normal(
                 (experts, w2_row_blocks * inter_blocks), self.SCALE_INV_MEAN, self.SCALE_INV_STD
             )
+        elif self.variant.weight_kind == "aiter_mxfp4":
+            w1_q, w2_q, fc1_scale, fc2_scale = self._build_aiter_mxfp4_weights()
         else:
             w1_q, w2_q, fc1_scale, fc2_scale = self._build_mxfp4_weights()
 
-        topk_ids = torch.randint(
-            low=0, high=experts, size=(self.tokens, self.topk), dtype=torch.int32, device=self.device
+        topk_ids = (
+            torch.rand((self.tokens, experts), dtype=torch.float32, device=self.device)
+            .topk(self.topk, dim=-1)
+            .indices.to(torch.int32)
         )
         topk_weights = torch.rand((self.tokens, self.topk), dtype=torch.float32, device=self.device)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -318,9 +563,12 @@ class FusedMoEInputBuilder:
             topk_ids=topk_ids, topk_weights=topk_weights
         )
 
-        if self.weight_format == "fp8":
+        if self.variant.weight_kind in ("fp8", "aiter_fp8"):
             w1_q_kernel = self._pack_blocks(w1_q, block_n=16, block_k=32).reshape(experts, inter_dim * 2, dim)
             w2_q_kernel = self._pack_blocks(w2_q, block_n=16, block_k=32).reshape(experts, dim, inter_dim)
+            if self.variant.weight_kind == "aiter_fp8":
+                w1_q_kernel.is_shuffled = True
+                w2_q_kernel.is_shuffled = True
             input_scale_kernel = input_scale.contiguous()
             fc1_scale_kernel = fc1_scale.contiguous()
             fc2_scale_kernel = (
@@ -330,14 +578,21 @@ class FusedMoEInputBuilder:
                 .reshape(experts, inter_blocks * w2_row_blocks)
                 .contiguous()
             )
+        elif self.variant.weight_kind == "aiter_mxfp4":
+            w1_q_kernel = w1_q
+            w2_q_kernel = w2_q
+            input_scale_kernel = input_scale.contiguous()
+            fc1_scale_kernel = fc1_scale.contiguous()
+            fc2_scale_kernel = fc2_scale.contiguous()
         else:
+            assert self.variant.weight_layout is not None
             (
                 w1_q_kernel,
                 fc1_scale_kernel,
             ) = petit_kernel.repack_moe_kernel_layout(
                 w1_q,
                 fc1_scale,
-                layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
+                layout=self.variant.weight_layout,
             )
             (
                 w2_q_kernel,
@@ -345,9 +600,21 @@ class FusedMoEInputBuilder:
             ) = petit_kernel.repack_moe_kernel_layout(
                 w2_q,
                 fc2_scale,
-                layout=petit_kernel.MoeKernelLayout.petit_mxfp4,
+                layout=self.variant.weight_layout,
             )
-            input_scale_kernel = input_scale.t().contiguous()
+            input_scale_kernel = (
+                input_scale.t().contiguous()
+                if self.variant.act_format == "fp8"
+                else input_scale.contiguous()
+            )
+        if self.variant.act_format == "mxfp4":
+            input_scale_kernel = self._pack_aiter_sorted_mxfp4_activation_scales(
+                input_scale,
+                sorted_token_ids,
+                num_valid_ids,
+            )
+            input_q = input_q.contiguous()
+        w13_bias, w2_bias = self._build_biases()
 
         return {
             "input_q": input_q,
@@ -365,53 +632,48 @@ class FusedMoEInputBuilder:
             "input_scale_kernel": input_scale_kernel,
             "fc1_scale_kernel": fc1_scale_kernel,
             "fc2_scale_kernel": fc2_scale_kernel,
-            "weight_format": self.weight_format,
+            "w13_bias": w13_bias,
+            "w2_bias": w2_bias,
+            "kernel_variant": self.variant.name,
+            "solution_id": self.variant.solution_id,
+            "activation_quantization": self.variant.activation_quantization,
+            "tokens": self.tokens,
+            "dim": self.dim,
         }
 
 
 def make_run_fn(
-    backend: str, data: Dict[str, torch.Tensor], num_persistent_tgs: int
+    backend: str, data: Dict[str, object], num_persistent_tgs: int
 ) -> Tuple[Callable[[], torch.Tensor], str]:
+    input_q = data["input_q"]
+    assert isinstance(input_q, torch.Tensor)
     if backend == "petit":
         out = torch.empty(
-            (data["input_q"].shape[0], data["input_q"].shape[1]),
+            (int(data["tokens"]), int(data["dim"])),
             dtype=torch.bfloat16,
-            device=data["input_q"].device,
+            device=input_q.device,
         )
-        if data["weight_format"] == "mxfp4":
-            def run() -> torch.Tensor:
-                return petit_kernel.fused_moe_fp8_blockscale_g1u1_mxfp4(
-                    data["input_q"],
-                    data["w1_q_kernel"],
-                    data["w2_q_kernel"],
-                    data["sorted_token_ids"],
-                    data["sorted_weights"],
-                    data["sorted_expert_ids"],
-                    data["num_valid_ids"],
-                    int(data["topk"]),
-                    data["input_scale_kernel"],
-                    fc1_scale=data["fc1_scale_kernel"],
-                    fc2_scale=data["fc2_scale_kernel"],
-                    num_persistent_tgs=num_persistent_tgs,
-                    out=out,
-                )
-        else:
-            def run() -> torch.Tensor:
-                return petit_kernel.fused_moe_fp8_blockscale_g1u1(
-                    data["input_q"],
-                    data["w1_q_kernel"],
-                    data["w2_q_kernel"],
-                    data["sorted_token_ids"],
-                    data["sorted_weights"],
-                    data["sorted_expert_ids"],
-                    data["num_valid_ids"],
-                    int(data["topk"]),
-                    data["input_scale_kernel"],
-                    fc1_scale=data["fc1_scale_kernel"],
-                    fc2_scale=data["fc2_scale_kernel"],
-                    num_persistent_tgs=num_persistent_tgs,
-                    out=out,
-                )
+
+        def run() -> torch.Tensor:
+            out.zero_()
+            return petit_kernel.ops.fmoe_matmul_1stage(
+                out,
+                data["input_q"],
+                data["w1_q_kernel"],
+                data["w2_q_kernel"],
+                data["sorted_token_ids"],
+                data["sorted_weights"],
+                data["sorted_expert_ids"],
+                data["num_valid_ids"],
+                int(data["topk"]),
+                data["input_scale_kernel"],
+                data["fc1_scale_kernel"],
+                data["fc2_scale_kernel"],
+                int(data["solution_id"]),
+                num_persistent_tgs,
+                data["w13_bias"],
+                data["w2_bias"],
+            )
 
         return run, "matmul_1stage"
 
@@ -422,43 +684,53 @@ def make_run_fn(
         )
 
     try:
-        import aiter  # type: ignore
+        from aiter import ActivationType, QuantType  # type: ignore
+        from aiter.fused_moe import fused_moe  # type: ignore
     except Exception as exc:
         raise RuntimeError("Failed to import aiter for backend=aiter.") from exc
 
-    input_scale_aiter = torch.empty_like(data["input_scale"])
-    num_rows = torch.tensor([data["input_q"].shape[0]], dtype=torch.int32, device=data["input_q"].device)
-    aiter.partial_transpose(input_scale_aiter, data["input_scale"], num_rows=num_rows)
-
-    out = torch.empty(
-        (data["input_q"].shape[0], data["input_q"].shape[1]),
-        dtype=torch.bfloat16,
-        device=data["input_q"].device,
-    )
+    activation_quantization = data.get("activation_quantization")
+    if activation_quantization == "static_fp8_blockscale":
+        quant_type = QuantType.per_1x128
+        impl = "fused_moe_fp8_blockscale"
+        a1_scale = data["input_scale_kernel"]
+        topk_ids = data["topk_ids"]
+        assert isinstance(topk_ids, torch.Tensor)
+        num_local_tokens = torch.tensor(
+            [int(data["tokens"])], dtype=topk_ids.dtype, device=topk_ids.device
+        )
+    elif activation_quantization == "dynamic_fp8_blockscale":
+        quant_type = QuantType.per_1x128
+        impl = "fused_moe_dynamic_fp8"
+        a1_scale = None
+        num_local_tokens = None
+    elif activation_quantization == "dynamic_mxfp4":
+        quant_type = QuantType.per_1x32
+        impl = "fused_moe_dynamic_mxfp4"
+        a1_scale = None
+        num_local_tokens = None
+    else:
+        raise RuntimeError(
+            "backend=aiter requires an AITER kernel variant."
+        )
 
     def run_aiter() -> torch.Tensor:
-        out.zero_()
-        aiter.fmoe_fp8_blockscale_g1u1(
-            out,
+        return fused_moe(
             data["input_q"],
             data["w1_q_kernel"],
             data["w2_q_kernel"],
-            data["sorted_token_ids"],
-            data["sorted_weights"],
-            data["sorted_expert_ids"],
-            data["num_valid_ids"],
-            int(data["topk"]),
-            input_scale_aiter,
-            data["fc1_scale_kernel"],
-            data["fc2_scale_kernel"],
-            "",
-            BLOCK_N,
-            BLOCK_K,
-            None,
+            data["topk_weights"],
+            data["topk_ids"],
+            activation=ActivationType.Silu,
+            quant_type=quant_type,
+            w1_scale=data["fc1_scale_kernel"],
+            w2_scale=data["fc2_scale_kernel"],
+            a1_scale=a1_scale,
+            num_local_tokens=num_local_tokens,
+            dtype=torch.bfloat16,
         )
-        return out
 
-    return run_aiter, "asm"
+    return run_aiter, impl
 
 
 def benchmark_with_events(fn: Callable[[], torch.Tensor], repeat: int) -> Tuple[float, int]:
@@ -508,12 +780,12 @@ def benchmark_with_cuda_graph(
         return ms, total_iters, False
 
 
-def compute_metrics(args: argparse.Namespace, data: Dict[str, torch.Tensor], avg_ms: float) -> Tuple[float, float]:
+def compute_metrics(args: argparse.Namespace, data: Dict[str, object], avg_ms: float) -> Tuple[float, float]:
     routes = args.tokens * args.topk
     flops = 6.0 * routes * args.dim * args.inter_dim
     tflops = flops / (avg_ms * 1e-3) / 1e12
 
-    byte_tensors = [
+    byte_tensors: list[torch.Tensor] = [
         data["input_q"],
         data["w1_q_kernel"],
         data["w2_q_kernel"],
@@ -524,7 +796,11 @@ def compute_metrics(args: argparse.Namespace, data: Dict[str, torch.Tensor], avg
         data["input_scale_kernel"],
         data["fc1_scale_kernel"],
         data["fc2_scale_kernel"],
-    ]
+    ]  # type: ignore[list-item]
+    for key in ("w13_bias", "w2_bias"):
+        tensor = data[key]
+        if isinstance(tensor, torch.Tensor):
+            byte_tensors.append(tensor)
     total_bytes = sum(t.numel() * t.element_size() for t in byte_tensors)
     total_bytes += args.tokens * args.dim * torch.tensor([], dtype=torch.bfloat16).element_size()
     gbps = total_bytes / (avg_ms * 1e-3) / 1e9
@@ -543,7 +819,10 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA/HIP device is not available.", file=sys.stderr)
         return 1
-    if not (hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e4m3fnuz")):
+    variant = VARIANTS[args.kernel_variant]
+    if variant.act_format == "fp8" and not (
+        hasattr(torch, "float8_e4m3fn") or hasattr(torch, "float8_e4m3fnuz")
+    ):
         print("torch float8_e4m3 dtype is required for this benchmark.", file=sys.stderr)
         return 1
 
@@ -559,7 +838,7 @@ def main() -> int:
         inter_dim=args.inter_dim,
         experts=args.experts,
         topk=args.topk,
-        weight_format=args.weight_format,
+        variant=variant,
     )
     data = builder.build()
 
@@ -583,9 +862,16 @@ def main() -> int:
         if args.backend == "petit"
         else "heuristic"
     )
+    activation_quantization = data["activation_quantization"]
+    activation_quantization_field = (
+        f"activation_quantization={activation_quantization} "
+        if activation_quantization is not None
+        else ""
+    )
     print(
         f"backend={args.backend} impl={impl} graph={1 if used_graph else 0} "
-        f"weight_format={args.weight_format} "
+        f"kernel_variant={args.kernel_variant} solution_id={int(data['solution_id'])} "
+        f"{activation_quantization_field}"
         f"tokens={args.tokens} dim={args.dim} inter_dim={args.inter_dim} "
         f"experts={args.experts} topk={args.topk} "
         f"valid_ids={num_valid_ids} valid_m_blocks={num_valid_m_blocks} "
