@@ -5,6 +5,13 @@
 
 namespace causalflow::petit::rocm::moe {
 
+struct TokenMetadata {
+    unsigned token_topk_idx;
+    unsigned src_rank : 8;
+    unsigned local_combine_slot : 24;
+};
+static_assert(sizeof(TokenMetadata) == sizeof(unsigned long), "");
+
 __device__ static inline float4 Fma4(float4 a, float s, float4 c) {
     const auto *a2 = reinterpret_cast<const float2 *>(&a);
     const auto *c2 = reinterpret_cast<const float2 *>(&c);

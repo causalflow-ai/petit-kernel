@@ -6,6 +6,9 @@ using namespace causalflow::petit::pybind;
 using namespace causalflow::petit::rocm::quantization;
 
 PYBIND11_MODULE(ops, m) {
+    pybind11::class_<VmmSymmetricHeap>(m, "VmmSymmetricHeap")
+        .def(pybind11::init<int>(), pybind11::arg("world_size"))
+        .def("local_tensor", &VmmSymmetricHeap::LocalTensor);
     m.def("repack_nvfp4", &RepackNvFp4, "Repack NVFP4 to Petit FP4");
     m.def("process_nvfp4_scales", &ProcessNvFp4Scales, "Process NVFP4 scales");
     m.def("process_mxfp4_scales", &ProcessMxFp4Scales, "Process MXFP4 scales");

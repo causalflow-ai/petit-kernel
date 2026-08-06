@@ -2,6 +2,7 @@ add_library(petit_kernels SHARED
     fp4.cc
     moe.cc
     pybind.cc
+    vmm_symmetric_heap.cc
 )
 
 find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")

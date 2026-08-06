@@ -121,7 +121,7 @@ __device__ int llvm_amdgcn_raw_buffer_atomic_add_i32(
 
 __device__ long llvm_amdgcn_raw_buffer_atomic_add_i64(
     long data, v4i rsrc, int voffset, int soffset,
-    int aux) __asm("llvm.amdgcn.raw.buffer.atomic.add");
+    int aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i64");
 
 __device__ static inline float2 amdgcn_pk_mul_f32(float2 a, float2 b) {
     v2f ret =
