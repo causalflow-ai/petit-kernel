@@ -64,9 +64,11 @@ FusedMoeShape MakeFusedMoEShape(const torch::Tensor &input_q,
                                 const torch::Tensor &sorted_expert_ids,
                                 uint64_t solution_id) {
     const int64_t tokens = input_q.size(0);
-    const int64_t dim = input_q.size(1);
-    const int64_t experts = w2_q.size(0);
     const auto solution = FusedMoESolutionId::FromRepr(solution_id);
+    const int64_t dim = solution.act_dtype == FusedMoEDataType::kMxFp4
+                            ? input_q.size(1) * 2
+                            : input_q.size(1);
+    const int64_t experts = w2_q.size(0);
     const int64_t inter_dim =
         (solution.weight_dtype == FusedMoEDataType::kMxFp4 ||
          solution.weight_dtype == FusedMoEDataType::kNvFp4)

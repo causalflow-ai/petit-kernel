@@ -331,6 +331,13 @@ hipError_t ScatterWeightedRoutes(const __hip_bfloat16 *route_out,
                                  unsigned routes, unsigned cols,
                                  hipStream_t stream = nullptr);
 
+hipError_t QuantizeDequantMxFp4(__hip_bfloat16 *data, unsigned rows,
+                                unsigned cols, hipStream_t stream = nullptr);
+
+hipError_t DequantizeNativeMxFp4Activations(
+    const unsigned char *q, const unsigned char *scale, __hip_bfloat16 *dq,
+    unsigned rows, unsigned cols, hipStream_t stream = nullptr);
+
 hipError_t RepackBf16BiasDppLayout(__hip_bfloat16 *output,
                                    const __hip_bfloat16 *input, unsigned rows,
                                    unsigned cols,
@@ -395,6 +402,10 @@ struct TestRunnerConfig {
         kSiluDot,
         kOpenAISwiGLU,
     };
+    enum class ReferenceIntermediate {
+        kBf16,
+        kMxFp4,
+    };
 
     unsigned tokens;
     unsigned dim;
@@ -412,6 +423,7 @@ struct TestRunnerConfig {
     float ocp_fp8_per_element_atol;
     float per_element_rtol;
     ReferenceActivation reference_activation;
+    ReferenceIntermediate reference_intermediate;
 };
 
 template <class Config, class Context>
@@ -437,6 +449,13 @@ constexpr TestRunnerConfig MakeTestRunnerConfig() {
                 return Config::kReferenceActivation;
             } else {
                 return TestRunnerConfig::ReferenceActivation::kSiluDot;
+            }
+        }(),
+        .reference_intermediate = [] {
+            if constexpr (requires { Config::kReferenceIntermediate; }) {
+                return Config::kReferenceIntermediate;
+            } else {
+                return TestRunnerConfig::ReferenceIntermediate::kBf16;
             }
         }(),
     };

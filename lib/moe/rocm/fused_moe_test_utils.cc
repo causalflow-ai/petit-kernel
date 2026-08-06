@@ -170,7 +170,9 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
                                unsigned sorted_token_padding,
                                unsigned max_num_m_blocks,
                                TestRunnerConfig::ReferenceActivation
-                                   reference_activation) {
+                                   reference_activation,
+                               TestRunnerConfig::ReferenceIntermediate
+                                   reference_intermediate) {
     std::fill(reference_out.begin(), reference_out.end(), 0u);
     const size_t token_out_bytes =
         static_cast<size_t>(tokens) * dim * sizeof(float);
@@ -281,6 +283,11 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
                 d_gate, d_up, device_ctx_accessor.act(), elem_count));
             CheckHIPStatus(hipFree(d_up));
             CheckHIPStatus(hipFree(d_gate));
+        }
+        if (reference_intermediate ==
+            TestRunnerConfig::ReferenceIntermediate::kMxFp4) {
+            CheckHIPStatus(QuantizeDequantMxFp4(device_ctx_accessor.act(), m_e,
+                                                inter_dim));
         }
 
         const size_t route_bytes =
@@ -562,7 +569,7 @@ void TestRunnerBase::ComputeReferences() {
         HostAccessor(), DeviceAccessor(), gemm_, std::span(reference_out_),
         config_.tokens, config_.dim, config_.inter_dim, config_.experts,
         config_.sorted_token_padding, config_.max_num_m_blocks,
-        config_.reference_activation);
+        config_.reference_activation, config_.reference_intermediate);
 }
 
 void TestRunnerBase::RunReferenceOnly() {

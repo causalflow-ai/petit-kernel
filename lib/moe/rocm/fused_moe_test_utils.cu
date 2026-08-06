@@ -70,6 +70,122 @@ __global__ void WeightedRouteScatterKernel(const __hip_bfloat16 *route_out,
     atomicAdd(token_out + static_cast<size_t>(token) * cols + col, weighted);
 }
 
+__device__ float ScaleFloatForMxFp4(float max_abs, unsigned &scale_byte) {
+    if (max_abs < 1.0e-12f) {
+        scale_byte = 127u;
+        return 1.0f;
+    }
+    const float required = max_abs * (1.0f / 6.0f);
+    const unsigned required_bits = reinterpret_cast<const unsigned &>(required);
+    scale_byte = (required_bits >> 23) & 0xffu;
+    if (scale_byte < 0xffu && (required_bits & 0x7fffffu)) {
+        ++scale_byte;
+    }
+    const unsigned bits = scale_byte << 23;
+    return reinterpret_cast<const float &>(bits);
+}
+
+__device__ unsigned CvtScaleFp4x2(__hip_bfloat162 value, float scale) {
+    return __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(0u, value, scale, 0) &
+           0xffu;
+}
+
+__device__ __hip_bfloat162 CvtFp4ByteToBf16x2(unsigned packed, float scale) {
+    return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed, scale, 0);
+}
+
+static constexpr unsigned kMxFp4ScaleGroupsPerDequantBlock = 16;
+static constexpr unsigned kMxFp4PairsPerScaleGroup = 16;
+static constexpr unsigned kMxFp4DequantThreads =
+    kMxFp4ScaleGroupsPerDequantBlock * kMxFp4PairsPerScaleGroup;
+
+__global__ void QuantizeDequantMxFp4Kernel(__hip_bfloat16 *data,
+                                           unsigned rows, unsigned cols) {
+    static constexpr unsigned kGroup = 32;
+    __shared__ float max_abs_shm[kGroup];
+
+    const unsigned row = blockIdx.y;
+    const unsigned group = blockIdx.x;
+    const unsigned lane = threadIdx.x;
+    if (row >= rows || lane >= kGroup) {
+        return;
+    }
+
+    const unsigned col = group * kGroup + lane;
+    const bool valid = col < cols;
+    const size_t base = static_cast<size_t>(row) * cols;
+    const float value = valid ? __bfloat162float(data[base + col]) : 0.0f;
+    max_abs_shm[lane] = fabsf(value);
+    __syncthreads();
+
+    for (unsigned offset = kGroup / 2; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            max_abs_shm[lane] =
+                fmaxf(max_abs_shm[lane], max_abs_shm[lane + offset]);
+        }
+        __syncthreads();
+    }
+
+    unsigned scale_byte;
+    const float scale = ScaleFloatForMxFp4(max_abs_shm[0], scale_byte);
+    if (lane < kGroup / 2) {
+        const unsigned even_col = group * kGroup + 2 * lane;
+        const __hip_bfloat16 a =
+            even_col < cols ? data[base + even_col]
+                            : __float2bfloat16(0.0f);
+        const __hip_bfloat16 b =
+            (even_col + 1 < cols) ? data[base + even_col + 1]
+                                  : __float2bfloat16(0.0f);
+        const unsigned packed = CvtScaleFp4x2(__hip_bfloat162(a, b), scale);
+        const __hip_bfloat162 bf16x2 = CvtFp4ByteToBf16x2(packed, scale);
+        if (even_col < cols) {
+            data[base + even_col] = bf16x2.x;
+        }
+        if (even_col + 1 < cols) {
+            data[base + even_col + 1] = bf16x2.y;
+        }
+    }
+}
+
+__global__ void DequantizeNativeMxFp4ActivationsKernel(
+    const unsigned char *__restrict__ q,
+    const unsigned char *__restrict__ scale,
+    __hip_bfloat16 *__restrict__ dq, unsigned cols) {
+    __shared__ float scale_values[kMxFp4ScaleGroupsPerDequantBlock];
+
+    const unsigned row = blockIdx.y;
+    const unsigned scale_group_begin =
+        blockIdx.x * kMxFp4ScaleGroupsPerDequantBlock;
+    const unsigned scale_cols = cols / 32;
+    const unsigned valid_scale_groups =
+        min(kMxFp4ScaleGroupsPerDequantBlock,
+            scale_cols - scale_group_begin);
+    const unsigned tid = threadIdx.x;
+
+    if (tid < valid_scale_groups) {
+        const unsigned scale_byte =
+            scale[static_cast<size_t>(row) * scale_cols + scale_group_begin +
+                  tid];
+        const unsigned scale_bits = scale_byte << 23;
+        scale_values[tid] = reinterpret_cast<const float &>(scale_bits);
+    }
+    __syncthreads();
+
+    const unsigned local_scale_group = tid / kMxFp4PairsPerScaleGroup;
+    if (local_scale_group >= valid_scale_groups) {
+        return;
+    }
+
+    const unsigned pair_col =
+        (scale_group_begin + local_scale_group) * kMxFp4PairsPerScaleGroup +
+        (tid % kMxFp4PairsPerScaleGroup);
+    const size_t pair_idx = static_cast<size_t>(row) * (cols / 2) + pair_col;
+    const __hip_bfloat162 bf16x2 =
+        CvtFp4ByteToBf16x2(q[pair_idx], scale_values[local_scale_group]);
+    reinterpret_cast<unsigned *>(dq)[pair_idx] =
+        reinterpret_cast<const unsigned &>(bf16x2);
+}
+
 __global__ void RepackBf16BiasDppLayoutKernel(__hip_bfloat16 *output,
                                               const __hip_bfloat16 *input,
                                               unsigned rows, unsigned cols) {
@@ -381,6 +497,36 @@ hipError_t ApplyElementwiseMultiply(const __hip_bfloat16 *a,
     return hipGetLastError();
 }
 
+hipError_t QuantizeDequantMxFp4(__hip_bfloat16 *data, unsigned rows,
+                                unsigned cols, hipStream_t stream) {
+    static constexpr unsigned kGroup = 32;
+    if (data == nullptr || rows == 0 || cols == 0) {
+        return hipErrorInvalidValue;
+    }
+
+    const dim3 block(kGroup);
+    const dim3 grid(tal::CeilingDiv<unsigned>(cols, kGroup), rows);
+    QuantizeDequantMxFp4Kernel<<<grid, block, 0, stream>>>(data, rows, cols);
+    return hipGetLastError();
+}
+
+hipError_t DequantizeNativeMxFp4Activations(
+    const unsigned char *q, const unsigned char *scale, __hip_bfloat16 *dq,
+    unsigned rows, unsigned cols, hipStream_t stream) {
+    if (q == nullptr || scale == nullptr || dq == nullptr || rows == 0 ||
+        cols == 0 || cols % 32 != 0) {
+        return hipErrorInvalidValue;
+    }
+
+    const dim3 block(kMxFp4DequantThreads);
+    const dim3 grid(tal::CeilingDiv<unsigned>(
+                        cols / 32, kMxFp4ScaleGroupsPerDequantBlock),
+                    rows);
+    DequantizeNativeMxFp4ActivationsKernel<<<grid, block, 0, stream>>>(
+        q, scale, dq, cols);
+    return hipGetLastError();
+}
+
 template <class Input>
 hipError_t ApplyOpenAISwiGLU(const Input *gate, const Input *up,
                              __hip_bfloat16 *out, unsigned count,
@@ -489,13 +635,20 @@ hipError_t RepackPetitMxFp4Weights(unsigned *output, const unsigned *input,
     static constexpr unsigned kRowsPerTile = 16;
     static constexpr unsigned kColsPerTile = 128;
     static constexpr unsigned kThreads = 256;
-    if (output == nullptr || input == nullptr || rows % kRowsPerTile != 0 ||
+    if (output == nullptr || input == nullptr || rows == 0 ||
         cols % kColsPerTile != 0) {
         return hipErrorInvalidValue;
     }
+    if (rows % kRowsPerTile != 0) {
+        (void)stream;
+        (void)output;
+        (void)input;
+        return hipSuccess;
+    }
 
     const dim3 block(kThreads);
-    const dim3 grid(cols / kColsPerTile, rows / kRowsPerTile);
+    const dim3 grid(cols / kColsPerTile,
+                    tal::CeilingDiv<unsigned>(rows, kRowsPerTile));
     RepackPetitMxFp4MoeWeightsKernel<<<grid, block, 0, stream>>>(output, input,
                                                                  rows, cols);
     return hipGetLastError();
