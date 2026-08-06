@@ -494,7 +494,7 @@ class half;
 /// half_float::half = 4.2_h;
 /// ~~~~
 namespace literal {
-half operator"" _h(long double);
+half operator""_h(long double);
 }
 #endif
 
@@ -2694,7 +2694,7 @@ class half {
     friend struct std::hash<half>;
 #endif
 #if HALF_ENABLE_CPP11_USER_LITERALS
-    friend half literal::operator"" _h(long double);
+    friend half literal::operator""_h(long double);
 #endif
 #endif
 };
@@ -2709,7 +2709,7 @@ namespace literal {
 /// performance optimization. \param value literal value \return half with of
 /// given value (possibly rounded) \exception FE_OVERFLOW, ...UNDERFLOW,
 /// ...INEXACT according to rounding
-inline half operator"" _h(long double value) {
+inline half operator""_h(long double value) {
     return half(detail::binary, detail::float2half<half::round_style>(value));
 }
 } // namespace literal
