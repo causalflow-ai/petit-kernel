@@ -120,14 +120,16 @@ struct OnestageFusedMoEBlockScaleFP8 {
         const unsigned route_group_step = persistent_route_step;
         const unsigned route_group_end =
             route_group_step ? route_group_limit : route_group_begin + 1;
-        for (unsigned route_group = route_group_begin;
-             route_group < route_group_end;
-             route_group += (route_group_step ? route_group_step : 1)) {
-            const unsigned route_base = route_group * kRoutesPerBlock;
-            if (route_group < route_group_limit && route_base < num_valid_ids) {
+        if (route_group_begin < route_group_limit) {
+            for (unsigned route_group = route_group_begin;
+                 route_group < route_group_end;
+                 route_group += (route_group_step ? route_group_step : 1)) {
+                const unsigned route_base = route_group * kRoutesPerBlock;
                 const unsigned expert_id = sorted_expert_ids[route_group];
-                const bool valid_expert =
-                    num_experts == 0 || expert_id < num_experts;
+                bool valid_expert = true;
+                if constexpr (Config::kValidateExpertIds) {
+                    valid_expert = expert_id < num_experts;
+                }
 
                 if (valid_expert) {
                     input_.Initialize(act, scales_act, wid, m, n_blocks, dim_);
@@ -135,8 +137,6 @@ struct OnestageFusedMoEBlockScaleFP8 {
                     KernelTrait::InitializeWeights(
                         *this, w13_base, w2, scales_w13, scales_w2, expert_id,
                         tile_k, n_blocks, k_blocks);
-                    sorted_token_br_ = MakeBufferResource(
-                        sorted_token_ids + route_base, kRefBufferRange);
 
                     uint2 token_select;
                     token_select.x =
@@ -146,60 +146,45 @@ struct OnestageFusedMoEBlockScaleFP8 {
                         0x00ffffffu;
 
                     unsigned tokens[kTokenBatch];
+#pragma unroll
                     for (int i = 0; i < kTokenBatch; i++) {
-                        const unsigned token_idx = wid + i * 4;
+                        const unsigned token_idx = wid + i * kNumWarps;
                         tokens[i] =
-                            sorted_token_br_
-                                .template LoadU32<BufferResource::kNone>(
-                                    0, token_idx * sizeof(unsigned)) &
+                            sorted_token_ids[route_base + token_idx] &
                             0x00ffffffu;
                     }
-
-                    uint2 safe_token_select = token_select;
-                    safe_token_select.x = (safe_token_select.x < num_tokens)
-                                              ? safe_token_select.x
-                                              : 0;
-                    safe_token_select.y = (safe_token_select.y < num_tokens)
-                                              ? safe_token_select.y
-                                              : 0;
-
-                    unsigned safe_tokens[kTokenBatch];
+                    unsigned invalid_token_mask = 0;
+#pragma unroll
                     for (int i = 0; i < kTokenBatch; i++) {
-                        safe_tokens[i] =
-                            (tokens[i] < num_tokens) ? tokens[i] : 0;
+                        invalid_token_mask |=
+                            (tokens[i] >= num_tokens) << i;
                     }
+                    invalid_token_mask =
+                        __builtin_amdgcn_readfirstlane(invalid_token_mask);
 
                     const float2 sorted_weights =
                         LoadSortedWeights(sorted_weights_ptr, tid, route_base);
                     float4 h[Stage1Trait::kAccumFragments];
-                    Stage1(h, shm, wid, wtid, tid, safe_token_select,
-                           safe_tokens, m, expert_id, tile_k, w13_bias);
+                    Stage1(h, shm, wid, wtid, tid, token_select, tokens, m,
+                           expert_id, tile_k, w13_bias);
                     __syncthreads();
-
-                    unsigned invalid_token_mask = 0;
-                    for (int i = 0; i < kTokenBatch; i++) {
-                        invalid_token_mask |= (tokens[i] >= num_tokens) << i;
-                    }
-                    invalid_token_mask =
-                        __builtin_amdgcn_readfirstlane(invalid_token_mask);
 
                     typename Stage2Trait::InputRegs stage2_input;
                     QuantizeAndShuffleOp::Run(stage2_input, shm.stage2_input, h,
                                               tid, wid, wtid);
 
-                    Stage2(out, shm, stage2_input, sorted_weights, safe_tokens,
+                    Stage2(out, shm, stage2_input, sorted_weights, tokens,
                            invalid_token_mask, tile_k, tid, wid, wtid,
                            expert_id, w2_bias);
                 }
+                __syncthreads();
             }
-            __syncthreads();
         }
     }
 
     unsigned dim_;
     unsigned inter_dim_;
     Input input_;
-    BufferResource sorted_token_br_;
     W13Weights w13_weights_;
     Bias w1_bias_, w3_bias_;
     W2Weights w2_weights_;
