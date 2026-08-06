@@ -21,7 +21,7 @@ template <class Config> struct ChannelScaleFp8Input {
     static constexpr unsigned kActivationFragments = kGroupDim / 32;
     static constexpr unsigned kScaleBlockSize = 128;
     static constexpr unsigned kRefBufferRange = (unsigned)-16;
-    static constexpr unsigned kShmInputPaddingBytes = 32 * kNumWarps;
+    static constexpr unsigned kShmInputPaddingBytes = 64 * kNumWarps;
     static constexpr unsigned kShmInputElements =
         kTokenBatch * kThreads + (kShmInputPaddingBytes / sizeof(unsigned));
     static constexpr unsigned kShmInputElementsPerWarp =
