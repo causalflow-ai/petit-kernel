@@ -83,8 +83,7 @@ struct FusedMoEWeightSelector<FusedMoEDataType::kMxFp4,
         kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id,
                                        tile_k, Config::kDim,
                                        Config::kInterDim);
-        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k,
-                                      Config::kDim, Config::kInterDim);
+        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k);
     }
 };
 
@@ -106,8 +105,7 @@ struct FusedMoEWeightSelector<FusedMoEDataType::kMxFp4,
         kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id,
                                        tile_k, Config::kDim,
                                        Config::kInterDim);
-        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k,
-                                      Config::kDim, Config::kInterDim);
+        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k);
     }
 };
 

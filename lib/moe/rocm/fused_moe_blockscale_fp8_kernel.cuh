@@ -105,8 +105,8 @@ struct OnestageFusedMoEBlockScaleFP8 {
                            const void *w13_bias) {
         Stage1Tiles tiles{input_, w13_weights_.w1_, w13_weights_.w3_,
                           w1_bias_, w3_bias_};
-        tiles.InitializeBias(w13_bias, expert_id, Config::kInterDim, tile_k);
-        Stage1Op::Run(h, shm.x, tiles, Config::kDim, tid, wid, wtid, tokens, m);
+        tiles.InitializeBias(w13_bias, expert_id, tile_k);
+        Stage1Op::Run(h, shm.x, tiles, tid, wid, wtid, tokens, m);
     }
 
     __device__ void
@@ -117,9 +117,9 @@ struct OnestageFusedMoEBlockScaleFP8 {
            unsigned wid, unsigned wtid, unsigned expert_id,
            const void *w2_bias) {
         Stage2Tiles tiles{w2_weights_.w2_, w2_bias_};
-        tiles.InitializeBias(w2_bias, expert_id, Config::kDim, tile_k);
-        Stage2Op::Run(out, shm.ret, tiles, Config::kDim, input, sorted_weights,
-                      tokens, tile_k, tid, wid, wtid);
+        tiles.InitializeBias(w2_bias, expert_id, tile_k);
+        Stage2Op::Run(out, shm.ret, tiles, input, sorted_weights, tokens,
+                      tile_k, tid, wid, wtid);
     }
 
     __device__ void

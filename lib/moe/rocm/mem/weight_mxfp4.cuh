@@ -73,12 +73,13 @@ template <class Config> struct MxFp4W2 {
     static constexpr unsigned kScaleWordBytes = Traits::kScaleWordBytes;
 
     __device__ void Initialize(const uint4 *w2, const unsigned *scales_w2,
-                               unsigned expert_id, unsigned tile_k, unsigned dim,
-                               unsigned inter_dim) {
+                               unsigned expert_id, unsigned tile_k) {
         static constexpr unsigned kRowGroupSize = W2::kRowGroupSize;
-        const unsigned value_bytes_per_expert = dim * inter_dim / 2;
+        static constexpr unsigned kDim = Config::kDim;
+        static constexpr unsigned kInterDim = Config::kInterDim;
+        const unsigned value_bytes_per_expert = kDim * kInterDim / 2;
         const unsigned scale_words_per_expert =
-            dim * inter_dim / kRowGroupSize / kScaleBytesPerWord;
+            kDim * kInterDim / kRowGroupSize / kScaleBytesPerWord;
         const unsigned value_tile_offset =
             tile_k * 2 * kWarpSize * sizeof(uint4);
         const unsigned scale_tile_offset = tile_k * kWarpSize;
@@ -91,7 +92,7 @@ template <class Config> struct MxFp4W2 {
                        scale_ptr,
                        (scale_words_per_expert - scale_tile_offset) *
                            kScaleWordBytes,
-                       inter_dim);
+                       kInterDim);
     }
 
     W2 w2_;

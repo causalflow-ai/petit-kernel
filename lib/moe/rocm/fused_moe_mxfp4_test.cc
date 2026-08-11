@@ -24,7 +24,7 @@ namespace moe_test = causalflow::petit::rocm::moe::test_utils;
 namespace fp8_sampler = causalflow::petit::tests::fp8_sampler;
 
 static constexpr FusedMoESolutionId kFp8PetitMxFp4SolutionId =
-    FusedMoESolutionId::Make(
+    FusedMoESolutionId::MakeBase(
         FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
         FusedMoEDataType::kNone, FusedMoEWeightOrdering::kPetitMxFp4,
         FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
@@ -32,7 +32,7 @@ static constexpr FusedMoESolutionId kFp8PetitMxFp4SolutionId =
         FusedMoEStage1Buffering::kSingleBuffer);
 
 static constexpr FusedMoESolutionId kFp8PetitMxFp4BiasSolutionId =
-    FusedMoESolutionId::Make(
+    FusedMoESolutionId::MakeBase(
         FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
         FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kPetitMxFp4,
         FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
@@ -40,7 +40,7 @@ static constexpr FusedMoESolutionId kFp8PetitMxFp4BiasSolutionId =
         FusedMoEStage1Buffering::kDoubleBuffer);
 
 static constexpr FusedMoESolutionId kBf16NativeMxFp4BiasSolutionId =
-    FusedMoESolutionId::Make(
+    FusedMoESolutionId::MakeBase(
         FusedMoEDataType::kBf16, FusedMoEDataType::kMxFp4,
         FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kNativeMxFp4,
         FusedMoEMfmaShape::kMfmaBf16MxFp4, FusedMoEStages::kOneStage,
@@ -48,7 +48,7 @@ static constexpr FusedMoESolutionId kBf16NativeMxFp4BiasSolutionId =
         FusedMoEStage1Buffering::kDoubleBuffer);
 
 static constexpr FusedMoESolutionId kMxFp4NativeMxFp4BiasSolutionId =
-    FusedMoESolutionId::Make(
+    FusedMoESolutionId::MakeBase(
         FusedMoEDataType::kMxFp4, FusedMoEDataType::kMxFp4,
         FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kNativeMxFp4,
         FusedMoEMfmaShape::kMfmaScaleFp4MxFp4, FusedMoEStages::kOneStage,
@@ -129,7 +129,9 @@ struct NativeMxFp4LayoutSensitiveConfig : TestConfig<32, 3072, 256, 1, 1> {
     static void AdjustTopKPatterns(std::vector<unsigned> &topk_ids,
                                    std::vector<float> &topk_weights) {
         std::fill(topk_ids.begin(), topk_ids.end(), 0u);
-        std::fill(topk_weights.begin(), topk_weights.end(), 1.0f);
+        for (unsigned token = 0; token < kTokens; ++token) {
+            topk_weights[token] = 0.125f + static_cast<float>(token) / 64.0f;
+        }
     }
 };
 
@@ -451,7 +453,10 @@ int Fp8InputMxFp4Runner<Config, RunnerConfig, kSolutionRepr>::RunKernelImpl() {
         nullptr,
         0,
     };
-    return FusedMoEMatmul1Stage(params, kSolutionRepr);
+    static constexpr auto kSolutionId =
+        FusedMoESolutionId::FromRepr(kSolutionRepr)
+            .WithShape(Context::kDim, Context::kInterDim);
+    return FusedMoEMatmul1Stage(params, kSolutionId.Repr());
 }
 
 template <class Config, class RunnerConfig, unsigned long kSolutionRepr>
@@ -682,7 +687,10 @@ class Bf16InputMxFp4Runner : public moe_test::TestRunnerBase {
             nullptr,
             0,
         };
-        return FusedMoEMatmul1Stage(params, kBf16NativeMxFp4BiasSolutionId.Repr());
+        static constexpr auto kSolutionId =
+            kBf16NativeMxFp4BiasSolutionId.WithShape(Context::kDim,
+                                                     Context::kInterDim);
+        return FusedMoEMatmul1Stage(params, kSolutionId.Repr());
     }
 
   private:
@@ -855,8 +863,10 @@ class NativeInputMxFp4Runner : public moe_test::TestRunnerBase {
             nullptr,
             0,
         };
-        return FusedMoEMatmul1Stage(params,
-                                    kMxFp4NativeMxFp4BiasSolutionId.Repr());
+        static constexpr auto kSolutionId =
+            kMxFp4NativeMxFp4BiasSolutionId.WithShape(Context::kDim,
+                                                      Context::kInterDim);
+        return FusedMoEMatmul1Stage(params, kSolutionId.Repr());
     }
 
   private:

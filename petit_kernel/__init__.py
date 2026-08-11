@@ -55,7 +55,7 @@ class _FusedMoeStage1Buffering(enum.IntEnum):
     double_buffer = 1
 
 
-def _make_fused_moe_solution_id(
+def _make_fused_moe_base_solution_id(
     activation_type: _FusedMoeDataType | int,
     weight_type: _FusedMoeDataType | int,
     bias_type: _FusedMoeDataType | int,
@@ -77,7 +77,49 @@ def _make_fused_moe_solution_id(
     )
 
 
-_FUSED_MOE_FP8_BLOCKSCALE_SOLUTION_ID = _make_fused_moe_solution_id(
+def _with_fused_moe_shape(solution_id: int, dim: int, inter_dim: int) -> int:
+    dim = int(dim)
+    inter_dim = int(inter_dim)
+    if dim <= 0 or inter_dim <= 0:
+        raise ValueError("MoE dimensions must be positive")
+    if dim % 64 != 0 or inter_dim % 64 != 0:
+        raise ValueError("MoE dimensions must be divisible by 64")
+    if dim // 64 > 0xFF or inter_dim // 64 > 0xFF:
+        raise ValueError("MoE dimensions exceed the solution-ID encoding")
+    shape_mask = 0xFFFF << 24
+    return (
+        (int(solution_id) & ~shape_mask)
+        | ((dim // 64) << 24)
+        | ((inter_dim // 64) << 32)
+    )
+
+
+def _make_fused_moe_solution_id(
+    activation_type: _FusedMoeDataType | int,
+    weight_type: _FusedMoeDataType | int,
+    bias_type: _FusedMoeDataType | int,
+    weight_ordering: _FusedMoeWeightOrdering | int,
+    mfma: _FusedMoeMfmaShape | int,
+    stages: _FusedMoeStages | int,
+    activation: _FusedMoeActivationFunction | int,
+    stage1_buffering: _FusedMoeStage1Buffering | int,
+    dim: int,
+    inter_dim: int,
+) -> int:
+    base = _make_fused_moe_base_solution_id(
+        activation_type,
+        weight_type,
+        bias_type,
+        weight_ordering,
+        mfma,
+        stages,
+        activation,
+        stage1_buffering,
+    )
+    return _with_fused_moe_shape(base, dim, inter_dim)
+
+
+_FUSED_MOE_FP8_BLOCKSCALE_SOLUTION_ID = _make_fused_moe_base_solution_id(
     _FusedMoeDataType.channel_scale_fp8,
     _FusedMoeDataType.blockscale_fp8,
     _FusedMoeDataType.none,
@@ -87,7 +129,7 @@ _FUSED_MOE_FP8_BLOCKSCALE_SOLUTION_ID = _make_fused_moe_solution_id(
     _FusedMoeActivationFunction.silu_dot,
     _FusedMoeStage1Buffering.double_buffer,
 )
-_FUSED_MOE_FP8_BLOCKSCALE_MXFP4_SOLUTION_ID = _make_fused_moe_solution_id(
+_FUSED_MOE_FP8_BLOCKSCALE_MXFP4_SOLUTION_ID = _make_fused_moe_base_solution_id(
     _FusedMoeDataType.channel_scale_fp8,
     _FusedMoeDataType.mxfp4,
     _FusedMoeDataType.none,
@@ -97,7 +139,7 @@ _FUSED_MOE_FP8_BLOCKSCALE_MXFP4_SOLUTION_ID = _make_fused_moe_solution_id(
     _FusedMoeActivationFunction.silu_dot,
     _FusedMoeStage1Buffering.single_buffer,
 )
-_FUSED_MOE_BF16_MXFP4_BIAS_SOLUTION_ID = _make_fused_moe_solution_id(
+_FUSED_MOE_BF16_MXFP4_BIAS_SOLUTION_ID = _make_fused_moe_base_solution_id(
     _FusedMoeDataType.bf16,
     _FusedMoeDataType.mxfp4,
     _FusedMoeDataType.bf16,
@@ -432,7 +474,9 @@ def fused_moe_fp8_blockscale_g1u1(
         input_scale,
         fc1_scale,
         fc2_scale,
-        _FUSED_MOE_FP8_BLOCKSCALE_SOLUTION_ID,
+        _with_fused_moe_shape(
+            _FUSED_MOE_FP8_BLOCKSCALE_SOLUTION_ID, dim, w2_q.size(2)
+        ),
         num_persistent_tgs,
     )
 
@@ -507,7 +551,11 @@ def fused_moe_fp8_blockscale_g1u1_mxfp4(
         input_scale,
         fc1_scale,
         fc2_scale,
-        _FUSED_MOE_FP8_BLOCKSCALE_MXFP4_SOLUTION_ID,
+        _with_fused_moe_shape(
+            _FUSED_MOE_FP8_BLOCKSCALE_MXFP4_SOLUTION_ID,
+            dim,
+            w2_q.size(2) * 2,
+        ),
         num_persistent_tgs,
     )
 
@@ -620,7 +668,11 @@ def fused_moe_bf16_mxfp4(
         input_scale,
         fc1_scale,
         fc2_scale,
-        _FUSED_MOE_BF16_MXFP4_BIAS_SOLUTION_ID,
+        _with_fused_moe_shape(
+            _FUSED_MOE_BF16_MXFP4_BIAS_SOLUTION_ID,
+            dim,
+            w2_q.size(2) * 2,
+        ),
         num_persistent_tgs,
         w13_bias,
         w2_bias,

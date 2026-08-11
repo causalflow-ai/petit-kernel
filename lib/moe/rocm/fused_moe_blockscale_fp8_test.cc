@@ -25,12 +25,14 @@ namespace moe_test = causalflow::petit::rocm::moe::test_utils;
 using moe_test::FillParallelIndexed;
 using moe_test::FillWeightsParallel;
 
-static constexpr FusedMoESolutionId kTestSolutionId = FusedMoESolutionId::Make(
-    FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kBlockScaleFp8,
-    FusedMoEDataType::kNone, FusedMoEWeightOrdering::kPetitFp8,
-    FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
-    FusedMoEActivationFunction::kSiluDot,
-    FusedMoEStage1Buffering::kDoubleBuffer);
+static constexpr FusedMoESolutionId kTestSolutionId =
+    FusedMoESolutionId::MakeBase(
+        FusedMoEDataType::kChannelScaleFp8,
+        FusedMoEDataType::kBlockScaleFp8, FusedMoEDataType::kNone,
+        FusedMoEWeightOrdering::kPetitFp8,
+        FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,
+        FusedMoEActivationFunction::kSiluDot,
+        FusedMoEStage1Buffering::kDoubleBuffer);
 
 template <unsigned kTokens_, unsigned kDim_, unsigned kInterDim_,
           unsigned kExperts_, unsigned kTopK_>
@@ -203,7 +205,9 @@ template <class Config> int TestRunner<Config>::RunKernelImpl() {
         nullptr,
         0,
     };
-    return FusedMoEMatmul1Stage(params, kTestSolutionId.Repr());
+    return FusedMoEMatmul1Stage(
+        params,
+        kTestSolutionId.WithShape(Context::kDim, Context::kInterDim).Repr());
 }
 
 template <class Config> void TestRunner<Config>::InitializeW13HostData() {

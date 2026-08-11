@@ -86,7 +86,7 @@ struct KernelVariant {
 };
 
 static constexpr moe::FusedMoESolutionId kFp8BlockScaleSiluSolutionId =
-    moe::FusedMoESolutionId::Make(
+    moe::FusedMoESolutionId::MakeBase(
         moe::FusedMoEDataType::kChannelScaleFp8,
         moe::FusedMoEDataType::kBlockScaleFp8, moe::FusedMoEDataType::kNone,
         moe::FusedMoEWeightOrdering::kPetitFp8,
@@ -96,7 +96,7 @@ static constexpr moe::FusedMoESolutionId kFp8BlockScaleSiluSolutionId =
         moe::FusedMoEStage1Buffering::kDoubleBuffer);
 
 static constexpr moe::FusedMoESolutionId kFp8PetitMxFp4SiluSolutionId =
-    moe::FusedMoESolutionId::Make(
+    moe::FusedMoESolutionId::MakeBase(
         moe::FusedMoEDataType::kChannelScaleFp8, moe::FusedMoEDataType::kMxFp4,
         moe::FusedMoEDataType::kNone, moe::FusedMoEWeightOrdering::kPetitMxFp4,
         moe::FusedMoEMfmaShape::kMfmaFp816x16x32,
@@ -105,7 +105,7 @@ static constexpr moe::FusedMoESolutionId kFp8PetitMxFp4SiluSolutionId =
         moe::FusedMoEStage1Buffering::kSingleBuffer);
 
 static constexpr moe::FusedMoESolutionId kFp8PetitMxFp4OpenAIBiasSolutionId =
-    moe::FusedMoESolutionId::Make(
+    moe::FusedMoESolutionId::MakeBase(
         moe::FusedMoEDataType::kChannelScaleFp8, moe::FusedMoEDataType::kMxFp4,
         moe::FusedMoEDataType::kBf16, moe::FusedMoEWeightOrdering::kPetitMxFp4,
         moe::FusedMoEMfmaShape::kMfmaFp816x16x32,
@@ -114,7 +114,7 @@ static constexpr moe::FusedMoESolutionId kFp8PetitMxFp4OpenAIBiasSolutionId =
         moe::FusedMoEStage1Buffering::kDoubleBuffer);
 
 static constexpr moe::FusedMoESolutionId kBf16NativeMxFp4OpenAIBiasSolutionId =
-    moe::FusedMoESolutionId::Make(
+    moe::FusedMoESolutionId::MakeBase(
         moe::FusedMoEDataType::kBf16, moe::FusedMoEDataType::kMxFp4,
         moe::FusedMoEDataType::kBf16,
         moe::FusedMoEWeightOrdering::kNativeMxFp4,
@@ -124,7 +124,7 @@ static constexpr moe::FusedMoESolutionId kBf16NativeMxFp4OpenAIBiasSolutionId =
         moe::FusedMoEStage1Buffering::kDoubleBuffer);
 
 static constexpr moe::FusedMoESolutionId
-    kMxFp4NativeMxFp4OpenAIBiasSolutionId = moe::FusedMoESolutionId::Make(
+    kMxFp4NativeMxFp4OpenAIBiasSolutionId = moe::FusedMoESolutionId::MakeBase(
         moe::FusedMoEDataType::kMxFp4, moe::FusedMoEDataType::kMxFp4,
         moe::FusedMoEDataType::kBf16,
         moe::FusedMoEWeightOrdering::kNativeMxFp4,
@@ -877,14 +877,14 @@ static bool RunBenchmark(const HostInputs &in, const DeviceBuffers &dev,
     };
 
     CheckHIPStatus(hipMemset(dev.out_bf16, 0, out_bytes));
-    const int err = moe::FusedMoEMatmul1Stage(params, variant.solution_id.Repr());
+    const auto solution_id = variant.solution_id.WithShape(dim, inter_dim);
+    const int err = moe::FusedMoEMatmul1Stage(params, solution_id.Repr());
     if (err != 0) {
         return false;
     }
 
     for (int i = 0; i < FLAGS_warmup; ++i) {
-        if (moe::FusedMoEMatmul1Stage(params, variant.solution_id.Repr()) !=
-            0) {
+        if (moe::FusedMoEMatmul1Stage(params, solution_id.Repr()) != 0) {
             return false;
         }
     }
@@ -898,7 +898,7 @@ static bool RunBenchmark(const HostInputs &in, const DeviceBuffers &dev,
 
     CheckHIPStatus(hipEventRecord(ev_start, 0));
     for (int i = 0; i < FLAGS_repeat; ++i) {
-        moe::FusedMoEMatmul1Stage(params, variant.solution_id.Repr());
+        moe::FusedMoEMatmul1Stage(params, solution_id.Repr());
     }
     CheckHIPStatus(hipEventRecord(ev_stop, 0));
     CheckHIPStatus(hipEventSynchronize(ev_stop));

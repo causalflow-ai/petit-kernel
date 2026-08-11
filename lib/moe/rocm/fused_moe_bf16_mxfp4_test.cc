@@ -24,7 +24,7 @@ namespace {
 namespace moe_test = causalflow::petit::rocm::moe::test_utils;
 
 static constexpr FusedMoESolutionId kBf16NativeMxFp4BiasSolutionId =
-    FusedMoESolutionId::Make(
+    FusedMoESolutionId::MakeBase(
         FusedMoEDataType::kBf16, FusedMoEDataType::kMxFp4,
         FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kNativeMxFp4,
         FusedMoEMfmaShape::kMfmaBf16MxFp4, FusedMoEStages::kOneStage,
@@ -112,7 +112,8 @@ int RunBf16MxFp4(uint4 *__restrict__ out, const uint4 *act,
         w13_bias,
         w2_bias,
     };
-    return FusedMoEMatmul1Stage(params, kBf16NativeMxFp4BiasSolutionId.Repr());
+    return FusedMoEMatmul1Stage(
+        params, kBf16NativeMxFp4BiasSolutionId.WithShape(n, k).Repr());
 }
 
 template <class T> T *CopyToDevice(std::span<const T> host) {

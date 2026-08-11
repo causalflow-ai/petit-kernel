@@ -33,16 +33,17 @@ template <class TileOps_> struct W13TileSchedule {
         : input(input), w1(w1), w3(w3), w1_bias(w1_bias), w3_bias(w3_bias) {}
 
     __device__ void InitializeBias(const void *w13_bias, unsigned expert_id,
-                                   unsigned inter_dim, unsigned tile_k) {
-        const unsigned projection_stride = Bias::PackedStride(inter_dim);
+                                   unsigned tile_k) {
+        const unsigned projection_stride =
+            Bias::PackedStride(Config::kInterDim);
         const unsigned expert_stride = 2 * projection_stride;
         const void *w3_bias_ptr =
             w13_bias == nullptr ? nullptr
                                 : reinterpret_cast<const char *>(w13_bias) +
                                       projection_stride * Bias::kElementBytes;
-        w1_bias.Initialize(w13_bias, expert_id, inter_dim, tile_k,
+        w1_bias.Initialize(w13_bias, expert_id, Config::kInterDim, tile_k,
                            expert_stride);
-        w3_bias.Initialize(w3_bias_ptr, expert_id, inter_dim, tile_k,
+        w3_bias.Initialize(w3_bias_ptr, expert_id, Config::kInterDim, tile_k,
                            expert_stride);
     }
 
@@ -106,10 +107,11 @@ template <class TileOps_> struct W2TileSchedule {
         : weight(weight), bias(bias) {}
 
     __device__ void InitializeBias(const void *bias_ptr, unsigned expert_id,
-                                   unsigned dim, unsigned tile_k) {
-        const unsigned expert_stride = Bias::PackedStride(dim);
+                                   unsigned tile_k) {
+        const unsigned expert_stride = Bias::PackedStride(Config::kDim);
         const unsigned bias_tile = TileOps::kStage2BiasUsesTileK ? tile_k : 0;
-        bias.Initialize(bias_ptr, expert_id, dim, bias_tile, expert_stride);
+        bias.Initialize(bias_ptr, expert_id, Config::kDim, bias_tile,
+                        expert_stride);
     }
 
     __device__ void LoadStage(unsigned stage, unsigned tid, unsigned wid,
@@ -143,7 +145,7 @@ template <class TileSchedule> struct OnestageFusedMoEStage1DoubleBufferOp {
     };
 
     __device__ static void Run(float4 h[kAccumFragments], Shm &shm,
-                               TileSchedule &tiles, unsigned dim, unsigned tid,
+                               TileSchedule &tiles, unsigned tid,
                                unsigned wid, unsigned wtid,
                                const unsigned tokens[kTokenBatch], unsigned m) {
         float4 t_gate[kAccumFragments], t_up[kAccumFragments];
@@ -158,7 +160,8 @@ template <class TileSchedule> struct OnestageFusedMoEStage1DoubleBufferOp {
         amdgcn_s_waitcnt_barrier<0>();
         tiles.ReadInput(x[curr], &shm.x[curr], wtid);
 
-        for (unsigned d = 0; d < dim; d += 2 * kGroupDim) {
+#pragma unroll
+        for (unsigned d = 0; d < Config::kDim; d += 2 * kGroupDim) {
             __syncthreads();
 #pragma unroll
             for (unsigned curr = 0, next = 1; curr < 2;
@@ -169,7 +172,7 @@ template <class TileSchedule> struct OnestageFusedMoEStage1DoubleBufferOp {
                 tiles.PrefetchInput(&shm.x[next], wid, wtid, tokens, m);
                 tiles.Matmul(t_gate, t_up, x[curr], tid, wid, wtid);
 
-                if (d + kGroupDim >= dim) {
+                if (d + kGroupDim >= Config::kDim) {
                     break;
                 }
 
@@ -199,7 +202,7 @@ template <class TileSchedule> struct OnestageFusedMoEStage1SingleBufferOp {
     };
 
     __device__ static void Run(float4 h[kAccumFragments], Shm &shm,
-                               TileSchedule &tiles, unsigned dim, unsigned tid,
+                               TileSchedule &tiles, unsigned tid,
                                unsigned wid, unsigned wtid,
                                const unsigned tokens[kTokenBatch], unsigned m) {
         float4 t_gate[kAccumFragments], t_up[kAccumFragments];
@@ -209,7 +212,8 @@ template <class TileSchedule> struct OnestageFusedMoEStage1SingleBufferOp {
 
         tiles.LoadInitial(tid, wid, wtid);
 
-        for (unsigned d = 0; d < dim; d += kGroupDim) {
+#pragma unroll
+        for (unsigned d = 0; d < Config::kDim; d += kGroupDim) {
             tiles.PrefetchInput(&shm.x[0], wid, wtid, tokens, m);
             amdgcn_s_waitcnt_barrier<0>();
             tiles.ReadInput(x, &shm.x[0], wtid);
@@ -299,9 +303,10 @@ struct OnestageFusedMoEStage2Op {
     template <unsigned kId>
     __device__ static void WriteOne(const BufferResource &out, uint2 value,
                                     const unsigned tokens[kTokenBatch],
-                                    unsigned dim, unsigned d, unsigned wtid) {
+                                    unsigned d, unsigned wtid) {
         const unsigned vo =
-            (tokens[kId] * dim + d + wtid * 2) * sizeof(__hip_bfloat16);
+            (tokens[kId] * Config::kDim + d + wtid * 2) *
+            sizeof(__hip_bfloat16);
         BufferAtomicWriteBf16x2(out, vo, value.x);
         BufferAtomicWriteBf16x2(out, vo + 256, value.y);
     }
@@ -309,21 +314,20 @@ struct OnestageFusedMoEStage2Op {
     __device__ static void WriteBack(const BufferResource &out,
                                      const uint2 o[kTokenBatch],
                                      const unsigned tokens[kTokenBatch],
-                                     unsigned dim, unsigned d, unsigned wtid) {
-        WriteOne<0>(out, o[0], tokens, dim, d, wtid);
-        WriteOne<1>(out, o[1], tokens, dim, d, wtid);
-        WriteOne<2>(out, o[2], tokens, dim, d, wtid);
-        WriteOne<3>(out, o[3], tokens, dim, d, wtid);
-        WriteOne<4>(out, o[4], tokens, dim, d, wtid);
-        WriteOne<5>(out, o[5], tokens, dim, d, wtid);
-        WriteOne<6>(out, o[6], tokens, dim, d, wtid);
-        WriteOne<7>(out, o[7], tokens, dim, d, wtid);
+                                     unsigned d, unsigned wtid) {
+        WriteOne<0>(out, o[0], tokens, d, wtid);
+        WriteOne<1>(out, o[1], tokens, d, wtid);
+        WriteOne<2>(out, o[2], tokens, d, wtid);
+        WriteOne<3>(out, o[3], tokens, d, wtid);
+        WriteOne<4>(out, o[4], tokens, d, wtid);
+        WriteOne<5>(out, o[5], tokens, d, wtid);
+        WriteOne<6>(out, o[6], tokens, d, wtid);
+        WriteOne<7>(out, o[7], tokens, d, wtid);
     }
 
     template <class RouteWeights>
     __device__ static void Run(const BufferResource &out, Shm &shm,
                                TileSchedule &tiles,
-                               unsigned dim,
                                const typename TileSchedule::InputRegs &input,
                                const RouteWeights &sorted_weights,
                                const unsigned tokens[kTokenBatch],
@@ -336,12 +340,13 @@ struct OnestageFusedMoEStage2Op {
         };
         WriteShm(shm, next, zeroes, wid, wtid);
 
-        for (unsigned d = 0; d < dim; d += 2 * kGroupDim) {
+#pragma unroll
+        for (unsigned d = 0; d < Config::kDim; d += 2 * kGroupDim) {
 #pragma unroll
             for (unsigned curr = 0, next = 1; curr < 2;
                  curr++, next = 1 - curr) {
                 const unsigned tile_d = d + curr * kGroupDim;
-                if (tile_d >= dim) {
+                if (tile_d >= Config::kDim) {
                     break;
                 }
                 // TODO: Optimize the syncthreads
@@ -366,7 +371,7 @@ struct OnestageFusedMoEStage2Op {
 
                 WriteShm(shm, curr, o, wid, wtid);
                 if (tile_d != 0) {
-                    WriteBack(out, ret, tokens, dim, tile_d - kGroupDim, wtid);
+                    WriteBack(out, ret, tokens, tile_d - kGroupDim, wtid);
                 }
                 __syncthreads();
             }
@@ -374,8 +379,9 @@ struct OnestageFusedMoEStage2Op {
 
         __syncthreads();
         uint2 ret[kTokenBatch];
-        ReadShm(shm, (dim / kGroupDim - 1) % kStage, ret, wid, wtid);
-        WriteBack(out, ret, tokens, dim, dim - kGroupDim, wtid);
+        ReadShm(shm, (Config::kDim / kGroupDim - 1) % kStage, ret, wid,
+                wtid);
+        WriteBack(out, ret, tokens, Config::kDim - kGroupDim, wtid);
     }
 };
 
