@@ -723,9 +723,11 @@ void DeviceBuffers::AllocateAndPrepare(const HostInputs &in,
     if (variant.has_bias) {
         auto *w13_logical = CopyToDevice(in.w13_bias);
         auto *w2_logical = CopyToDevice(in.w2_bias);
-        const unsigned w13_packed_cols = CeilingDiv<unsigned>(inter_dim, 512) *
-                                         512;
-        const unsigned w2_packed_cols = CeilingDiv<unsigned>(dim, 512) * 512;
+        const unsigned bias_block_cols = 256;
+        const unsigned w13_packed_cols =
+            CeilingDiv<unsigned>(inter_dim, bias_block_cols) * bias_block_cols;
+        const unsigned w2_packed_cols =
+            CeilingDiv<unsigned>(dim, bias_block_cols) * bias_block_cols;
         CheckHIPStatus(hipMalloc(&w13_bias,
                                  static_cast<size_t>(experts) * 2 *
                                      w13_packed_cols *
@@ -734,10 +736,10 @@ void DeviceBuffers::AllocateAndPrepare(const HostInputs &in,
                                  static_cast<size_t>(experts) *
                                      w2_packed_cols *
                                      sizeof(__hip_bfloat16)));
-        CheckHIPStatus(moe_test::RepackBf16BiasDppLayout(
+        CheckHIPStatus(moe_test::RepackMxFp4Bias(
             w13_bias, reinterpret_cast<const __hip_bfloat16 *>(w13_logical),
             experts * 2, inter_dim));
-        CheckHIPStatus(moe_test::RepackBf16BiasDppLayout(
+        CheckHIPStatus(moe_test::RepackMxFp4Bias(
             w2_bias, reinterpret_cast<const __hip_bfloat16 *>(w2_logical),
             experts, dim));
         CheckHIPStatus(hipFree(w13_logical));

@@ -527,16 +527,16 @@ void RunSingleExpertBiasCoverageTest() {
     auto *d_w2_bias_logical = CopyToDevice(w2_bias);
     __hip_bfloat16 *d_w13_bias = nullptr;
     __hip_bfloat16 *d_w2_bias = nullptr;
-    const unsigned w13_bias_padded_cols = ((kInterDim + 511) / 512) * 512;
-    const unsigned w2_bias_padded_cols = ((kDim + 511) / 512) * 512;
+    const unsigned w13_bias_padded_cols = ((kInterDim + 255) / 256) * 256;
+    const unsigned w2_bias_padded_cols = ((kDim + 255) / 256) * 256;
     CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&d_w13_bias),
                              2 * w13_bias_padded_cols *
                                  sizeof(__hip_bfloat16)));
     CheckHIPStatus(hipMalloc(reinterpret_cast<void **>(&d_w2_bias),
                              w2_bias_padded_cols * sizeof(__hip_bfloat16)));
-    CheckHIPStatus(moe_test::RepackBf16BiasDppLayout(
+    CheckHIPStatus(moe_test::RepackMxFp4Bias(
         d_w13_bias, d_w13_bias_logical, 2, kInterDim));
-    CheckHIPStatus(moe_test::RepackBf16BiasDppLayout(
+    CheckHIPStatus(moe_test::RepackMxFp4Bias(
         d_w2_bias, d_w2_bias_logical, 1, kDim));
 
     const int err = RunBf16MxFp4(

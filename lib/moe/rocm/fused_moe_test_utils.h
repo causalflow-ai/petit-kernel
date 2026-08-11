@@ -338,26 +338,25 @@ hipError_t DequantizeNativeMxFp4Activations(
     const unsigned char *q, const unsigned char *scale, __hip_bfloat16 *dq,
     unsigned rows, unsigned cols, hipStream_t stream = nullptr);
 
-hipError_t RepackBf16BiasDppLayout(__hip_bfloat16 *output,
-                                   const __hip_bfloat16 *input, unsigned rows,
-                                   unsigned cols,
-                                   hipStream_t stream = nullptr);
+hipError_t RepackMxFp4Bias(__hip_bfloat16 *output,
+                           const __hip_bfloat16 *input, unsigned rows,
+                           unsigned cols, hipStream_t stream = nullptr);
 
 hipError_t RepackNativeMxFp4Weights(unsigned *output, const unsigned *input,
-                                       unsigned rows, unsigned cols,
-                                       hipStream_t stream = nullptr);
+                                    unsigned rows, unsigned cols,
+                                    hipStream_t stream = nullptr);
 
 hipError_t RepackNativeMxFp4Scales(unsigned *output, const unsigned *input,
-                                      unsigned rows, unsigned scale_cols,
-                                      hipStream_t stream = nullptr);
+                                   unsigned rows, unsigned scale_cols,
+                                   hipStream_t stream = nullptr);
 
 hipError_t RepackPetitMxFp4Weights(unsigned *output, const unsigned *input,
-                                     unsigned rows, unsigned cols,
-                                     hipStream_t stream = nullptr);
+                                   unsigned rows, unsigned cols,
+                                   hipStream_t stream = nullptr);
 
 hipError_t RepackPetitMxFp4Scales(unsigned *output, const unsigned *input,
-                                    unsigned rows, unsigned scale_cols,
-                                    hipStream_t stream = nullptr);
+                                  unsigned rows, unsigned scale_cols,
+                                  hipStream_t stream = nullptr);
 
 class HipBlasLtRunner {
   public:

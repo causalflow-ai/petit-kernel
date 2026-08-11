@@ -186,36 +186,30 @@ __global__ void DequantizeNativeMxFp4ActivationsKernel(
         reinterpret_cast<const unsigned &>(bf16x2);
 }
 
-__global__ void RepackBf16BiasDppLayoutKernel(__hip_bfloat16 *output,
-                                              const __hip_bfloat16 *input,
-                                              unsigned rows, unsigned cols) {
-    using namespace causalflow::tal;
-    static constexpr unsigned kColsPerTile = 512;
-    __shared__ __hip_bfloat16 tile[kColsPerTile];
-
+__global__ void RepackBf16BiasKernel(__hip_bfloat16 *output,
+                                     const __hip_bfloat16 *input,
+                                     unsigned rows, unsigned cols) {
+    static constexpr unsigned kColsPerTile = 256;
     const unsigned tid = threadIdx.x;
     const unsigned tile_id = blockIdx.x;
     const unsigned row = blockIdx.y;
-    const unsigned tiles = CeilingDiv<unsigned>(cols, kColsPerTile);
+    const unsigned tiles = tal::CeilingDiv<unsigned>(cols, kColsPerTile);
+    const unsigned padded_cols = tiles * kColsPerTile;
     (void)rows;
 
-    for (unsigned idx = tid; idx < kColsPerTile; idx += blockDim.x) {
-        const unsigned col = tile_id * kColsPerTile + idx;
-        tile[idx] = col < cols
-                        ? input[static_cast<size_t>(row) * cols + col]
-                        : __float2bfloat16(0.0f);
-    }
-    __syncthreads();
-
-    using SourceLayout = Layout<
-        Shape<Shape<C<4>, C<2>>, Shape<C<4>, C<4>>, C<4>>,
-        Stride<Stride<_1, C<256>>, Stride<C<64>, C<4>>, C<16>>>;
-    const SourceLayout source_layout;
-    const size_t output_base =
-        (static_cast<size_t>(row) * tiles + tile_id) * kColsPerTile;
-    for (unsigned idx = tid; idx < kColsPerTile; idx += blockDim.x) {
-        output[output_base + idx] = tile[source_layout(idx)];
-    }
+    const unsigned col = tile_id * kColsPerTile + tid;
+    using namespace causalflow::tal;
+    // Packed coordinates are [wave][q][fragment][component]. Logical bias is
+    // [wave][fragment][q][component].
+    const auto source_layout =
+        make_layout(make_shape(C<4>{}, C<4>{}, C<4>{}, C<4>{}),
+                    make_stride(_1{}, C<16>{}, C<4>{}, C<64>{}));
+    const unsigned src_col =
+        tile_id * kColsPerTile + source_layout(tid);
+    output[static_cast<size_t>(row) * padded_cols + col] =
+        src_col < cols
+            ? input[static_cast<size_t>(row) * cols + src_col]
+            : __float2bfloat16(0.0f);
 }
 
 template <unsigned kBlockSize>
@@ -302,10 +296,9 @@ DequantizeShuffledBlockScaleFp8Kernel(const unsigned char *q,
     }
 }
 
-__global__ void RepackBf16MxFp4CDNA4WeightsKernel(unsigned *__restrict__ output,
-                                                  const unsigned *__restrict__ input,
-                                                  unsigned rows,
-                                                  unsigned cols) {
+__global__ void RepackNativeMxFp4WeightsKernel(
+    unsigned *__restrict__ output, const unsigned *__restrict__ input,
+    unsigned rows, unsigned cols) {
     using namespace causalflow::tal;
     static constexpr unsigned kRowsPerTile = 256;
     static constexpr unsigned kColsPerTile = 128;
@@ -338,7 +331,6 @@ __global__ void RepackBf16MxFp4CDNA4WeightsKernel(unsigned *__restrict__ output,
                    make_shape(C<4>{}, C<4>{})),
         make_stride(make_stride(_1{}, C<4>{}, C<64>{}),
                     make_stride(256 * k128_blocks, 1024 * k128_blocks)));
-
     for (unsigned idx = tid; idx < kWordsPerTile; idx += blockDim.x) {
         const size_t output_base =
             static_cast<size_t>(n256) * 4096 * k128_blocks + k128 * 256;
@@ -347,143 +339,105 @@ __global__ void RepackBf16MxFp4CDNA4WeightsKernel(unsigned *__restrict__ output,
     }
 }
 
-__global__ void RepackPetitMxFp4MoeWeightsKernel(unsigned *__restrict__ output,
-                                                 const unsigned *__restrict__ input,
-                                                 unsigned rows,
-                                                 unsigned cols) {
+__global__ void RepackPetitMxFp4WeightsKernel(
+    unsigned *__restrict__ output, const unsigned *__restrict__ input,
+    unsigned rows, unsigned cols) {
     using namespace causalflow::tal;
-    static constexpr unsigned kRowsPerTile = 16;
+    static constexpr unsigned kRowsPerTile = 256;
     static constexpr unsigned kColsPerTile = 128;
     static constexpr unsigned kWordsPerTile = kRowsPerTile * kColsPerTile / 8;
     __shared__ unsigned tile[kWordsPerTile];
 
     const unsigned tid = threadIdx.x;
-    const unsigned row16_block = blockIdx.y;
+    const unsigned n256 = blockIdx.y;
     const unsigned k128 = blockIdx.x;
     const unsigned k128_blocks = cols / kColsPerTile;
     const unsigned row_words = cols / 8;
     (void)rows;
 
-    const auto baseline_tile_layout =
-        make_layout(make_shape(C<16>{}, C<16>{}),
-                    make_stride(_1{}, row_words));
-    const size_t baseline_base =
-        static_cast<size_t>(row16_block) * kRowsPerTile * row_words +
-        k128 * 16;
     for (unsigned idx = tid; idx < kWordsPerTile; idx += blockDim.x) {
-        tile[idx] = input[baseline_base + baseline_tile_layout(idx)];
-    }
-    __syncthreads();
-
-    const auto source_tile_layout =
-        make_layout(make_shape(make_shape(C<4>{}, C<16>{}), C<4>{}),
-                    make_stride(make_stride(C<4>{}, C<16>{}), _1{}));
-    const auto destination_tile_layout =
-        make_layout(make_shape(make_shape(C<4>{}, C<16>{}), C<4>{}),
-                    make_stride(make_stride(_1{}, C<4>{}), C<64>{}));
-
-    const size_t destination_base =
-        static_cast<size_t>(row16_block) * 256 * k128_blocks + k128 * 256;
-    for (unsigned idx = tid; idx < kWordsPerTile; idx += blockDim.x) {
-        output[destination_base + destination_tile_layout(idx)] =
-            quantization::fp4::PetitFormat(tile[source_tile_layout(idx)]);
-    }
-}
-
-__global__ void RepackPetitMxFp4MoeScalesKernel(unsigned *__restrict__ output,
-                                                const unsigned *__restrict__ input,
-                                                unsigned rows,
-                                                unsigned scale_cols) {
-    using namespace causalflow::tal;
-    static constexpr unsigned kRowsPerTile = 256;
-    static constexpr unsigned kScalesPerTile = 4;
-    static constexpr unsigned kBytesPerTile = kRowsPerTile * kScalesPerTile;
-    __shared__ unsigned char tile[kBytesPerTile];
-
-    const unsigned tid = threadIdx.x;
-    const unsigned n256 = blockIdx.y;
-    const unsigned kblock = blockIdx.x;
-    const unsigned kblocks = scale_cols / kScalesPerTile;
-    const auto *in_bytes = reinterpret_cast<const unsigned char *>(input);
-    auto *out_bytes = reinterpret_cast<unsigned char *>(output);
-    (void)rows;
-
-    for (unsigned idx = tid; idx < kBytesPerTile; idx += blockDim.x) {
-        const unsigned tile_row = idx / kScalesPerTile;
-        const unsigned tile_col = idx % kScalesPerTile;
+        const unsigned tile_row = idx / 16;
+        const unsigned tile_word_col = idx % 16;
         const unsigned row = n256 * kRowsPerTile + tile_row;
-        const unsigned scale_col = kblock * kScalesPerTile + tile_col;
-        tile[idx] = in_bytes[static_cast<size_t>(row) * scale_cols + scale_col];
+        const unsigned word_col = k128 * 16 + tile_word_col;
+        tile[idx] = input[static_cast<size_t>(row) * row_words + word_col];
     }
     __syncthreads();
 
     const auto input_tile_layout = make_layout(
-        make_shape(make_shape(C<4>{}, C<4>{}), C<4>{},
+        make_shape(make_shape(C<4>{}, C<16>{}, C<4>{}),
                    make_shape(C<4>{}, C<4>{})),
-        make_stride(make_stride(C<4>{}, _1{}), C<256>{},
-                    make_stride(C<16>{}, C<64>{})));
+        make_stride(make_stride(_1{}, C<16>{}, C<4>{}),
+                    make_stride(C<256>{}, C<1024>{})));
     const auto output_tile_layout = make_layout(
-        make_shape(make_shape(C<4>{}, C<4>{}), C<4>{},
+        make_shape(make_shape(C<4>{}, C<16>{}, C<4>{}),
                    make_shape(C<4>{}, C<4>{})),
-        make_stride(make_stride(_1{}, C<4>{}), C<16>{},
-                    make_stride(C<64>{}, C<256>{})));
-
-    for (unsigned idx = tid; idx < kBytesPerTile; idx += blockDim.x) {
+        make_stride(make_stride(C<64>{}, C<4>{}, _1{}),
+                    make_stride(256 * k128_blocks, 1024 * k128_blocks)));
+    for (unsigned idx = tid; idx < kWordsPerTile; idx += blockDim.x) {
         const size_t output_base =
-            static_cast<size_t>(n256) * 1024 * kblocks + kblock * 1024;
-        out_bytes[output_base + output_tile_layout(idx)] =
-            tile[input_tile_layout(idx)];
+            static_cast<size_t>(n256) * 4096 * k128_blocks + k128 * 256;
+        output[output_base + output_tile_layout(idx)] =
+            quantization::fp4::PetitFormat(tile[input_tile_layout(idx)]);
     }
 }
 
-__global__ void RepackBf16MxFp4CDNA4ScalesKernel(unsigned *__restrict__ output,
-                                                 const unsigned *__restrict__ input,
-                                                 unsigned rows,
-                                                 unsigned scale_cols) {
+__global__ void RepackNativeMxFp4ScalesKernel(
+    unsigned *__restrict__ output, const unsigned *__restrict__ input,
+    unsigned rows, unsigned scale_cols) {
     using namespace causalflow::tal;
-    static constexpr unsigned kRowsPerTile = 256;
-    static constexpr unsigned kScalesPerTile = 4;
-    static constexpr unsigned kBytesPerTile = kRowsPerTile * kScalesPerTile;
-    __shared__ unsigned char tile[kBytesPerTile];
-
-    const unsigned tid = threadIdx.x;
-    const unsigned n256 = blockIdx.y;
-    const unsigned k128 = blockIdx.x;
-    const unsigned k128_blocks = scale_cols / kScalesPerTile;
-    const auto *in_bytes = reinterpret_cast<const unsigned char *>(input);
+    static constexpr unsigned kRowsPerTile = 32;
+    static constexpr unsigned kScalesPerTile = 8;
+    static constexpr unsigned kBytesPerTile =
+        kRowsPerTile * kScalesPerTile;
+    const unsigned idx = threadIdx.x;
+    const unsigned n32 = blockIdx.y;
+    const unsigned k256 = blockIdx.x;
+    const unsigned k256_blocks = scale_cols / kScalesPerTile;
+    const unsigned src_base =
+        n32 * kRowsPerTile * scale_cols + k256 * kScalesPerTile;
+    const unsigned dst_base =
+        (n32 * k256_blocks + k256) * kBytesPerTile;
+    const auto src = make_layout(
+        make_shape(make_shape(C<2>{}, C<16>{}),
+                   make_shape(C<2>{}, C<4>{})),
+        make_stride(make_stride(16 * scale_cols, scale_cols),
+                    make_stride(C<4>{}, _1{})));
+    const auto dst = make_layout(
+        make_shape(make_shape(C<2>{}, C<16>{}),
+                   make_shape(C<2>{}, C<4>{})),
+        make_stride(make_stride(_1{}, C<4>{}),
+                    make_stride(C<2>{}, C<64>{})));
+    auto *out = reinterpret_cast<unsigned char *>(output);
+    const auto *in = reinterpret_cast<const unsigned char *>(input);
     (void)rows;
+    out[dst_base + dst(idx)] = in[src_base + src(idx)];
+}
 
-    for (unsigned idx = tid; idx < kBytesPerTile; idx += blockDim.x) {
-        const unsigned tile_row = idx / kScalesPerTile;
-        const unsigned tile_col = idx % kScalesPerTile;
-        const unsigned row = n256 * kRowsPerTile + tile_row;
-        const unsigned scale_col = k128 * kScalesPerTile + tile_col;
-        tile[idx] = in_bytes[static_cast<size_t>(row) * scale_cols + scale_col];
-    }
-    __syncthreads();
-
-    const unsigned out_words_per_tile = kBytesPerTile / sizeof(unsigned);
-    const auto input_tile_layout =
-        make_layout(make_shape(C<4>{}, C<4>{}, C<16>{}, C<4>{}),
-                    make_stride(C<256>{}, C<64>{}, C<4>{}, _1{}));
-    const auto output_tile_layout =
-        make_layout(make_shape(C<16>{}, C<4>{}, C<4>{}),
-                    make_stride(_1{}, C<16>{}, C<64>{}));
-    for (unsigned idx = tid; idx < out_words_per_tile; idx += blockDim.x) {
-        const unsigned wid = idx / 64;
-        const unsigned k32 = (idx % 64) / 16;
-        const unsigned n16 = idx % 16;
-        unsigned word = 0;
-        for (unsigned n_iter = 0; n_iter < 4; ++n_iter) {
-            word |= static_cast<unsigned>(
-                        tile[input_tile_layout(
-                            make_coord(n_iter, wid, n16, k32))])
-                    << (8 * n_iter);
-        }
-        const size_t output_base =
-            static_cast<size_t>(n256) * 256 * k128_blocks + k128 * 256;
-        output[output_base + output_tile_layout(idx)] = word;
-    }
+__global__ void RepackPetitMxFp4ScalesKernel(
+    unsigned *__restrict__ output, const unsigned *__restrict__ input,
+    unsigned rows, unsigned scale_cols) {
+    using namespace causalflow::tal;
+    static constexpr unsigned kRowsPerTile = 32;
+    static constexpr unsigned kScalesPerTile = 8;
+    static constexpr unsigned kBytesPerTile =
+        kRowsPerTile * kScalesPerTile;
+    const unsigned idx = threadIdx.x;
+    const unsigned n32 = blockIdx.y;
+    const unsigned k256 = blockIdx.x;
+    const unsigned k256_blocks = scale_cols / kScalesPerTile;
+    const unsigned src_base =
+        n32 * kRowsPerTile * scale_cols + k256 * kScalesPerTile;
+    const unsigned dst_base =
+        (n32 * k256_blocks + k256) * kBytesPerTile;
+    const auto src = make_layout(make_shape(C<8>{}, C<4>{}, C<8>{}),
+                                 make_stride(4 * scale_cols, scale_cols, _1{}));
+    const auto dst = make_layout(make_shape(C<8>{}, C<4>{}, C<8>{}),
+                                 make_stride(C<32>{}, _1{}, C<4>{}));
+    auto *out = reinterpret_cast<unsigned char *>(output);
+    const auto *in = reinterpret_cast<const unsigned char *>(input);
+    (void)rows;
+    out[dst_base + dst(idx)] = in[src_base + src(idx)];
 }
 
 hipError_t ApplyElementwiseMultiply(const __hip_bfloat16 *a,
@@ -559,19 +513,18 @@ hipError_t ScatterWeightedRoutes(const __hip_bfloat16 *route_out,
     return hipGetLastError();
 }
 
-hipError_t RepackBf16BiasDppLayout(__hip_bfloat16 *output,
-                                   const __hip_bfloat16 *input, unsigned rows,
-                                   unsigned cols, hipStream_t stream) {
+hipError_t RepackMxFp4Bias(__hip_bfloat16 *output,
+                           const __hip_bfloat16 *input, unsigned rows,
+                           unsigned cols, hipStream_t stream) {
     static constexpr unsigned kThreads = 256;
     if (output == nullptr || input == nullptr || rows == 0 || cols == 0) {
         return hipErrorInvalidValue;
     }
 
-    static constexpr unsigned kColsPerTile = 512;
+    static constexpr unsigned kColsPerTile = 256;
     const dim3 block(kThreads);
     const dim3 grid(tal::CeilingDiv<unsigned>(cols, kColsPerTile), rows);
-    RepackBf16BiasDppLayoutKernel<<<grid, block, 0, stream>>>(output, input,
-                                                              rows, cols);
+    RepackBf16BiasKernel<<<grid, block, 0, stream>>>(output, input, rows, cols);
     return hipGetLastError();
 }
 
@@ -594,8 +547,8 @@ hipError_t DequantizeShuffledBlockScaleFp8(const unsigned char *q,
 }
 
 hipError_t RepackNativeMxFp4Weights(unsigned *output, const unsigned *input,
-                                       unsigned rows, unsigned cols,
-                                       hipStream_t stream) {
+                                    unsigned rows, unsigned cols,
+                                    hipStream_t stream) {
     static constexpr unsigned kRowsPerTile = 256;
     static constexpr unsigned kColsPerTile = 128;
     static constexpr unsigned kThreads = 256;
@@ -606,68 +559,58 @@ hipError_t RepackNativeMxFp4Weights(unsigned *output, const unsigned *input,
 
     const dim3 block(kThreads);
     const dim3 grid(cols / kColsPerTile, rows / kRowsPerTile);
-    RepackBf16MxFp4CDNA4WeightsKernel<<<grid, block, 0, stream>>>(output, input,
-                                                                  rows, cols);
+    RepackNativeMxFp4WeightsKernel<<<grid, block, 0, stream>>>(
+        output, input, rows, cols);
     return hipGetLastError();
 }
 
 hipError_t RepackNativeMxFp4Scales(unsigned *output, const unsigned *input,
-                                      unsigned rows, unsigned scale_cols,
-                                      hipStream_t stream) {
-    static constexpr unsigned kRowsPerTile = 256;
-    static constexpr unsigned kScalesPerTile = 4;
+                                   unsigned rows, unsigned scale_cols,
+                                   hipStream_t stream) {
     static constexpr unsigned kThreads = 256;
-    if (output == nullptr || input == nullptr || rows % kRowsPerTile != 0 ||
-        scale_cols % kScalesPerTile != 0) {
+    if (output == nullptr || input == nullptr || rows % 32 != 0 ||
+        scale_cols % 8 != 0) {
         return hipErrorInvalidValue;
     }
 
     const dim3 block(kThreads);
-    const dim3 grid(scale_cols / kScalesPerTile, rows / kRowsPerTile);
-    RepackBf16MxFp4CDNA4ScalesKernel<<<grid, block, 0, stream>>>(
+    const dim3 grid(scale_cols / 8, rows / 32);
+    RepackNativeMxFp4ScalesKernel<<<grid, block, 0, stream>>>(
         output, input, rows, scale_cols);
     return hipGetLastError();
 }
 
 hipError_t RepackPetitMxFp4Weights(unsigned *output, const unsigned *input,
-                                     unsigned rows, unsigned cols,
-                                     hipStream_t stream) {
-    static constexpr unsigned kRowsPerTile = 16;
+                                   unsigned rows, unsigned cols,
+                                   hipStream_t stream) {
+    static constexpr unsigned kRowsPerTile = 256;
     static constexpr unsigned kColsPerTile = 128;
     static constexpr unsigned kThreads = 256;
-    if (output == nullptr || input == nullptr || rows == 0 ||
+    if (output == nullptr || input == nullptr ||
+        rows % kRowsPerTile != 0 ||
         cols % kColsPerTile != 0) {
         return hipErrorInvalidValue;
     }
-    if (rows % kRowsPerTile != 0) {
-        (void)stream;
-        (void)output;
-        (void)input;
-        return hipSuccess;
-    }
 
     const dim3 block(kThreads);
-    const dim3 grid(cols / kColsPerTile,
-                    tal::CeilingDiv<unsigned>(rows, kRowsPerTile));
-    RepackPetitMxFp4MoeWeightsKernel<<<grid, block, 0, stream>>>(output, input,
-                                                                 rows, cols);
+    const dim3 grid(cols / kColsPerTile, rows / kRowsPerTile);
+    RepackPetitMxFp4WeightsKernel<<<grid, block, 0, stream>>>(
+        output, input, rows, cols);
     return hipGetLastError();
 }
 
 hipError_t RepackPetitMxFp4Scales(unsigned *output, const unsigned *input,
-                                    unsigned rows, unsigned scale_cols,
-                                    hipStream_t stream) {
-    static constexpr unsigned kRowsPerTile = 256;
-    static constexpr unsigned kScalesPerTile = 4;
+                                  unsigned rows, unsigned scale_cols,
+                                  hipStream_t stream) {
     static constexpr unsigned kThreads = 256;
-    if (output == nullptr || input == nullptr || rows % kRowsPerTile != 0 ||
-        scale_cols % kScalesPerTile != 0) {
+    if (output == nullptr || input == nullptr || rows % 32 != 0 ||
+        scale_cols % 8 != 0) {
         return hipErrorInvalidValue;
     }
 
     const dim3 block(kThreads);
-    const dim3 grid(scale_cols / kScalesPerTile, rows / kRowsPerTile);
-    RepackPetitMxFp4MoeScalesKernel<<<grid, block, 0, stream>>>(
+    const dim3 grid(scale_cols / 8, rows / 32);
+    RepackPetitMxFp4ScalesKernel<<<grid, block, 0, stream>>>(
         output, input, rows, scale_cols);
     return hipGetLastError();
 }
