@@ -6,12 +6,10 @@
 
 namespace causalflow::petit::rocm::moe {
 
-// Load input activation into LDS asynchronously and then to registres.  All
-// warps have identical activations. A warp collectively uses x_u128[i*4..i*4+4]
-// to a swizzled matrix of 16 tokens x (2x32) weights. The token ids are
-// [0,8,16,24,1,9,...]. The lower and the upper half of the registers represent
-// two 16-token groups.
+// Load input activation into row-major LDS and then adapt it to the hardware
+// MFMA operand layout. Wave w owns rows [w*8, w*8+8).
 template <class Config> struct ChannelScaleFp8Input {
+    static constexpr unsigned kDim = Config::kDim;
     static constexpr unsigned kTokenBatch = Config::kTokenBatch;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kGroupDim = Config::kGroupDim;
@@ -21,31 +19,25 @@ template <class Config> struct ChannelScaleFp8Input {
     static constexpr unsigned kActivationFragments = kGroupDim / 32;
     static constexpr unsigned kScaleBlockSize = 128;
     static constexpr unsigned kRefBufferRange = (unsigned)-16;
-    static constexpr unsigned kShmInputPaddingBytes = 64 * kNumWarps;
+    static constexpr unsigned kWordsPerRow = kGroupK / sizeof(unsigned);
     static constexpr unsigned kShmInputElements =
-        kTokenBatch * kThreads + (kShmInputPaddingBytes / sizeof(unsigned));
-    static constexpr unsigned kShmInputElementsPerWarp =
-        kShmInputElements / kNumWarps;
-    static constexpr unsigned kShmInputVec4PerWarp =
-        kShmInputElementsPerWarp / (sizeof(uint4) / sizeof(unsigned));
-
-    static_assert(kShmInputElements % kNumWarps == 0, "");
-    static_assert(
-        kShmInputElementsPerWarp % (sizeof(uint4) / sizeof(unsigned)) == 0, "");
+        kTokenBatch * kNumWarps * kWordsPerRow;
+    static constexpr unsigned kScaleBlocks = kGroupK / kScaleBlockSize;
+    static constexpr unsigned kShmScaleElements =
+        kTokenBatch * kNumWarps * kScaleBlocks;
 
     __device__ void Initialize(const void *value_ptr, const void *scale_ptr,
-                               unsigned wid, unsigned m, unsigned n_blocks,
-                               unsigned dim) {
+                               unsigned wid, unsigned m, unsigned n_blocks) {
+        (void)wid;
         const unsigned *scale_act_ptr =
-            reinterpret_cast<const unsigned *>(scale_ptr) + (wid / 2) * m;
-        const unsigned value_range = m * dim;
-        const unsigned scale_range = (n_blocks - (wid / 2)) * m * sizeof(float);
-        Initialize(value_ptr, value_range, scale_act_ptr, scale_range, dim);
+            reinterpret_cast<const unsigned *>(scale_ptr);
+        const unsigned value_range = m * kDim;
+        const unsigned scale_range = n_blocks * m * sizeof(float);
+        Initialize(value_ptr, value_range, scale_act_ptr, scale_range);
     }
 
     __device__ void Initialize(const void *value_ptr, unsigned value_range,
-                               const void *scale_ptr, unsigned scale_range,
-                               unsigned dim) {
+                               const void *scale_ptr, unsigned scale_range) {
         values_.v = {
             .ptr = reinterpret_cast<uintptr_t>(value_ptr),
             .range = value_range,
@@ -56,35 +48,38 @@ template <class Config> struct ChannelScaleFp8Input {
             .range = scale_range,
             .config = BufferResource::kDataFormatU32Config,
         };
-        dim_ = dim;
         values_offset_bytes_ = 0;
         scales_offset_bytes_ = 0;
     }
 
     __device__ void FetchAsync(unsigned *shm_x, unsigned wid, unsigned wtid,
                                const unsigned tokens[kTokenBatch]) {
-        auto lds_ptr = (__attribute__((address_space(3))) unsigned *)shm_x +
-                       wid * kShmInputElementsPerWarp;
         for (int i = 0; i < kTokenBatch; i++) {
-            const unsigned src_off = tokens[i] * dim_ + values_offset_bytes_ +
+            const unsigned row = wid * kTokenBatch + i;
+            auto lds_ptr =
+                (__attribute__((address_space(3))) unsigned *)shm_x +
+                row * kWordsPerRow;
+            const unsigned src_off = tokens[i] * kDim + values_offset_bytes_ +
                                      wtid * sizeof(unsigned);
             values_.LoadLds<BufferResource::kNone, sizeof(unsigned), 0>(
                 lds_ptr, src_off, 0);
-            lds_ptr += kWarpSize;
         }
         values_offset_bytes_ += kGroupK;
     }
 
     __device__ void FetchToRegs(uint4 regs[kActivationFragments],
                                 const unsigned *shm_x, unsigned wtid) const {
-        auto x = reinterpret_cast<const uint4 *>(shm_x) +
-                 kShmInputVec4PerWarp * (wtid & 3) +
-                 ((wtid >> 2) & 3) * (kGroupK / sizeof(uint4)) +
-                 wtid / kSubGroupSize;
+        const auto *x = reinterpret_cast<const uint4 *>(shm_x);
+        const unsigned m4 = (wtid >> 2) & 3;
+        const unsigned m1 = wtid & 3;
+        const unsigned k32 = wtid / kSubGroupSize;
         static constexpr unsigned kFragmentsPerRow = kActivationFragments / 2;
         for (int i = 0; i < 2; i++) {
+            const unsigned row = i * 16 + m4 * 4 + m1;
             for (unsigned j = 0; j < kFragmentsPerRow; j++) {
-                regs[i * kFragmentsPerRow + j] = x[i * kWarpSize + j * 4];
+                const unsigned word_col = k32 * 4 + j * 16;
+                regs[i * kFragmentsPerRow + j] =
+                    x[(row * kWordsPerRow + word_col) / 4];
             }
         }
     }
@@ -94,47 +89,57 @@ template <class Config> struct ChannelScaleFp8Input {
     __device__ void FetchToRegsFP4(uint4 regs[kActivationFragments],
                                    const unsigned *shm_x,
                                    unsigned wtid) const {
-        auto x = reinterpret_cast<const uint2 *>(shm_x) +
-                 kShmInputVec4PerWarp * 2 * (wtid & 3) +
-                 ((wtid >> 2) & 3) * (kGroupK / sizeof(uint2)) +
-                 wtid / kSubGroupSize;
+        const auto *x = reinterpret_cast<const uint2 *>(shm_x);
+        const unsigned m4 = (wtid >> 2) & 3;
+        const unsigned m1 = wtid & 3;
+        const unsigned k32 = wtid / kSubGroupSize;
+        static constexpr unsigned kUint2PerRow = kGroupK / sizeof(uint2);
         auto r = reinterpret_cast<uint2 *>(regs);
         for (int i = 0; i < 2; i++) {
+            const unsigned row = i * 16 + m4 * 4 + m1;
             for (unsigned j = 0; j < kActivationFragments; j++) {
                 r[i * kActivationFragments + j] =
-                    x[i * kWarpSize * 2 + j * 4];
+                    x[row * kUint2PerRow + k32 + j * 4];
             }
         }
     }
 
     __device__ void FetchScaleAsync(float *shm_scale_x, unsigned wid,
-                                    unsigned wtid, const uint2 token_select,
+                                    unsigned wtid,
+                                    const unsigned tokens[kTokenBatch],
                                     unsigned m) {
-        (void)wtid;
-        auto lds_ptr =
-            (__attribute__((address_space(3))) unsigned *)shm_scale_x +
-            wid * kWarpSize;
-        const unsigned token_off =
-            ((wid & 1) ? token_select.y : token_select.x) * sizeof(unsigned);
-        scales_.LoadLds<BufferResource::kNone, sizeof(unsigned), 0>(
-            lds_ptr, token_off, scales_offset_bytes_);
+        static constexpr unsigned kScaleLoadLanes =
+            kTokenBatch * kScaleBlocks;
+        static_assert(kScaleLoadLanes == 16, "scale load uses one lane row");
+        if (wtid < kScaleLoadLanes) {
+            const unsigned local_row = wtid / kScaleBlocks;
+            const unsigned scale_block = wtid % kScaleBlocks;
+            auto lds_ptr =
+                (__attribute__((address_space(3))) unsigned *)shm_scale_x +
+                wid * kTokenBatch * kScaleBlocks;
+            const unsigned token_off =
+                (scale_block * m + tokens[local_row]) * sizeof(unsigned);
+            scales_.LoadLds<BufferResource::kNone, sizeof(unsigned), 0>(
+                lds_ptr, token_off, scales_offset_bytes_);
+        }
         scales_offset_bytes_ +=
             m * (kGroupDim / kScaleBlockSize) * sizeof(float);
     }
 
     __device__ float4 FetchScaleToReg(const float *shm_scale_x,
                                       unsigned tid) const {
-        float4 r{0, 0, 0, 0};
-        float *u = reinterpret_cast<float *>(&r);
-        for (unsigned i = 0; i < 4; i++) {
-            u[i] = shm_scale_x[tid + i * kWarpSize];
-        }
-        return r;
+        const unsigned m4 = (tid >> 2) & 3;
+        const unsigned m1 = tid & 3;
+        const unsigned row0 = m4 * 4 + m1;
+        const unsigned row1 = 16 + row0;
+        return float4{shm_scale_x[row0 * kScaleBlocks],
+                      shm_scale_x[row1 * kScaleBlocks],
+                      shm_scale_x[row0 * kScaleBlocks + 1],
+                      shm_scale_x[row1 * kScaleBlocks + 1]};
     }
 
     BufferResource values_;
     BufferResource scales_;
-    unsigned dim_;
     unsigned values_offset_bytes_ = 0;
     unsigned scales_offset_bytes_ = 0;
 };

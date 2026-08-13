@@ -62,9 +62,17 @@
 #define HAS_AMD_SCHED_GROUP_BARRIER 0
 #endif
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__) &&                  \
+    __has_builtin(__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
+#define HAS_AMD_SCALE_FP4_MFMA 1
+#else
+#define HAS_AMD_SCALE_FP4_MFMA 0
+#endif
+
 namespace causalflow::petit::rocm {
 
 typedef int v4i __attribute__((ext_vector_type(4)));
+typedef int v8i __attribute__((ext_vector_type(8)));
 typedef int v2i __attribute__((ext_vector_type(2)));
 typedef _Float16 v4h __attribute__((ext_vector_type(4)));
 typedef float v4f __attribute__((ext_vector_type(4)));
@@ -91,6 +99,14 @@ __device__ void llvm_amdgcn_raw_buffer_store_v4i32(
     v4i data, v4i rsrc, int voffset, int soffset,
     int aux) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
 
+__device__ void llvm_amdgcn_raw_buffer_store_v2i32(
+    v2i data, v4i rsrc, int voffset, int soffset,
+    int aux) __asm("llvm.amdgcn.raw.buffer.store.v2i32");
+
+__device__ void llvm_amdgcn_raw_buffer_store_i32(
+    int data, v4i rsrc, int voffset, int soffset,
+    int aux) __asm("llvm.amdgcn.raw.buffer.store.i32");
+
 __device__ v2i llvm_amdgcn_raw_buffer_load_v2i32(
     v4i rsrc, int voffset, int soffset,
     int aux) __asm("llvm.amdgcn.raw.buffer.load.v2i32");
@@ -98,6 +114,14 @@ __device__ v2i llvm_amdgcn_raw_buffer_load_v2i32(
 __device__ int llvm_amdgcn_raw_buffer_load_i32(
     v4i rsrc, int voffset, int soffset,
     int aux) __asm("llvm.amdgcn.raw.buffer.load.i32");
+
+__device__ int llvm_amdgcn_raw_buffer_atomic_add_i32(
+    int data, v4i rsrc, int voffset, int soffset,
+    int aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
+
+__device__ long llvm_amdgcn_raw_buffer_atomic_add_i64(
+    long data, v4i rsrc, int voffset, int soffset,
+    int aux) __asm("llvm.amdgcn.raw.buffer.atomic.add");
 
 __device__ static inline float2 amdgcn_pk_mul_f32(float2 a, float2 b) {
     v2f ret =
@@ -130,6 +154,28 @@ __device__ inline unsigned amdgcn_perm_b32(unsigned hi, unsigned lo,
 
 __device__ inline int amdgcn_ds_permute_b32(int index, int src) {
     return __builtin_amdgcn_ds_permute(index, src);
+}
+
+__device__ static inline unsigned amdgcn_cvt_pk_bf16_f32(float a, float b) {
+#if defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__)
+    unsigned packed;
+    asm("v_cvt_pk_bf16_f32 %0, %1, %2"
+        : "=v"(packed)
+        : "v"(a), "v"(b));
+    return packed;
+#else
+    const unsigned a_bits = __builtin_bit_cast(unsigned, a);
+    const unsigned b_bits = __builtin_bit_cast(unsigned, b);
+    const unsigned a_rounded =
+        (a_bits & 0x7fffffffu) > 0x7f800000u
+            ? 0x7fff0000u
+            : a_bits + 0x7fffu + ((a_bits >> 16) & 1u);
+    const unsigned b_rounded =
+        (b_bits & 0x7fffffffu) > 0x7f800000u
+            ? 0x7fff0000u
+            : b_bits + 0x7fffu + ((b_bits >> 16) & 1u);
+    return (a_rounded >> 16) | (b_rounded & 0xffff0000u);
+#endif
 }
 
 template <bool kWordHi>
@@ -212,6 +258,25 @@ __device__ static inline float4 mma_m16n16k32_fp8_fp8_f32(uint2 fa, uint2 fb,
 #endif
 }
 
+__device__ static inline float4 mma_m16n16k128_fp8_fp8_f32(const uint2 *fa,
+                                                           const uint2 *fb,
+                                                           float4 c) {
+#if HAS_AMD_SCALE_FP4_MFMA
+    v4f ret = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+        *reinterpret_cast<const v8i *>(fa), *reinterpret_cast<const v8i *>(fb),
+        *reinterpret_cast<v4f *>(&c), 0, 0, 0, 0, 0, 0);
+    return reinterpret_cast<const float4 &>(ret);
+#elif HAS_AMD_FP8_MFMA
+    c = mma_m16n16k32_fp8_fp8_f32(fa[0], fb[0], c);
+    c = mma_m16n16k32_fp8_fp8_f32(fa[1], fb[1], c);
+    c = mma_m16n16k32_fp8_fp8_f32(fa[2], fb[2], c);
+    c = mma_m16n16k32_fp8_fp8_f32(fa[3], fb[3], c);
+    return c;
+#else
+    return {0, 0, 0, 0};
+#endif
+}
+
 __device__ static inline float4 mma_m16n16k32_bf8_fp8_f32(uint2 fa, uint2 fb,
                                                           float4 c) {
 #if HAS_AMD_BF8_FP8_MFMA
@@ -235,6 +300,28 @@ __device__ static inline float4 mma_m16n16k32_fp8_bf8_f32(uint2 fa, uint2 fb,
     return *reinterpret_cast<const float4 *>(&ret);
 #else
     return {0, 0, 0, 0};
+#endif
+}
+
+template <int kOpSelA, int kOpSelB>
+__device__ static inline float4
+mma_scale_m16n16k128_fp4_fp4_f32(uint4 fa, unsigned scale_a, uint4 fb,
+                                 unsigned scale_b, float4 c) {
+#if HAS_AMD_SCALE_FP4_MFMA
+    const auto a = reinterpret_cast<const v4i &>(fa);
+    const auto b = reinterpret_cast<const v4i &>(fb);
+    v4f ret = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+        v8i{a[0], a[1], a[2], a[3], 0, 0, 0, 0},
+        v8i{b[0], b[1], b[2], b[3], 0, 0, 0, 0},
+        reinterpret_cast<const v4f &>(c), 4, 4, kOpSelA, scale_a, kOpSelB,
+        scale_b);
+    return reinterpret_cast<const float4 &>(ret);
+#else
+    (void)fa;
+    (void)scale_a;
+    (void)fb;
+    (void)scale_b;
+    return c;
 #endif
 }
 
@@ -272,7 +359,20 @@ __device__ static inline v16f mma_m32n32k8_bf16(uint2 fa, uint2 fb, v16f c) {
 // details.
 union BufferResource {
     static constexpr unsigned kDataFormatU32Config = 4 << 15;
-    enum { kNone = 0, kGLCBit = 1 << 0, kSLCBit = 1 << 1 };
+    enum {
+        kNone = 0,
+        // gfx94+: bit 0 = SC0, bit 1 = NT, bit 3 = SWZ, bit 4 = SC1.
+        // Keep the legacy GLC/SLC names for existing call sites.
+        kSC0Bit = 1 << 0,
+        kNTBit = 1 << 1,
+        kSWZBit = 1 << 3,
+        kSC1Bit = 1 << 4,
+        kGLCBit = kSC0Bit,
+        kSLCBit = kNTBit,
+    };
+
+    static constexpr unsigned kAtomicScopeAgent = kNone;
+    static constexpr unsigned kAtomicScopeSystem = kSC1Bit;
 
     v4i content;
     struct {
@@ -302,10 +402,38 @@ union BufferResource {
     }
 
     template <int kAux>
+    __device__ inline void StoreU64(int voffset, int soffset, uint2 data) const {
+        v2i v = *reinterpret_cast<const v2i *>(&data);
+        llvm_amdgcn_raw_buffer_store_v2i32(v, content, voffset, soffset, kAux);
+    }
+
+    template <int kAux>
     __device__ inline unsigned LoadU32(int voffset, int soffset) const {
         int v =
             llvm_amdgcn_raw_buffer_load_i32(content, voffset, soffset, kAux);
         return static_cast<unsigned>(v);
+    }
+
+    template <int kAux>
+    __device__ inline void StoreU32(int voffset, int soffset,
+                                    unsigned data) const {
+        llvm_amdgcn_raw_buffer_store_i32(static_cast<int>(data), content,
+                                         voffset, soffset, kAux);
+    }
+
+    template <int kAux>
+    __device__ inline int AtomicAddI32(int voffset, int soffset,
+                                       int data) const {
+        return llvm_amdgcn_raw_buffer_atomic_add_i32(data, content, voffset,
+                                                     soffset, kAux);
+    }
+
+    template <int kAux>
+    __device__ inline unsigned long long
+    AtomicAddU64(int voffset, int soffset, unsigned long long data) const {
+        return static_cast<unsigned long long>(
+            llvm_amdgcn_raw_buffer_atomic_add_i64(
+                static_cast<long>(data), content, voffset, soffset, kAux));
     }
 
     template <int kAux, int kSize, int kOffset>
@@ -321,8 +449,17 @@ union BufferResource {
 // eliminate the branches.
 template <class T>
 __device__ static inline T *GetConditionShmPtr(T *ptr, bool cond) {
-    static constexpr unsigned kMaxShmSize = 64 * 1024;
+    static constexpr unsigned kMaxShmSize = 160 * 1024;
     return cond ? ptr : reinterpret_cast<T *>(kMaxShmSize);
+}
+
+template <class T>
+__device__ static inline __attribute__((address_space(3))) T *
+GetConditionShmPtr(__attribute__((address_space(3))) T *ptr, bool cond) {
+    static constexpr unsigned kMaxShmSize = 160 * 1024;
+    return cond ? ptr
+                : reinterpret_cast<__attribute__((address_space(3))) T *>(
+                      kMaxShmSize);
 }
 
 template <int kVmCnt = -1, int kExpCnt = -1, int kLgkmCnt = -1>

@@ -32,6 +32,8 @@ enum class FusedMoEStages : unsigned {
 
 enum class FusedMoEMfmaShape : unsigned {
     kMfmaFp816x16x32,
+    kMfmaBf16MxFp4,
+    kMfmaScaleFp4MxFp4,
 };
 
 enum class FusedMoEActivationFunction : unsigned {
@@ -53,7 +55,41 @@ struct FusedMoESolutionId {
     FusedMoEStages stages : 4;
     FusedMoEActivationFunction activation : 3;
     FusedMoEStage1Buffering stage1_buffering : 1;
-    unsigned long padding : 40;
+    unsigned long dim_div64 : 8;
+    unsigned long inter_dim_div64 : 8;
+    unsigned long padding : 24;
+
+    static constexpr unsigned kShapeAlignment = 64;
+    static constexpr unsigned kMaxShapeDiv64 = 0xff;
+
+    constexpr unsigned Dim() const { return dim_div64 * kShapeAlignment; }
+    constexpr unsigned InterDim() const {
+        return inter_dim_div64 * kShapeAlignment;
+    }
+
+    static constexpr bool IsShapeEncodable(unsigned dim, unsigned inter_dim) {
+        return dim != 0 && inter_dim != 0 && dim % kShapeAlignment == 0 &&
+               inter_dim % kShapeAlignment == 0 &&
+               dim / kShapeAlignment <= kMaxShapeDiv64 &&
+               inter_dim / kShapeAlignment <= kMaxShapeDiv64;
+    }
+
+    constexpr FusedMoESolutionId WithShape(unsigned dim,
+                                           unsigned inter_dim) const {
+        return FusedMoESolutionId{
+            act_dtype,
+            weight_dtype,
+            bias_dtype,
+            weight_ordering,
+            mfma,
+            stages,
+            activation,
+            stage1_buffering,
+            dim / kShapeAlignment,
+            inter_dim / kShapeAlignment,
+            0,
+        };
+    }
 
     constexpr unsigned long Repr() const {
         return (static_cast<unsigned long>(act_dtype) << 0) |
@@ -63,7 +99,9 @@ struct FusedMoESolutionId {
                (static_cast<unsigned long>(mfma) << 14) |
                (static_cast<unsigned long>(stages) << 16) |
                (static_cast<unsigned long>(activation) << 20) |
-               (static_cast<unsigned long>(stage1_buffering) << 23);
+               (static_cast<unsigned long>(stage1_buffering) << 23) |
+               (static_cast<unsigned long>(dim_div64) << 24) |
+               (static_cast<unsigned long>(inter_dim_div64) << 32);
     }
 
     static constexpr FusedMoESolutionId FromRepr(unsigned long repr) {
@@ -76,6 +114,24 @@ struct FusedMoESolutionId {
             static_cast<FusedMoEStages>((repr >> 16) & 0xf),
             static_cast<FusedMoEActivationFunction>((repr >> 20) & 0x7),
             static_cast<FusedMoEStage1Buffering>((repr >> 23) & 0x1),
+            (repr >> 24) & 0xff,
+            (repr >> 32) & 0xff,
+            0,
+        };
+    }
+
+    static constexpr FusedMoESolutionId
+    MakeBase(FusedMoEDataType act_dtype, FusedMoEDataType weight_dtype,
+             FusedMoEDataType bias_dtype,
+             FusedMoEWeightOrdering weight_ordering, FusedMoEMfmaShape mfma,
+             FusedMoEStages stages, FusedMoEActivationFunction activation,
+             FusedMoEStage1Buffering stage1_buffering) {
+        return FusedMoESolutionId{
+            act_dtype,  weight_dtype,
+            bias_dtype, weight_ordering,
+            mfma,       stages,
+            activation, stage1_buffering,
+            0,          0,
             0,
         };
     }
