@@ -3,18 +3,33 @@
 #include "moe/rocm/memory_ops.cuh"
 
 #include <hip/hip_runtime.h>
+#include <type_traits>
 
 namespace causalflow::petit::rocm::moe {
 
+template <class Config, class = void> struct MxFp4ConfigWeightLayouts {
+    static constexpr MxFp4TileShape kW13 = MxFp4TileShape::kN256;
+    static constexpr MxFp4TileShape kW2 = MxFp4TileShape::kN256;
+};
+
+template <class Config>
+struct MxFp4ConfigWeightLayouts<Config,
+                                std::void_t<decltype(Config::kW13TileShape),
+                                            decltype(Config::kW2TileShape)>> {
+    static constexpr MxFp4TileShape kW13 = Config::kW13TileShape;
+    static constexpr MxFp4TileShape kW2 = Config::kW2TileShape;
+};
+
 template <class Config> struct MxFp4WeightConfig {
-    using W13 = MxFp4WeightLayout<Config::kNumWarps, Config::kGroupDim>;
-    using W2 = MxFp4WeightLayout<Config::kNumWarps, Config::kGroupN>;
+    using Layouts = MxFp4ConfigWeightLayouts<Config>;
+    using W13 = MxFp4WeightLayout<Config::kNumWarps, Layouts::kW13>;
+    using W2 = MxFp4WeightLayout<Config::kNumWarps, Layouts::kW2>;
 
     static constexpr unsigned kScaleGroupK = 128;
     static constexpr unsigned kScaleGroupN = 64;
     static constexpr unsigned kWeightVecSize = sizeof(uint4) * 2;
-    static constexpr unsigned kScaleGroupsPerOutputTile =
-        Config::kGroupN / kScaleGroupN;
+    static constexpr unsigned kW13ScaleGroupsPerOutputTile =
+        W13::kGroupN / kScaleGroupN;
     static constexpr unsigned kScaleBytesPerWord =
         sizeof(unsigned) / sizeof(unsigned char);
     static constexpr unsigned kScaleWordBytes = sizeof(unsigned);
@@ -28,9 +43,8 @@ template <class Config> struct MxFp4W13 {
     static constexpr unsigned kScaleGroupN = Traits::kScaleGroupN;
     static constexpr unsigned kWeightVecSize = Traits::kWeightVecSize;
     static constexpr unsigned kScaleGroupsPerOutputTile =
-        Traits::kScaleGroupsPerOutputTile;
-    static constexpr unsigned kScaleBytesPerWord =
-        Traits::kScaleBytesPerWord;
+        Traits::kW13ScaleGroupsPerOutputTile;
+    static constexpr unsigned kScaleBytesPerWord = Traits::kScaleBytesPerWord;
     static constexpr unsigned kScaleWordBytes = Traits::kScaleWordBytes;
 
     __device__ void Initialize(const uint4 *w13_base,
@@ -46,9 +60,9 @@ template <class Config> struct MxFp4W13 {
             (2 * dim * inter_dim) / kRowGroupSize / kScaleBytesPerWord;
         const unsigned scale_words_per_k_tile =
             (dim / kScaleGroupK) * kScaleGroupsPerOutputTile * kWarpSize;
-        const unsigned *scale_w1_ptr =
-            scales_w13 + expert_id * w13_scale_words_per_expert +
-            tile_k * scale_words_per_k_tile;
+        const unsigned *scale_w1_ptr = scales_w13 +
+                                       expert_id * w13_scale_words_per_expert +
+                                       tile_k * scale_words_per_k_tile;
         const unsigned w13_value_range = W13::kGroupN * dim / 2;
         const unsigned w13_scale_range =
             scale_words_per_k_tile * kScaleWordBytes;
@@ -68,12 +82,12 @@ template <class Config> struct MxFp4W2 {
     using W2 = typename Traits::W2;
 
     static constexpr unsigned kWeightVecSize = Traits::kWeightVecSize;
-    static constexpr unsigned kScaleBytesPerWord =
-        Traits::kScaleBytesPerWord;
+    static constexpr unsigned kScaleBytesPerWord = Traits::kScaleBytesPerWord;
     static constexpr unsigned kScaleWordBytes = Traits::kScaleWordBytes;
 
     __device__ void Initialize(const uint4 *w2, const unsigned *scales_w2,
-                               unsigned expert_id, unsigned tile_k) {
+                               unsigned expert_id, unsigned tile_n,
+                               unsigned tile_k) {
         static constexpr unsigned kRowGroupSize = W2::kRowGroupSize;
         static constexpr unsigned kDim = Config::kDim;
         static constexpr unsigned kInterDim = Config::kInterDim;
@@ -81,18 +95,22 @@ template <class Config> struct MxFp4W2 {
         const unsigned scale_words_per_expert =
             kDim * kInterDim / kRowGroupSize / kScaleBytesPerWord;
         const unsigned value_tile_offset =
+            tile_n * W2::kGroupN * kInterDim / 2 +
             tile_k * 2 * kWarpSize * sizeof(uint4);
-        const unsigned scale_tile_offset = tile_k * kWarpSize;
+        const unsigned scale_tile_offset =
+            tile_n * W2::kGroupN * kInterDim / kRowGroupSize /
+                kScaleBytesPerWord +
+            tile_k * kWarpSize;
         const auto *value_ptr = reinterpret_cast<const unsigned char *>(w2) +
                                 expert_id * value_bytes_per_expert +
                                 value_tile_offset;
-        const unsigned *scale_ptr =
-            scales_w2 + expert_id * scale_words_per_expert + scale_tile_offset;
-        w2_.Initialize(value_ptr, value_bytes_per_expert - value_tile_offset,
-                       scale_ptr,
-                       (scale_words_per_expert - scale_tile_offset) *
-                           kScaleWordBytes,
-                       kInterDim);
+        const unsigned *scale_ptr = scales_w2 +
+                                    expert_id * scale_words_per_expert +
+                                    scale_tile_offset;
+        w2_.Initialize(
+            value_ptr, value_bytes_per_expert - value_tile_offset, scale_ptr,
+            (scale_words_per_expert - scale_tile_offset) * kScaleWordBytes,
+            kInterDim);
     }
 
     W2 w2_;

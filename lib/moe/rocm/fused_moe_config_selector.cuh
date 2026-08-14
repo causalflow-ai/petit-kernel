@@ -9,7 +9,7 @@
 #include "memory_ops.cuh"
 #include "moe/rocm/fused_moe.cuh"
 #include "moe/rocm/ops/activation.cuh"
-#include "moe/rocm/ops/onestage_fused_moe_fp8_quantize_shuffle.cuh"
+#include "moe/rocm/ops/quantize_and_shuffle.cuh"
 #include "moe/rocm/ops/op_stages.cuh"
 #include "moe/rocm/quantization.cuh"
 #include "moe/rocm/mem/bias.cuh"
@@ -24,21 +24,53 @@
 
 namespace causalflow::petit::rocm::moe {
 
-template <FusedMoEDataType kBiasDType, unsigned kNumWarps, unsigned kGroupN>
+template <FusedMoEDataType kBiasDType, FusedMoEDataType kWeightDType,
+          FusedMoEMfmaShape kMfma, unsigned kNumWarps, unsigned kGroupN>
 struct BiasLayoutSelector;
 
-template <unsigned kNumWarps, unsigned kGroupN>
-struct BiasLayoutSelector<FusedMoEDataType::kNone, kNumWarps, kGroupN> {
+template <FusedMoEDataType kWeightDType, FusedMoEMfmaShape kMfma,
+          unsigned kNumWarps, unsigned kGroupN>
+struct BiasLayoutSelector<FusedMoEDataType::kNone, kWeightDType, kMfma,
+                          kNumWarps, kGroupN> {
     using Type = NoopBiasLayout<kNumWarps, kGroupN>;
 };
 
-template <unsigned kNumWarps, unsigned kGroupN>
-struct BiasLayoutSelector<FusedMoEDataType::kBf16, kNumWarps, kGroupN> {
-    using Type = Bf16BiasLayout<kNumWarps, kGroupN>;
+template <FusedMoEDataType, FusedMoEMfmaShape, unsigned kGroupN>
+struct BiasMemoryLayoutSelector;
+
+template <unsigned kGroupN>
+struct BiasMemoryLayoutSelector<FusedMoEDataType::kMxFp4,
+                                FusedMoEMfmaShape::kMfmaFp816x16x32,
+                                kGroupN> {
+    using Type = typename MxFp4BiasLayout<kGroupN>::Type;
 };
 
-template <FusedMoEDataType kWeightDType,
-          FusedMoEWeightOrdering kWeightOrdering, class Config>
+template <unsigned kGroupN>
+struct BiasMemoryLayoutSelector<FusedMoEDataType::kMxFp4,
+                                FusedMoEMfmaShape::kMfmaBf16MxFp4,
+                                kGroupN> {
+    using Type = typename MxFp4BiasLayout<kGroupN>::Type;
+};
+
+template <unsigned kGroupN>
+struct BiasMemoryLayoutSelector<FusedMoEDataType::kMxFp4,
+                                FusedMoEMfmaShape::kMfmaScaleFp4MxFp4,
+                                kGroupN> {
+    using Type = typename MxFp4BiasLayout<kGroupN>::Type;
+};
+
+template <FusedMoEDataType kWeightDType, FusedMoEMfmaShape kMfma,
+          unsigned kNumWarps, unsigned kGroupN>
+struct BiasLayoutSelector<FusedMoEDataType::kBf16, kWeightDType, kMfma,
+                          kNumWarps, kGroupN> {
+    using Type =
+        Bf16BiasLayout<kNumWarps, kGroupN,
+                       typename BiasMemoryLayoutSelector<
+                           kWeightDType, kMfma, kGroupN>::Type>;
+};
+
+template <FusedMoEDataType kWeightDType, FusedMoEWeightOrdering kWeightOrdering,
+          class Config>
 struct FusedMoEWeightSelector;
 
 template <class Config>
@@ -52,13 +84,19 @@ struct FusedMoEWeightSelector<FusedMoEDataType::kBlockScaleFp8,
 
     template <class Kernel>
     __device__ static void
-    InitializeWeights(Kernel &kernel, const uint4 *w13_base, const uint4 *w2,
-                      const unsigned *scales_w13, const unsigned *scales_w2,
-                      unsigned expert_id, unsigned tile_k, unsigned n_blocks,
-                      unsigned k_blocks) {
-        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id,
-                                       tile_k, n_blocks, k_blocks,
-                                       Config::kDim, Config::kInterDim);
+    InitializeW13(Kernel &kernel, const uint4 *w13_base,
+                  const unsigned *scales_w13, unsigned expert_id,
+                  unsigned tile_k, unsigned n_blocks, unsigned k_blocks) {
+        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id, tile_k,
+                                       n_blocks, k_blocks, Config::kDim,
+                                       Config::kInterDim);
+    }
+
+    template <class Kernel>
+    __device__ static void
+    InitializeW2(Kernel &kernel, const uint4 *w2,
+                 const unsigned *scales_w2, unsigned expert_id,
+                 unsigned tile_k, unsigned n_blocks, unsigned k_blocks) {
         kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k,
                                       n_blocks, k_blocks, Config::kDim,
                                       Config::kInterDim);
@@ -76,14 +114,19 @@ struct FusedMoEWeightSelector<FusedMoEDataType::kMxFp4,
 
     template <class Kernel>
     __device__ static void
-    InitializeWeights(Kernel &kernel, const uint4 *w13_base, const uint4 *w2,
-                      const unsigned *scales_w13, const unsigned *scales_w2,
-                      unsigned expert_id, unsigned tile_k,
-                      unsigned, unsigned) {
-        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id,
-                                       tile_k, Config::kDim,
-                                       Config::kInterDim);
-        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k);
+    InitializeW13(Kernel &kernel, const uint4 *w13_base,
+                  const unsigned *scales_w13, unsigned expert_id,
+                  unsigned tile_k, unsigned, unsigned) {
+        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id, tile_k,
+                                       Config::kDim, Config::kInterDim);
+    }
+
+    template <class Kernel>
+    __device__ static void
+    InitializeW2(Kernel &kernel, const uint4 *w2,
+                 const unsigned *scales_w2, unsigned expert_id,
+                 unsigned tile_k, unsigned, unsigned) {
+        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, 0, tile_k);
     }
 };
 
@@ -98,14 +141,19 @@ struct FusedMoEWeightSelector<FusedMoEDataType::kMxFp4,
 
     template <class Kernel>
     __device__ static void
-    InitializeWeights(Kernel &kernel, const uint4 *w13_base, const uint4 *w2,
-                      const unsigned *scales_w13, const unsigned *scales_w2,
-                      unsigned expert_id, unsigned tile_k,
-                      unsigned, unsigned) {
-        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id,
-                                       tile_k, Config::kDim,
-                                       Config::kInterDim);
-        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, tile_k);
+    InitializeW13(Kernel &kernel, const uint4 *w13_base,
+                  const unsigned *scales_w13, unsigned expert_id,
+                  unsigned tile_k, unsigned, unsigned) {
+        kernel.w13_weights_.Initialize(w13_base, scales_w13, expert_id, tile_k,
+                                       Config::kDim, Config::kInterDim);
+    }
+
+    template <class Kernel>
+    __device__ static void
+    InitializeW2(Kernel &kernel, const uint4 *w2,
+                 const unsigned *scales_w2, unsigned expert_id,
+                 unsigned tile_k, unsigned, unsigned) {
+        kernel.w2_weights_.Initialize(w2, scales_w2, expert_id, 0, tile_k);
     }
 };
 
@@ -181,8 +229,7 @@ struct FusedMoEStage2TilesSelector<
 };
 
 template <FusedMoEActivationFunction kActivation>
-struct FusedMoEActivationSelector {
-};
+struct FusedMoEActivationSelector {};
 
 template <>
 struct FusedMoEActivationSelector<FusedMoEActivationFunction::kSiluDot> {
@@ -210,7 +257,8 @@ struct FusedMoEStage1OpSelector<FusedMoEStage1Buffering::kDoubleBuffer,
     using Type = OnestageFusedMoEStage1DoubleBufferOp<Stage1Tiles>;
 };
 
-template <FusedMoEDataType kActDType, class Config> struct FusedMoEInputSelector;
+template <FusedMoEDataType kActDType, class Config>
+struct FusedMoEInputSelector;
 
 template <class Config>
 struct FusedMoEInputSelector<FusedMoEDataType::kChannelScaleFp8, Config> {
@@ -227,60 +275,31 @@ struct FusedMoEInputSelector<FusedMoEDataType::kMxFp4, Config> {
     using Type = MxFp4Input<Config>;
 };
 
-template <FusedMoEDataType kWeightDType, class Config>
-struct QuantizationShuffleReadLayoutSelector;
-
-template <class Config>
-struct QuantizationShuffleReadLayoutSelector<FusedMoEDataType::kBlockScaleFp8,
-                                             Config> {
-    static constexpr unsigned kElementsPerThread =
-        (Config::kGroupM * Config::kGroupN) / Config::kThreads;
-    static constexpr unsigned kElementsPerThreadVec4 = kElementsPerThread / 4;
-
-    using Type =
-        tal::Layout<tal::Shape<tal::C<kElementsPerThreadVec4>, tal::_2,
-                               tal::Shape<tal::C<16>,
-                                          tal::C<Config::kNumWarps>>>,
-                    tal::Stride<tal::C<2 * kWarpSize>, tal::_16,
-                                tal::Stride<tal::_1, tal::C<32>>>>;
-};
-
-template <class Config>
-struct QuantizationShuffleReadLayoutSelector<FusedMoEDataType::kMxFp4,
-                                             Config> {
-    static constexpr unsigned kElementsPerThread =
-        (Config::kGroupM * Config::kGroupN) / Config::kThreads;
-    static constexpr unsigned kElementsPerThreadVec4 = kElementsPerThread / 4;
-
-    using Type =
-        tal::Layout<tal::Shape<tal::C<kElementsPerThreadVec4>, tal::_2,
-                               tal::Shape<tal::C<16>, tal::_4>>,
-                    tal::Stride<tal::C<2 * kWarpSize>, tal::C<kWarpSize>,
-                                tal::Stride<tal::_1, tal::_16>>>;
-};
-
-template <FusedMoEDataType kWeightDType> struct HandoffSelector;
+template <FusedMoEDataType kWeightDType>
+struct Fp8QuantizeShufflePolicySelector;
 
 template <>
-struct HandoffSelector<FusedMoEDataType::kBlockScaleFp8> {
-    using Type = BlockScaleFp8Handoff;
+struct Fp8QuantizeShufflePolicySelector<
+    FusedMoEDataType::kBlockScaleFp8> {
+    using Type = BlockScaleFp8QuantizeShufflePolicy;
 };
 
-template <> struct HandoffSelector<FusedMoEDataType::kMxFp4> {
-    using Type = PetitMxFp4Handoff;
+template <>
+struct Fp8QuantizeShufflePolicySelector<FusedMoEDataType::kMxFp4> {
+    using Type = PetitMxFp4QuantizeShufflePolicy;
 };
 
 template <FusedMoEDataType kActDType, class Config>
 struct HiddenShuffleSelector {
     using Type = QuantizeAndShuffleFp8<
-        Config, typename HandoffSelector<Config::kWeightDType>::Type>;
+        Config, typename Fp8QuantizeShufflePolicySelector<
+                    Config::kWeightDType>::Type>;
 };
 
 template <class Config>
 struct HiddenShuffleSelector<FusedMoEDataType::kBf16, Config> {
     using Type =
         PackAndShuffleBf16<Config::kNumWarps, Config::kGroupN,
-                           typename Config::QuantizationShuffleReadLayout,
                            typename Config::Stage2Tiles::InputRegs>;
 };
 
@@ -288,7 +307,6 @@ template <class Config>
 struct HiddenShuffleSelector<FusedMoEDataType::kMxFp4, Config> {
     using Type =
         QuantizeAndShuffleMxFp4<Config::kNumWarps, Config::kGroupN,
-                                typename Config::QuantizationShuffleReadLayout,
                                 typename Config::Stage2Tiles::InputRegs>;
 };
 
@@ -298,6 +316,8 @@ template <FusedMoESolutionId id> struct ConfigSelector {
     static constexpr unsigned kTopK = 4;
     static_assert(FusedMoESolutionId::IsShapeEncodable(kDim, kInterDim));
     static constexpr unsigned kGroupM = 32;
+    static constexpr unsigned kStage1GroupN =
+        id.stages == FusedMoEStages::kTwoStage ? 128 : 256;
     static constexpr unsigned kGroupN = 256;
     static constexpr unsigned kGroupDim = 256;
     static constexpr unsigned kTokenBatch = 8;
@@ -308,20 +328,27 @@ template <FusedMoESolutionId id> struct ConfigSelector {
     static constexpr FusedMoEDataType kWeightDType = id.weight_dtype;
     static constexpr FusedMoEMfmaShape kMfmaShape = id.mfma;
     static constexpr bool kValidateExpertIds = false;
+    static constexpr MxFp4TileShape kW13TileShape =
+        id.stages == FusedMoEStages::kTwoStage ? MxFp4TileShape::kN128
+                                               : MxFp4TileShape::kN256;
+    static constexpr MxFp4TileShape kW2TileShape = MxFp4TileShape::kN256;
 
     using ActivationOp =
         typename FusedMoEActivationSelector<id.activation>::Type;
     using Input =
         typename FusedMoEInputSelector<id.act_dtype, ConfigSelector<id>>::Type;
-    using Weight =
-        FusedMoEWeightSelector<id.weight_dtype, id.weight_ordering,
-                               ConfigSelector<id>>;
+    using Weight = FusedMoEWeightSelector<id.weight_dtype, id.weight_ordering,
+                                          ConfigSelector<id>>;
     using W13Weights = typename Weight::W13Weights;
     using W2Weights = typename Weight::W2Weights;
     using W13 = typename W13Weights::W13;
     using W2 = typename W2Weights::W2;
     using Bias =
-        typename BiasLayoutSelector<id.bias_dtype, kNumWarps, kGroupN>::Type;
+        typename BiasLayoutSelector<id.bias_dtype, id.weight_dtype, id.mfma,
+                                    kNumWarps, kStage1GroupN>::Type;
+    using Stage2Bias =
+        typename BiasLayoutSelector<id.bias_dtype, id.weight_dtype, id.mfma,
+                                    kNumWarps, kGroupN>::Type;
     using Stage1Tiles = typename FusedMoEStage1TilesSelector<
         id.weight_dtype, id.weight_ordering, id.mfma,
         ConfigSelector<id>>::Type;
@@ -333,28 +360,34 @@ template <FusedMoESolutionId id> struct ConfigSelector {
         ConfigSelector<id>>::Type;
     using Stage2Op = OnestageFusedMoEStage2Op<Stage2Tiles>;
     using Weights = typename Weight::Weights;
-    using QuantizationShuffleReadLayout =
-        typename QuantizationShuffleReadLayoutSelector<id.weight_dtype,
-                                                       ConfigSelector<id>>::
-            Type;
     using QuantizeAndShuffleOp =
         typename HiddenShuffleSelector<id.act_dtype, ConfigSelector<id>>::Type;
 
     template <class Kernel>
     __device__ static void
-    InitializeWeights(Kernel &kernel, const uint4 *w13_base, const uint4 *w2,
-                      const unsigned *scales_w13, const unsigned *scales_w2,
-                      unsigned expert_id, unsigned tile_k, unsigned n_blocks,
-                      unsigned k_blocks) {
-        Weight::InitializeWeights(kernel, w13_base, w2, scales_w13, scales_w2,
-                                  expert_id, tile_k, n_blocks, k_blocks);
+    InitializeW13(Kernel &kernel, const uint4 *w13_base,
+                  const unsigned *scales_w13, unsigned expert_id,
+                  unsigned tile_k, unsigned n_blocks, unsigned k_blocks) {
+        Weight::InitializeW13(kernel, w13_base, scales_w13, expert_id, tile_k,
+                              n_blocks, k_blocks);
+    }
+
+    template <class Kernel>
+    __device__ static void
+    InitializeW2(Kernel &kernel, const uint4 *w2,
+                 const unsigned *scales_w2, unsigned expert_id,
+                 unsigned tile_k, unsigned n_blocks, unsigned k_blocks) {
+        Weight::InitializeW2(kernel, w2, scales_w2, expert_id, tile_k,
+                             n_blocks, k_blocks);
     }
 
     static int Invoke(FusedMoE1StageParams params) {
         static_assert(kDim % kQuantBlockK == 0);
         static_assert(kInterDim % kGroupDim == 0);
         static constexpr unsigned kSplitK = kInterDim / kGroupDim;
-        using Kernel = OnestageFusedMoEBlockScaleFP8<ConfigSelector<id>>;
+        using Epilogue =
+            OnestageFusedMoEStage1Epilogue<ConfigSelector<id>>;
+        using Kernel = FusedMoEStage1<ConfigSelector<id>, Epilogue>;
 
         if (params.out == nullptr || params.num_valid_ids == nullptr) {
             return kFusedMoEErrorInvalidArgument;
@@ -370,18 +403,13 @@ template <FusedMoESolutionId id> struct ConfigSelector {
             params.sorted_expert_ids == nullptr ||
             (params.scales_act == nullptr &&
              id.act_dtype != FusedMoEDataType::kBf16) ||
-            params.scales_w13 == nullptr ||
-            params.scales_w2 == nullptr) {
+            params.scales_w13 == nullptr || params.scales_w2 == nullptr) {
             return kFusedMoEErrorInvalidArgument;
         }
-        if (params.m == 0 || params.topk == 0 ||
-            params.max_num_m_blocks == 0) {
+        if (params.m == 0 || params.topk == 0 || params.max_num_m_blocks == 0) {
             return 0;
         }
 
-        using Kernel = OnestageFusedMoEBlockScaleFP8<ConfigSelector<id>>;
-        const unsigned split_k =
-            tal::CeilingDiv<unsigned>(params.k, kGroupDim);
         unsigned route_groups = params.max_num_m_blocks;
         unsigned persistent_route_step = 0;
         if (params.num_persistent_tgs > 0) {
@@ -412,9 +440,8 @@ template <FusedMoESolutionId id> struct ConfigSelector {
                 params.num_valid_ids, params.topk,
                 reinterpret_cast<const uint4 *>(params.scales_act),
                 reinterpret_cast<const uint4 *>(params.scales_w13),
-                params.scales_w2, params.m, num_experts,
-                persistent_route_step, params.w13_bias,
-                params.w2_bias);
+                params.scales_w2, params.m, num_experts, persistent_route_step,
+                params.w13_bias, params.w2_bias);
 
         const auto e = hipGetLastError();
         return e == hipSuccess ? 0 : kFusedMoEErrorInvalidArgument;
@@ -445,8 +472,8 @@ static constexpr FusedMoESolutionId kFusedMoEFp8PetitMxFp4SolutionId =
         FusedMoEActivationFunction::kSiluDot,
         FusedMoEStage1Buffering::kSingleBuffer);
 
-static constexpr FusedMoESolutionId
-    kFusedMoEFp8PetitMxFp4BiasSolutionId = FusedMoESolutionId::MakeBase(
+static constexpr FusedMoESolutionId kFusedMoEFp8PetitMxFp4BiasSolutionId =
+    FusedMoESolutionId::MakeBase(
         FusedMoEDataType::kChannelScaleFp8, FusedMoEDataType::kMxFp4,
         FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kPetitMxFp4,
         FusedMoEMfmaShape::kMfmaFp816x16x32, FusedMoEStages::kOneStage,

@@ -239,7 +239,13 @@ struct Bf16MxFp4Matmul : detail::MatmulTile<64, 16, 4> {
 
 };
 
-struct NativeMxFp4Matmul : detail::MatmulTile<64, 4, 4> {
+template <unsigned kTileN_>
+struct NativeMxFp4Matmul : detail::MatmulTile<kTileN_, 4, 4> {
+    using Base = detail::MatmulTile<kTileN_, 4, 4>;
+    static constexpr unsigned kActivationFragments =
+        Base::kActivationFragments;
+    static constexpr unsigned kAccumFragments = Base::kAccumFragments;
+    static constexpr unsigned kWeightFragments = Base::kWeightFragments;
 
     // With weight as operand A, lane 16*q+r owns
     // C[16*m16+r, 16*n_fragment+4*q+component]. Accumulators therefore use
@@ -262,29 +268,6 @@ struct NativeMxFp4Matmul : detail::MatmulTile<64, 4, 4> {
                         w[k128][n_fragment], scale_w[n_fragment / 2],
                         x[m16 * 2 + k128], scale_x, t[t_idx]);
                 }
-            }
-        }
-    }
-};
-
-// Staged form used by the block-wide M32xN128xK256 pipeline. Each wave owns
-// M32xN32xK256, and each call consumes one K128 half.
-struct NativeMxFp4M32N128K256Matmul : detail::MatmulTile<32, 4, 4> {
-
-    __device__ static void
-    Matmul(float4 t[kAccumFragments], const uint4 w[kWeightFragments],
-           const uint4 x[kActivationFragments], unsigned scale_x,
-           unsigned scale_w, unsigned stage) {
-#pragma unroll
-        for (unsigned n_fragment = 0; n_fragment < kWeightFragments;
-             ++n_fragment) {
-#pragma unroll
-            for (unsigned m16 = 0; m16 < 2; ++m16) {
-                const unsigned t_idx = n_fragment * 2 + m16;
-                t[t_idx] = detail::ScaledMxFp4Mfma(
-                    2 * stage + n_fragment, 2 * stage + m16,
-                    w[n_fragment], scale_w, x[m16 * 2 + stage], scale_x,
-                    t[t_idx]);
             }
         }
     }

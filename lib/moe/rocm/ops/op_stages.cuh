@@ -88,7 +88,7 @@ template <class TileOps_> struct W2TileSchedule {
     using TileOps = TileOps_;
     using Config = typename TileOps::Config;
     using Weight = typename Config::W2;
-    using Bias = typename Config::Bias;
+    using Bias = typename Config::Stage2Bias;
     using CShuffle = typename TileOps::CShuffle;
     using InputRegs = typename TileOps::InputRegs;
 
@@ -120,15 +120,17 @@ template <class TileOps_> struct W2TileSchedule {
         weight.template AdvanceStep<1, 0>();
     }
 
+    __device__ void LoadKStage(unsigned stage, unsigned tid, unsigned wid,
+                               unsigned wtid) {
+        TileOps::Load(weight, stages[stage], tid, wid, wtid);
+        weight.template AdvanceStep<0, TileOps::kKStages>();
+    }
+
     __device__ void Matmul(float4 t[kAccumFragments], const InputRegs &input,
                            unsigned stage, unsigned wtid) const {
         TileOps::Matmul(t, stages[stage], input, wtid);
     }
 
-    __device__ void AddBias(float4 t[kAccumFragments], unsigned tile_d,
-                            unsigned tid) const {
-        bias.AddToAccumulator(t, tile_d, tid);
-    }
 };
 
 template <class TileSchedule> struct OnestageFusedMoEStage1DoubleBufferOp {
@@ -186,6 +188,7 @@ template <class TileSchedule> struct OnestageFusedMoEStage1DoubleBufferOp {
             h[i] = ActivationOp::Apply(t_gate[i], t_up[i]);
         }
     }
+
 };
 
 template <class TileSchedule> struct OnestageFusedMoEStage1SingleBufferOp {
@@ -261,6 +264,27 @@ __device__ static inline uint2 ToBf16Rn(float4 m) {
                  amdgcn_cvt_pk_bf16_f32(m.z, m.w)};
 }
 
+template <class TileSchedule> struct W2AccumulatorEpilogue {
+    static constexpr unsigned kAccumFragments = TileSchedule::kAccumFragments;
+    using Bias = typename TileSchedule::Bias;
+    using BiasPrefetch = typename Bias::Prefetch;
+    using NoopBias = NoopBiasLayout<Bias::kNumWarps, Bias::kGroupN>;
+
+    __device__ static void PrefetchBias(BiasPrefetch &prefetch,
+                                        const TileSchedule &tiles,
+                                        unsigned tile_col, unsigned tid) {
+        tiles.bias.PrefetchFragments(prefetch, tile_col, tid);
+    }
+
+    template <class SelectedBias = Bias, class RouteWeights>
+    __device__ static void Apply(float4 accum[kAccumFragments],
+                                 const BiasPrefetch &bias,
+                                 const RouteWeights &route_weights) {
+        SelectedBias::Apply(accum, bias);
+        MultRouteWeights<kAccumFragments>(accum, route_weights);
+    }
+};
+
 template <class TileSchedule>
 struct OnestageFusedMoEStage2Op {
     using Config = typename TileSchedule::Config;
@@ -277,6 +301,7 @@ struct OnestageFusedMoEStage2Op {
     static constexpr unsigned kActivationFragments =
         TileSchedule::kActivationFragments;
     static constexpr unsigned kTokenPairs = kTokenBatch / 2;
+    using AccumulatorEpilogue = W2AccumulatorEpilogue<TileSchedule>;
 
     static_assert(TileSchedule::kNumWarps == kNumWarps, "");
     static_assert(kTokenBatch % 2 == 0, "");
@@ -360,10 +385,16 @@ struct OnestageFusedMoEStage2Op {
                 uint2 ret[kTokenBatch];
                 ReadShm(shm, next, ret, wid, wtid);
                 tiles.Matmul(t, input, curr, wtid);
-                if (tile_k == 0) {
-                    tiles.AddBias(t, tile_d, tid);
-                }
-                MultRouteWeights<kAccumFragments>(t, sorted_weights);
+                typename AccumulatorEpilogue::BiasPrefetch bias{};
+                if (tile_k == 0)
+                    AccumulatorEpilogue::PrefetchBias(bias, tiles, tile_d,
+                                                      tid);
+                if (tile_k == 0)
+                    AccumulatorEpilogue::Apply(t, bias, sorted_weights);
+                else
+                    AccumulatorEpilogue::template Apply<
+                        typename AccumulatorEpilogue::NoopBias>(
+                        t, bias, sorted_weights);
                 uint2 o[kAccumFragments];
                 for (unsigned i = 0; i < kAccumFragments; i++) {
                     o[i] = ToBf16Rn(t[i]);

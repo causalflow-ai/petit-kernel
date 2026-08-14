@@ -12,8 +12,8 @@ template <class Weight> struct MxFp4Tile {
     uint4 value[2][Weight::kLoadGlobal];
     unsigned scale[Weight::kLoadGlobal / 2];
 
-    static_assert(Weight::kLoadGlobal == 4,
-                  "MXFP4 N256 tiles require four N16 fragments");
+    static_assert(Weight::kLoadGlobal == 2 || Weight::kLoadGlobal == 4,
+                  "MXFP4 tiles require two or four N16 fragments");
 };
 
 template <class Config_, class Weight_> struct BlockScaleFp8TileOps {
@@ -209,7 +209,8 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
     using Config = Config_;
     using Weight = Weight_;
     using Input = typename Config::Input;
-    using MatmulOp = NativeMxFp4Matmul;
+    static constexpr unsigned kWaveTileN = Weight::kGroupN / Config::kNumWarps;
+    using MatmulOp = NativeMxFp4Matmul<kWaveTileN>;
     using CShuffle = BlockedVectorRowMajorCShuffle;
 
     static constexpr unsigned kNumWarps = Config::kNumWarps;
@@ -253,8 +254,11 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
                                 unsigned wid, unsigned wtid) {
         weight.LoadTile(tile.value[0], 0, wid, wtid);
         weight.LoadTile(tile.value[1], 1, wid, wtid);
-        tile.scale[0] = weight.LoadScale(wid, wtid, 0);
-        tile.scale[1] = weight.LoadScale(wid, wtid, 1);
+#pragma unroll
+        for (unsigned n32_pair = 0;
+             n32_pair < Weight::kLoadGlobal / 2; ++n32_pair)
+            tile.scale[n32_pair] =
+                weight.LoadScale(wid, wtid, n32_pair);
     }
 
     __device__ static void Matmul(float4 t[kAccumFragments], const Tile &tile,

@@ -7,18 +7,76 @@
 
 namespace causalflow::petit::rocm::moe {
 
-template <unsigned kNumWarps_, unsigned kGroupN_> struct Bf16BiasLayout {
+// MXFP4 bias access differs only in the mapping from [fragment, lane quarter,
+// wave] to the packed BF16 vector. Keep that mapping as a TAL layout rather
+// than encoding it in separate access classes.
+template <unsigned kGroupN> struct MxFp4BiasLayout;
+
+template <> struct MxFp4BiasLayout<128> {
+    // An N128 tile assigns N32 to each wave. Decomposing the wave coordinate
+    // maps the two waves in a pair into one packed N64 slice.
+    using Type = tal::Layout<
+        tal::Shape<tal::_2, tal::_4, tal::Shape<tal::_2, tal::_2>>,
+        tal::Stride<tal::_4, tal::_16,
+                    tal::Stride<tal::_8, tal::C<64>>>>;
+};
+
+template <> struct MxFp4BiasLayout<256> {
+    using Type = tal::Layout<tal::Shape<tal::_4, tal::_4, tal::_4>,
+                             tal::Stride<tal::_4, tal::_16, tal::C<64>>>;
+};
+
+template <class Layout_> struct Bf16BiasAccess {
+    using Layout = Layout_;
+
+    template <class Bias>
+    __device__ static uint2 LoadFragment(const Bias &bias, unsigned fragment,
+                                         unsigned tile_col, unsigned tid) {
+        const unsigned wid = tid / kWarpSize;
+        const unsigned q = (tid % kWarpSize) / 16;
+        const unsigned col =
+            tile_col + Layout{}(tal::make_coord(fragment, q, wid));
+        return bias.v_.template LoadU64<BufferResource::kNone>(
+            col * Bias::kElementBytes, 0);
+    }
+
+    template <class Bias>
+    __device__ static void LoadFragments(const Bias &bias,
+                                         uint2 fragments[Bias::kLoadGlobal],
+                                         unsigned tile_col, unsigned tid) {
+#pragma unroll
+        for (unsigned fragment = 0; fragment < Bias::kLoadGlobal; ++fragment) {
+            fragments[fragment] =
+                LoadFragment(bias, fragment, tile_col, tid);
+        }
+    }
+};
+
+__device__ inline float4 Bf16BiasToFloat(uint2 packed) {
+    const auto *bf16 = reinterpret_cast<const __hip_bfloat162 *>(&packed);
+    const float2 lo = __bfloat1622float2(bf16[0]);
+    const float2 hi = __bfloat1622float2(bf16[1]);
+    return float4{lo.x, lo.y, hi.x, hi.y};
+}
+
+template <unsigned kNumWarps_, unsigned kGroupN_, class MemoryLayout_>
+struct Bf16BiasLayout {
     static constexpr unsigned kGroupN = kGroupN_;
     static constexpr unsigned kNumWarps = kNumWarps_;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kLoadGlobal = kGroupN / 64;
     static constexpr unsigned kElementBytes = sizeof(__hip_bfloat16);
-    static constexpr unsigned kPackedTileElements = kGroupN;
+    static constexpr unsigned kPackedTileElements = 256;
+    using Access = Bf16BiasAccess<MemoryLayout_>;
 
-    static_assert(kGroupN % 64 == 0, "");
-    static_assert(kGroupN == 256, "block bias layout expects 256-col tiles");
-    static_assert(kNumWarps == 4, "block bias layout expects four warps");
-    static_assert(kThreads == 256, "block bias layout expects 256 threads");
+    struct Prefetch {
+        uint2 fragments[kLoadGlobal];
+    };
+
+    static_assert(kGroupN == 128 || kGroupN == 256,
+                  "bias layout expects N128 or N256 tiles");
+    static_assert(kNumWarps == 4, "bias layout expects four warps");
+    static_assert(kThreads == 256, "bias layout expects 256 threads");
 
     __host__ __device__ static constexpr unsigned PackedStride(unsigned dim) {
         return tal::CeilingDiv<unsigned>(dim, kPackedTileElements) *
@@ -30,55 +88,54 @@ template <unsigned kNumWarps_, unsigned kGroupN_> struct Bf16BiasLayout {
                                unsigned expert_stride) {
         const unsigned packed_stride = PackedStride(dim);
         const unsigned tile_col = tile_k * kGroupN;
-        if (value_ptr == nullptr || expert_stride == 0 ||
-            tile_col >= packed_stride) {
-            v_.v = {
-                .ptr = 0,
-                .range = 0,
-                .config = BufferResource::kDataFormatU32Config,
-            };
-            return;
-        }
-        const unsigned value_offset =
-            expert_id * expert_stride + tile_col;
-        const auto *ptr =
-            reinterpret_cast<const __hip_bfloat16 *>(value_ptr) + value_offset;
+        const unsigned value_offset = expert_id * expert_stride + tile_col;
+        // Schedulers only issue in-range tiles. A zero descriptor range makes
+        // every optional null-bias load return zero in hardware.
         v_.v = {
-            .ptr = reinterpret_cast<uintptr_t>(ptr),
-            .range = (packed_stride - tile_col) * kElementBytes,
+            .ptr = reinterpret_cast<uintptr_t>(value_ptr) +
+                   value_offset * kElementBytes,
+            .range = value_ptr == nullptr
+                         ? 0
+                         : (packed_stride - tile_col) * kElementBytes,
             .config = BufferResource::kDataFormatU32Config,
         };
     }
 
     __device__ void AddToAccumulator(float4 t[2 * kLoadGlobal],
                                      unsigned tile_col, unsigned tid) const {
-        const unsigned wid = tid / kWarpSize;
-        const unsigned q = (tid % kWarpSize) / 16;
+        Prefetch prefetch;
+        PrefetchFragments(prefetch, tile_col, tid);
+        Apply(t, prefetch);
+    }
+
+    __device__ void PrefetchFragments(Prefetch &prefetch, unsigned tile_col,
+                                      unsigned tid) const {
+        Access::LoadFragments(*this, prefetch.fragments, tile_col, tid);
+    }
+
+    __device__ static void Apply(float4 t[2 * kLoadGlobal],
+                                 const Prefetch &prefetch) {
 #pragma unroll
         for (unsigned fragment = 0; fragment < kLoadGlobal; ++fragment) {
-            // Packed bias is [wave][q][fragment][component], matching
-            // C[16*m16+r, 64*wave+16*fragment+4*q+component].
-            const unsigned col = tile_col + wid * 64 + q * 16 + fragment * 4;
-            const uint2 packed = v_.template LoadU64<BufferResource::kNone>(
-                col * kElementBytes, 0);
-            const auto *bf16 =
-                reinterpret_cast<const __hip_bfloat162 *>(&packed);
-            const float2 lo = __bfloat1622float2(bf16[0]);
-            const float2 hi = __bfloat1622float2(bf16[1]);
-            const float4 add{lo.x, lo.y, hi.x, hi.y};
+            const float4 value =
+                Bf16BiasToFloat(prefetch.fragments[fragment]);
             reinterpret_cast<v4f &>(t[2 * fragment]) +=
-                reinterpret_cast<const v4f &>(add);
+                reinterpret_cast<const v4f &>(value);
             reinterpret_cast<v4f &>(t[2 * fragment + 1]) +=
-                reinterpret_cast<const v4f &>(add);
+                reinterpret_cast<const v4f &>(value);
         }
     }
 
     BufferResource v_;
 };
 
-template <unsigned, unsigned> struct NoopBiasLayout {
+template <unsigned kNumWarps_, unsigned kGroupN_> struct NoopBiasLayout {
+    static constexpr unsigned kNumWarps = kNumWarps_;
+    static constexpr unsigned kGroupN = kGroupN_;
     static constexpr unsigned kElementBytes = 1;
     static constexpr unsigned kPackedTileElements = 1;
+
+    struct Prefetch {};
 
     __host__ __device__ static constexpr unsigned PackedStride(unsigned dim) {
         return dim;
@@ -87,6 +144,10 @@ template <unsigned, unsigned> struct NoopBiasLayout {
     __device__ void Initialize(const void *, unsigned, unsigned, unsigned,
                                unsigned) {}
     __device__ void AddToAccumulator(float4 *, unsigned, unsigned) const {}
+    __device__ void PrefetchFragments(Prefetch &, unsigned, unsigned) const {}
+
+    template <class BiasPrefetch>
+    __device__ static void Apply(float4 *, const BiasPrefetch &) {}
 };
 
 } // namespace causalflow::petit::rocm::moe

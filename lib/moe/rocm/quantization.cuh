@@ -18,6 +18,18 @@ static constexpr float kFp8E4m3Max = 240.0f;
 #endif
 static constexpr float kQuantFloor = 1e-6f;
 
+__device__ static inline unsigned QuantizeFp8E4m3x4(float4 value,
+                                                    float scale) {
+    const float2 scale2{scale, scale};
+    const float2 xy = amdgcn_pk_mul_f32(
+        reinterpret_cast<const float2 &>(value), scale2);
+    const float2 zw = amdgcn_pk_mul_f32(
+        reinterpret_cast<const float2 *>(&value)[1], scale2);
+    unsigned packed = 0;
+    packed = amdgcn_cvt_pk_fp8_f32<false>(xy.x, xy.y, packed);
+    return amdgcn_cvt_pk_fp8_f32<true>(zw.x, zw.y, packed);
+}
+
 __host__ __device__ static inline float ClampQuantAbsmax(float absmax) {
     if (!__builtin_isfinite(absmax)) {
         return kQuantFloor;
@@ -75,7 +87,6 @@ __device__ static inline void OnlineQuantize2x128(uint4 out[kRows],
     static_assert(kRows == 2, "OnlineQuantize2x128 expects exactly 2 rows.");
     static_assert(kCols == kQuantBlockK,
                   "OnlineQuantize2x128 expects kCols == 128.");
-    int dummy = 0;
     for (int i = 0; i < 2; ++i) {
         unsigned *q = reinterpret_cast<unsigned *>(out + i);
         for (int k = 0; k < 2; ++k) {
@@ -85,14 +96,68 @@ __device__ static inline void OnlineQuantize2x128(uint4 out[kRows],
                 // Stage1 accumulators are laid out as:
                 // [A0-row0, A0-row1, A1-row0, A1-row1, A2-row0, ...].
                 const float4 v = in[k * 4 + j * 2 + i];
-                const unsigned u0 =
-                    amdgcn_cvt_pk_fp8_f32<false>(v.x * s, v.y * s, dummy);
-                const unsigned u1 =
-                    amdgcn_cvt_pk_fp8_f32<false>(v.z * s, v.w * s, dummy);
-                q[k * 2 + j] = (u1 << 16) | u0;
+                q[k * 2 + j] = QuantizeFp8E4m3x4(v, s);
             }
         }
     }
+}
+
+struct MxFp4Scale {
+    unsigned byte;
+    float packing_scale;
+};
+
+struct NativeMxFp4Quantization {
+    __device__ static float MaximumAbs(float4 value) {
+        return fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                     fmaxf(fabsf(value.z), fabsf(value.w)));
+    }
+
+    __device__ static MxFp4Scale EncodeScale(float max_abs) {
+        if (max_abs < 1.0e-12f)
+            return {127u, 1.0f};
+        const float required = max_abs * (1.0f / 6.0f);
+        const unsigned required_bits =
+            reinterpret_cast<const unsigned &>(required);
+        unsigned scale_byte = (required_bits >> 23) & 0xffu;
+        if (scale_byte < 0xffu && (required_bits & 0x7fffffu))
+            ++scale_byte;
+        const unsigned bits = scale_byte << 23;
+        return {scale_byte, reinterpret_cast<const float &>(bits)};
+    }
+
+    template <unsigned kVectors>
+    __device__ static void Pack(unsigned char *dst,
+                                const float4 values[kVectors],
+                                const MxFp4Scale &scale) {
+        static_assert(kVectors % 2 == 0,
+                      "native packing consumes pairs of float4");
+        auto *packed = reinterpret_cast<unsigned *>(dst);
+#pragma unroll
+        for (unsigned vector = 0; vector < kVectors; vector += 2) {
+            const float4 a = values[vector];
+            const float4 b = values[vector + 1];
+            unsigned word = 0;
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(
+                word, a.x, a.y, scale.packing_scale, 0);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(
+                word, a.z, a.w, scale.packing_scale, 1);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(
+                word, b.x, b.y, scale.packing_scale, 2);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(
+                word, b.z, b.w, scale.packing_scale, 3);
+            packed[vector / 2] = word;
+        }
+    }
+};
+
+template <class Quantization, unsigned kVectors>
+__device__ static inline unsigned
+QuantizeMxFp4(unsigned char *dst, const float4 values[kVectors],
+              float max_abs) {
+    const MxFp4Scale scale = Quantization::EncodeScale(max_abs);
+    Quantization::template Pack<kVectors>(dst, values, scale);
+    return scale.byte;
 }
 
 } // namespace causalflow::petit::rocm::moe
