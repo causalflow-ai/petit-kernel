@@ -265,6 +265,8 @@ class DeviceContextAccessorBase {
     virtual unsigned *route_tokens() const = 0;
     virtual float *route_weights() const = 0;
     virtual float *reference_acc() const = 0;
+    virtual const __hip_bfloat16 *logical_w13_bias() const = 0;
+    virtual const __hip_bfloat16 *logical_w2_bias() const = 0;
 };
 
 template <class Context>
@@ -298,6 +300,18 @@ class DeviceContextAccessor final : public DeviceContextAccessorBase {
     unsigned *route_tokens() const override { return ctx_->route_tokens; }
     float *route_weights() const override { return ctx_->route_weights; }
     float *reference_acc() const override { return ctx_->reference_acc; }
+    const __hip_bfloat16 *logical_w13_bias() const override {
+        if constexpr (requires { ctx_->logical_w13_bias; }) {
+            return ctx_->logical_w13_bias;
+        }
+        return nullptr;
+    }
+    const __hip_bfloat16 *logical_w2_bias() const override {
+        if constexpr (requires { ctx_->logical_w2_bias; }) {
+            return ctx_->logical_w2_bias;
+        }
+        return nullptr;
+    }
 
   private:
     Context *ctx_;
@@ -313,6 +327,14 @@ hipError_t ApplyElementwiseMultiply(const __hip_bfloat16 *a,
                                     const __hip_bfloat16 *b,
                                     __hip_bfloat16 *out, unsigned count,
                                     hipStream_t stream = nullptr);
+
+hipError_t AddFloatRowBias(float *data, const __hip_bfloat16 *bias,
+                           unsigned rows, unsigned cols,
+                           hipStream_t stream = nullptr);
+
+hipError_t AddBf16RowBias(__hip_bfloat16 *data, const __hip_bfloat16 *bias,
+                          unsigned rows, unsigned cols,
+                          hipStream_t stream = nullptr);
 
 template <class Input>
 hipError_t ApplyOpenAISwiGLU(const Input *gate, const Input *up,

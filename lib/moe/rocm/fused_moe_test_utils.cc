@@ -239,6 +239,19 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
         const __hip_bfloat16 *d_b2 =
             device_ctx_accessor.dq_w2() +
             static_cast<size_t>(expert) * inter_dim * dim;
+        const __hip_bfloat16 *d_w13_bias =
+            device_ctx_accessor.logical_w13_bias();
+        const __hip_bfloat16 *d_w2_bias = device_ctx_accessor.logical_w2_bias();
+        const __hip_bfloat16 *d_b_gate_bias =
+            d_w13_bias == nullptr
+                ? nullptr
+                : d_w13_bias +
+                      (static_cast<size_t>(expert) * 2 + 0) * inter_dim;
+        const __hip_bfloat16 *d_b_up_bias =
+            d_w13_bias == nullptr
+                ? nullptr
+                : d_w13_bias +
+                      (static_cast<size_t>(expert) * 2 + 1) * inter_dim;
 
         const size_t inter_bytes =
             static_cast<size_t>(m_e) * inter_dim * sizeof(__hip_bfloat16);
@@ -263,6 +276,12 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
             };
             run_stage1_gemm(d_b_gate, device_ctx_accessor.gate(), true);
             run_stage1_gemm(d_b_up, device_ctx_accessor.up(), false);
+            if (d_w13_bias != nullptr) {
+                CheckHIPStatus(AddBf16RowBias(device_ctx_accessor.gate(),
+                                              d_b_gate_bias, m_e, inter_dim));
+                CheckHIPStatus(AddBf16RowBias(device_ctx_accessor.up(),
+                                              d_b_up_bias, m_e, inter_dim));
+            }
             CheckHIPStatus(ApplyElementwiseMultiply(
                 device_ctx_accessor.gate(), device_ctx_accessor.up(),
                 device_ctx_accessor.act(), elem_count));
@@ -279,6 +298,12 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
                                         d_gate, m_e, inter_dim, dim);
             gemm.RunRowMajorGemmToFloat(device_ctx_accessor.a(), d_b_up, d_up,
                                         m_e, inter_dim, dim);
+            if (d_w13_bias != nullptr) {
+                CheckHIPStatus(
+                    AddFloatRowBias(d_gate, d_b_gate_bias, m_e, inter_dim));
+                CheckHIPStatus(
+                    AddFloatRowBias(d_up, d_b_up_bias, m_e, inter_dim));
+            }
             CheckHIPStatus(ApplyOpenAISwiGLU(
                 d_gate, d_up, device_ctx_accessor.act(), elem_count));
             CheckHIPStatus(hipFree(d_up));
@@ -297,6 +322,11 @@ void ComputeHipBlasLtReference(DeviceContextAccessorBase &host_ctx_accessor,
         gemm.RunRowMajorGemm(device_ctx_accessor.act(), d_b2,
                              device_ctx_accessor.route_out(), m_e, dim,
                              inter_dim);
+        if (d_w2_bias != nullptr) {
+            CheckHIPStatus(AddBf16RowBias(
+                device_ctx_accessor.route_out(),
+                d_w2_bias + static_cast<size_t>(expert) * dim, m_e, dim));
+        }
 
         CheckHIPStatus(ScatterWeightedRoutes(
             device_ctx_accessor.route_out(), device_ctx_accessor.route_tokens(),

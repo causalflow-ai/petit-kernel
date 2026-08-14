@@ -258,9 +258,8 @@ __device__ static inline float4 mma_m16n16k32_fp8_fp8_f32(uint2 fa, uint2 fb,
 #endif
 }
 
-__device__ static inline float4 mma_m16n16k128_fp8_fp8_f32(const uint2 *fa,
-                                                           const uint2 *fb,
-                                                           float4 c) {
+__device__ static inline float4
+mma_m16n16k128_fp8_fp8_f32(const uint2 *fa, const uint2 *fb, float4 c) {
 #if HAS_AMD_SCALE_FP4_MFMA
     v4f ret = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
         *reinterpret_cast<const v8i *>(fa), *reinterpret_cast<const v8i *>(fb),
@@ -402,7 +401,8 @@ union BufferResource {
     }
 
     template <int kAux>
-    __device__ inline void StoreU64(int voffset, int soffset, uint2 data) const {
+    __device__ inline void StoreU64(int voffset, int soffset,
+                                    uint2 data) const {
         v2i v = *reinterpret_cast<const v2i *>(&data);
         llvm_amdgcn_raw_buffer_store_v2i32(v, content, voffset, soffset, kAux);
     }

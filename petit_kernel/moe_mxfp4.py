@@ -209,9 +209,7 @@ def _repack_petit_mxfp4(
     )
 
 
-def _repack_mxfp4_bias(
-    bias: torch.Tensor,
-) -> torch.Tensor:
+def _repack_mxfp4_bias(bias: torch.Tensor) -> torch.Tensor:
     _require(bias.dtype == torch.bfloat16, "bias must be bfloat16")
     _require(bias.ndim in (2, 3), "bias must be rank-2 or rank-3")
     _require(bias.is_contiguous(), "bias must be contiguous")
@@ -244,6 +242,8 @@ def repack_moe_kernel_layout(
         f"unsupported MoE kernel layout: {layout}",
     )
     if scales_e8m0 is None:
+        # All W4 schedules use weight as MFMA operand A and therefore share
+        # the same adjacent-N accumulator ownership and bias permutation.
         return _repack_mxfp4_bias(data)
     if layout == MoeKernelLayout.native_mxfp4:
         return _repack_native_mxfp4(data, scales_e8m0)

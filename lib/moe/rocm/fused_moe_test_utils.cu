@@ -70,6 +70,30 @@ __global__ void WeightedRouteScatterKernel(const __hip_bfloat16 *route_out,
     atomicAdd(token_out + static_cast<size_t>(token) * cols + col, weighted);
 }
 
+template <class Output>
+__global__ void AddRowBiasKernel(Output *data, const __hip_bfloat16 *bias,
+                                 unsigned rows, unsigned cols) {
+    const size_t idx =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t count = static_cast<size_t>(rows) * cols;
+    if (idx >= count) {
+        return;
+    }
+    const float value = [&] {
+        if constexpr (std::is_same_v<Output, float>) {
+            return data[idx];
+        } else {
+            return __bfloat162float(data[idx]);
+        }
+    }();
+    const float sum = value + __bfloat162float(bias[idx % cols]);
+    if constexpr (std::is_same_v<Output, float>) {
+        data[idx] = sum;
+    } else {
+        data[idx] = __float2bfloat16(sum);
+    }
+}
+
 __device__ float ScaleFloatForMxFp4(float max_abs, unsigned &scale_byte) {
     if (max_abs < 1.0e-12f) {
         scale_byte = 127u;
@@ -448,6 +472,24 @@ hipError_t ApplyElementwiseMultiply(const __hip_bfloat16 *a,
     const dim3 block(kThreads);
     const dim3 grid(tal::CeilingDiv<unsigned>(count, block.x));
     ElementwiseMultiplyKernel<<<grid, block, 0, stream>>>(a, b, out, count);
+    return hipGetLastError();
+}
+
+hipError_t AddFloatRowBias(float *data, const __hip_bfloat16 *bias,
+                           unsigned rows, unsigned cols, hipStream_t stream) {
+    static constexpr unsigned kThreads = 256;
+    const size_t count = static_cast<size_t>(rows) * cols;
+    const dim3 grid(tal::CeilingDiv<size_t>(count, kThreads));
+    AddRowBiasKernel<<<grid, kThreads, 0, stream>>>(data, bias, rows, cols);
+    return hipGetLastError();
+}
+
+hipError_t AddBf16RowBias(__hip_bfloat16 *data, const __hip_bfloat16 *bias,
+                          unsigned rows, unsigned cols, hipStream_t stream) {
+    static constexpr unsigned kThreads = 256;
+    const size_t count = static_cast<size_t>(rows) * cols;
+    const dim3 grid(tal::CeilingDiv<size_t>(count, kThreads));
+    AddRowBiasKernel<<<grid, kThreads, 0, stream>>>(data, bias, rows, cols);
     return hipGetLastError();
 }
 

@@ -2,6 +2,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
+
 namespace causalflow::petit::rocm::moe {
 
 enum {
@@ -141,12 +143,11 @@ struct FusedMoESolutionId {
          FusedMoEDataType bias_dtype, FusedMoEWeightOrdering weight_ordering,
          FusedMoEMfmaShape mfma, FusedMoEStages stages,
          FusedMoEActivationFunction activation,
-         FusedMoEStage1Buffering stage1_buffering) {
-        return FusedMoESolutionId{
-            act_dtype, weight_dtype, bias_dtype, weight_ordering,
-            mfma,      stages,       activation,  stage1_buffering,
-            0,
-        };
+         FusedMoEStage1Buffering stage1_buffering, unsigned dim,
+         unsigned inter_dim) {
+        return MakeBase(act_dtype, weight_dtype, bias_dtype, weight_ordering,
+                        mfma, stages, activation, stage1_buffering)
+            .WithShape(dim, inter_dim);
     }
 };
 static_assert(sizeof(FusedMoESolutionId) == 8, "");
@@ -177,6 +178,50 @@ struct FusedMoE1StageParams {
 
 int FusedMoEMatmul1Stage(FusedMoE1StageParams params,
                          unsigned long solution_id);
+
+struct FusedMoE2StageCommonParams {
+    void *intermediate;
+    std::size_t intermediate_bytes;
+    const unsigned *sorted_token_ids;
+    const unsigned *sorted_expert_ids;
+    const unsigned *num_valid_ids;
+    unsigned topk;
+    unsigned max_num_m_blocks;
+    unsigned m;
+    unsigned n;
+    unsigned k;
+    unsigned num_experts;
+    hipStream_t stream;
+    unsigned num_persistent_tgs;
+};
+
+struct FusedMoE2Stage1Params {
+    FusedMoE2StageCommonParams common;
+    const unsigned *act;
+    const unsigned *w13;
+    const unsigned *scales_act;
+    const unsigned *scales_w13;
+    const void *w13_bias = nullptr;
+};
+
+struct FusedMoE2Stage2Params {
+    FusedMoE2StageCommonParams common;
+    unsigned *out;
+    const unsigned *w2;
+    const unsigned *sorted_weights;
+    const unsigned *scales_w2;
+    const void *w2_bias = nullptr;
+};
+
+std::size_t FusedMoE2StageWorkspaceSize(unsigned max_num_m_blocks,
+                                        unsigned inter_dim,
+                                        unsigned long solution_id);
+
+int FusedMoEMatmul2Stage1(FusedMoE2Stage1Params params,
+                          unsigned long solution_id);
+
+int FusedMoEMatmul2Stage2(FusedMoE2Stage2Params params,
+                          unsigned long solution_id);
 
 template <unsigned long kRepr> struct FusedMoESolutionAdapter {
     static int Invoke(FusedMoE1StageParams params);

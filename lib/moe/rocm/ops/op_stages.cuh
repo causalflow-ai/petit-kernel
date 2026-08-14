@@ -285,6 +285,94 @@ template <class TileSchedule> struct W2AccumulatorEpilogue {
     }
 };
 
+template <class TileSchedule> struct TwoStageStage2Epilogue {
+    using Config = typename TileSchedule::Config;
+    using AccumulatorEpilogue = W2AccumulatorEpilogue<TileSchedule>;
+    using BiasPrefetch = typename AccumulatorEpilogue::BiasPrefetch;
+    static constexpr unsigned kAccumFragments = TileSchedule::kAccumFragments;
+    static constexpr unsigned kNumWarps = 4;
+    static constexpr unsigned kTokenBatch = Config::kTokenBatch;
+    static constexpr unsigned kTileRows = kTokenBatch * kNumWarps;
+    static constexpr unsigned kTileCols = Config::kGroupN;
+
+    struct Shm {
+        unsigned short output[kTileRows * kTileCols];
+        unsigned output_row_offsets[kTileRows];
+    };
+
+    static_assert(kTileRows == 32, "two-stage C-shuffle expects M32");
+    static_assert(kTileCols == 256, "two-stage C-shuffle expects N256");
+    static_assert(kAccumFragments == 8,
+                  "two-stage C-shuffle expects N64 waves");
+
+    __device__ static void PrefetchBias(BiasPrefetch &prefetch,
+                                        const TileSchedule &tiles,
+                                        unsigned tile_col, unsigned tid) {
+        AccumulatorEpilogue::PrefetchBias(prefetch, tiles, tile_col, tid);
+    }
+
+    template <class RouteWeights>
+    __device__ static void Apply(float4 accum[kAccumFragments],
+                                 const BiasPrefetch &bias,
+                                 const RouteWeights &route_weights) {
+        AccumulatorEpilogue::Apply(accum, bias, route_weights);
+    }
+
+    __device__ static void StoreOutputRowOffset(Shm &shm, unsigned row,
+                                                unsigned offset) {
+        if (row < kTileRows)
+            shm.output_row_offsets[row] = offset;
+    }
+
+    __device__ static void WriteShm(Shm &shm,
+                                    const float4 accum[kAccumFragments],
+                                    unsigned wid, unsigned wtid) {
+        const unsigned q = wtid / 16;
+        const unsigned r = wtid % 16;
+#pragma unroll
+        for (unsigned mi = 0; mi < 2; ++mi) {
+#pragma unroll
+            for (unsigned ni = 0; ni < kAccumFragments / 2; ++ni) {
+                const unsigned fragment = 2 * ni + mi;
+#pragma unroll
+                for (unsigned component = 0; component < 4; ++component) {
+                    const float value = reinterpret_cast<const float *>(
+                        &accum[fragment])[component];
+                    const unsigned packed = amdgcn_cvt_pk_bf16_f32(value,
+                                                                    value);
+                    const unsigned row = mi * 16 + r;
+                    const unsigned col =
+                        wid * 64 + ni * 16 + q * 4 + component;
+                    shm.output[row * kTileCols + col] =
+                        static_cast<unsigned short>(packed);
+                }
+            }
+        }
+    }
+
+    __device__ static void WriteBack(const BufferResource &out, Shm &shm,
+                                     unsigned tile_col, unsigned tid) {
+        const unsigned m_lane = tid / 32;
+        const unsigned n_lane = tid % 32;
+        const auto *output = reinterpret_cast<const unsigned *>(shm.output);
+        const unsigned base = m_lane * (kTileCols / 2) + n_lane;
+#pragma unroll
+        for (unsigned mr = 0; mr < 4; ++mr) {
+            const unsigned output_row_offset =
+                shm.output_row_offsets[m_lane + mr * 8];
+#pragma unroll
+            for (unsigned nr = 0; nr < 4; ++nr) {
+                const unsigned value =
+                    output[base + mr * 8 * (kTileCols / 2) + nr * 32];
+                const unsigned col = tile_col + nr * 64 + n_lane * 2;
+                const unsigned vo =
+                    output_row_offset + col * sizeof(__hip_bfloat16);
+                BufferAtomicWriteBf16x2(out, vo, value);
+            }
+        }
+    }
+};
+
 template <class TileSchedule>
 struct OnestageFusedMoEStage2Op {
     using Config = typename TileSchedule::Config;

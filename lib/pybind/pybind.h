@@ -42,6 +42,27 @@ torch::Tensor FusedMoeMatmul1Stage(
     const std::optional<torch::Tensor> &w13_bias = std::nullopt,
     const std::optional<torch::Tensor> &w2_bias = std::nullopt);
 
+int64_t FusedMoe2StageWorkspaceSize(int64_t max_num_m_blocks, int64_t inter_dim,
+                                    uint64_t solution_id);
+
+torch::Tensor FusedMoeMatmul2Stage1(
+    const torch::Tensor &intermediate, const torch::Tensor &input_q,
+    const torch::Tensor &w1_q, const torch::Tensor &sorted_token_ids,
+    const torch::Tensor &sorted_expert_ids, const torch::Tensor &num_valid_ids,
+    int64_t topk, const torch::Tensor &input_scale,
+    const torch::Tensor &w1_scale, int64_t inter_dim, int64_t num_experts,
+    uint64_t solution_id, int64_t num_persistent_tgs = 0,
+    const std::optional<torch::Tensor> &w13_bias = std::nullopt);
+
+torch::Tensor FusedMoeMatmul2Stage2(
+    const torch::Tensor &out, const torch::Tensor &intermediate,
+    const torch::Tensor &w2_q, const torch::Tensor &sorted_token_ids,
+    const torch::Tensor &sorted_weights, const torch::Tensor &sorted_expert_ids,
+    const torch::Tensor &num_valid_ids, int64_t topk,
+    const torch::Tensor &w2_scale, int64_t inter_dim, int64_t num_experts,
+    uint64_t solution_id, int64_t num_persistent_tgs = 0,
+    const std::optional<torch::Tensor> &w2_bias = std::nullopt);
+
 py::list GetNvFp4Solutions(
     const causalflow::petit::rocm::quantization::PetitSolutionHints &hints,
     int64_t size_m, int64_t size_n, int64_t size_k);

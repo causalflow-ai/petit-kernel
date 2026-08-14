@@ -1,4 +1,7 @@
 import enum
+import functools
+import os
+from dataclasses import dataclass, field
 
 import torch
 
@@ -43,6 +46,7 @@ class _FusedMoeStages(enum.IntEnum):
 class _FusedMoeMfmaShape(enum.IntEnum):
     mfma_fp8_16x16x32 = 0
     mfma_bf16_mxfp4 = 1
+    mfma_scale_fp4_mxfp4 = 2
 
 
 class _FusedMoeActivationFunction(enum.IntEnum):
@@ -149,6 +153,409 @@ _FUSED_MOE_BF16_MXFP4_BIAS_SOLUTION_ID = _make_fused_moe_base_solution_id(
     _FusedMoeActivationFunction.openai_swiglu,
     _FusedMoeStage1Buffering.double_buffer,
 )
+_FUSED_MOE_MXFP4_MXFP4_BIAS_SOLUTION_ID = _make_fused_moe_base_solution_id(
+    _FusedMoeDataType.mxfp4,
+    _FusedMoeDataType.mxfp4,
+    _FusedMoeDataType.bf16,
+    _FusedMoeWeightOrdering.native_mxfp4,
+    _FusedMoeMfmaShape.mfma_scale_fp4_mxfp4,
+    _FusedMoeStages.one_stage,
+    _FusedMoeActivationFunction.openai_swiglu,
+    _FusedMoeStage1Buffering.double_buffer,
+)
+
+_FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID = _make_fused_moe_solution_id(
+    _FusedMoeDataType.mxfp4,
+    _FusedMoeDataType.mxfp4,
+    _FusedMoeDataType.bf16,
+    _FusedMoeWeightOrdering.native_mxfp4,
+    _FusedMoeMfmaShape.mfma_scale_fp4_mxfp4,
+    _FusedMoeStages.two_stage,
+    _FusedMoeActivationFunction.openai_swiglu,
+    _FusedMoeStage1Buffering.double_buffer,
+    3072,
+    3072,
+)
+
+_FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X2048_SOLUTION_ID = (
+    _make_fused_moe_solution_id(
+        _FusedMoeDataType.mxfp4,
+        _FusedMoeDataType.mxfp4,
+        _FusedMoeDataType.none,
+        _FusedMoeWeightOrdering.native_mxfp4,
+        _FusedMoeMfmaShape.mfma_scale_fp4_mxfp4,
+        _FusedMoeStages.two_stage,
+        _FusedMoeActivationFunction.silu_dot,
+        _FusedMoeStage1Buffering.double_buffer,
+        7168,
+        2048,
+    )
+)
+
+_FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X3072_SOLUTION_ID = (
+    _make_fused_moe_solution_id(
+        _FusedMoeDataType.mxfp4,
+        _FusedMoeDataType.mxfp4,
+        _FusedMoeDataType.none,
+        _FusedMoeWeightOrdering.native_mxfp4,
+        _FusedMoeMfmaShape.mfma_scale_fp4_mxfp4,
+        _FusedMoeStages.two_stage,
+        _FusedMoeActivationFunction.silu_dot,
+        _FusedMoeStage1Buffering.double_buffer,
+        7168,
+        3072,
+    )
+)
+
+_FUSED_MOE_TWO_STAGE_PROFILES = {
+    (3072, 3072, 4, "swiglu"): _FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID,
+    # Current vLLM runs the eight routed DeepSeek-V3 experts here and
+    # evaluates the shared expert separately.  Keep the nine-route entry for
+    # integrations that fuse the shared expert into this invocation.
+    (7168, 2048, 8, "silu"): (
+        _FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X2048_SOLUTION_ID
+    ),
+    (7168, 2048, 9, "silu"): (
+        _FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X2048_SOLUTION_ID
+    ),
+    (7168, 3072, 7, "silu"): (
+        _FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X3072_SOLUTION_ID
+    ),
+}
+
+
+def _config_value_name(value: object) -> str:
+    name = getattr(value, "name", None)
+    return str(name if name is not None else value).lower()
+
+
+@dataclass(frozen=True)
+class Moe1StageConfig:
+    token: int
+    model_dim: int
+    inter_dim: int
+    expert: int
+    topk: int
+    block_m: int = 32
+    ksplit: int = 0
+    run_1stage: bool = field(init=False, default=True)
+    _solution_id: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_solution_id",
+            _with_fused_moe_shape(
+                _FUSED_MOE_MXFP4_MXFP4_BIAS_SOLUTION_ID,
+                self.model_dim,
+                self.inter_dim,
+            ),
+        )
+
+    def stage1(
+        self,
+        out: torch.Tensor,
+        input_q: torch.Tensor,
+        w1_q: torch.Tensor,
+        w2_q: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        sorted_weights: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        input_scale: torch.Tensor,
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        *,
+        num_persistent_tgs: int = 0,
+        bias1: torch.Tensor | None = None,
+        bias2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if input_q.size(0) != self.token:
+            raise ValueError("input_q token dimension does not match config")
+        if out.shape != (self.token, self.model_dim):
+            raise ValueError("out shape does not match config")
+        return ops.fmoe_matmul_1stage(
+            out,
+            input_q,
+            w1_q,
+            w2_q,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            self.topk,
+            input_scale,
+            w1_scale,
+            w2_scale,
+            self._solution_id,
+            int(num_persistent_tgs),
+            bias1,
+            bias2,
+        )
+
+
+@dataclass(frozen=True)
+class Moe2StageConfig:
+    token: int
+    model_dim: int
+    inter_dim: int
+    expert: int
+    topk: int
+    block_m: int = 32
+    ksplit: int = 0
+    run_1stage: bool = field(init=False, default=False)
+    _solution_id: int = field(
+        repr=False,
+        compare=False,
+        default=_FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID,
+    )
+
+    def workspace_size(self, max_num_m_blocks: int) -> int:
+        return int(
+            ops.fmoe_matmul_2stage_workspace_size(
+                int(max_num_m_blocks), self.inter_dim, self._solution_id
+            )
+        )
+
+    def intermediate_views(
+        self, intermediate: torch.Tensor, max_num_m_blocks: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_num_m_blocks = int(max_num_m_blocks)
+        payload_capacity = max_num_m_blocks * self.block_m * self.inter_dim // 2
+        payload_bytes = self.token * self.topk * self.inter_dim // 2
+        scale_rows = ((max_num_m_blocks * self.block_m + 255) // 256) * 256
+        scale_cols = ((self.inter_dim // 32 + 7) // 8) * 8
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
+        payload = intermediate[:payload_bytes].view(fp4_dtype).view(
+            self.token, self.topk, self.inter_dim // 2
+        )
+        scales = intermediate[
+            payload_capacity : payload_capacity + scale_rows * scale_cols
+        ].view(e8m0_dtype).view(scale_rows, scale_cols)
+        return payload, scales
+
+    def stage1(
+        self,
+        intermediate: torch.Tensor,
+        input_q: torch.Tensor,
+        w1_q: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        input_scale: torch.Tensor,
+        w1_scale: torch.Tensor,
+        *,
+        num_persistent_tgs: int = 0,
+        bias1: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if input_q.size(0) != self.token:
+            raise ValueError("input_q token dimension does not match config")
+        return ops.fmoe_matmul_2stage_stage1(
+            intermediate,
+            input_q,
+            w1_q,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            self.topk,
+            input_scale,
+            w1_scale,
+            self.inter_dim,
+            self.expert,
+            self._solution_id,
+            int(num_persistent_tgs),
+            bias1,
+        )
+
+    def stage2(
+        self,
+        out: torch.Tensor,
+        intermediate: torch.Tensor,
+        w2_q: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        sorted_weights: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        w2_scale: torch.Tensor,
+        *,
+        num_persistent_tgs: int = 0,
+        bias2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Accumulate stage 2 into a caller-provided, zeroed BF16 output."""
+        if out.shape != (self.token, self.model_dim):
+            raise ValueError("out shape does not match config")
+        return ops.fmoe_matmul_2stage_stage2(
+            out,
+            intermediate,
+            w2_q,
+            sorted_token_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            self.topk,
+            w2_scale,
+            self.inter_dim,
+            self.expert,
+            self._solution_id,
+            int(num_persistent_tgs),
+            bias2,
+        )
+
+
+@functools.lru_cache(maxsize=2048)
+def _get_2stage_cfgs_cached(
+    token: int,
+    model_dim: int,
+    inter_dim: int,
+    expert: int,
+    topk: int,
+    dtype: object,
+    q_dtype_a: object,
+    q_dtype_w: object,
+    q_type: object,
+    use_g1u1: bool,
+    activation: object,
+    doweight_stage1: bool,
+    hidden_pad: int,
+    intermediate_pad: int,
+    is_shuffled: bool = True,
+    gate_mode: object = "separated",
+    is_ep: bool = False,
+    has_stage2_bias: bool = False,
+    two_stage_threshold: int = 128,
+    is_gfx950: bool = False,
+) -> Moe1StageConfig | Moe2StageConfig:
+    del has_stage2_bias, is_ep
+    q_type_name = _config_value_name(q_type)
+    activation_name = _config_value_name(activation)
+    gate_mode_name = _config_value_name(gate_mode)
+    q_dtype_a_name = _config_value_name(q_dtype_a)
+    q_dtype_w_name = _config_value_name(q_dtype_w)
+    activation_profile = (
+        "swiglu"
+        if "swiglu" in activation_name
+        else "silu"
+        if "silu" in activation_name
+        else None
+    )
+    supported = (
+        dtype == torch.bfloat16
+        and (
+            q_dtype_a == torch.uint8
+            or "fp4" in q_dtype_a_name
+            or "float4" in q_dtype_a_name
+        )
+        and (
+            q_dtype_w == torch.uint8
+            or "fp4" in q_dtype_w_name
+            or "float4" in q_dtype_w_name
+        )
+        and "per_1x32" in q_type_name
+        and bool(use_g1u1)
+        and activation_profile is not None
+        and not bool(doweight_stage1)
+        and int(hidden_pad) == 0
+        and int(intermediate_pad) == 0
+        and bool(is_shuffled)
+        and "separated" in gate_mode_name
+    )
+    if not supported:
+        raise ValueError("unsupported MoE configuration")
+    if token < 0 or expert <= 0 or topk <= 0 or topk > expert:
+        raise ValueError("invalid MoE problem shape")
+    one_stage = Moe1StageConfig(
+        int(token),
+        int(model_dim),
+        int(inter_dim),
+        int(expert),
+        int(topk),
+    )
+    profile_solution_id = _FUSED_MOE_TWO_STAGE_PROFILES.get(
+        (int(model_dim), int(inter_dim), int(topk), activation_profile)
+    )
+    if profile_solution_id is None:
+        return one_stage
+
+    if profile_solution_id != _FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID:
+        return Moe2StageConfig(
+            int(token),
+            int(model_dim),
+            int(inter_dim),
+            int(expert),
+            int(topk),
+            _solution_id=profile_solution_id,
+        )
+
+    if (
+        two_stage_threshold <= 0
+        or token <= 0
+        or token > two_stage_threshold
+        or model_dim != 3072
+        or inter_dim != 3072
+        or not is_gfx950
+    ):
+        return one_stage
+    return Moe2StageConfig(
+        int(token),
+        int(model_dim),
+        int(inter_dim),
+        int(expert),
+        int(topk),
+        _solution_id=profile_solution_id,
+    )
+
+
+def get_2stage_cfgs(
+    token: int,
+    model_dim: int,
+    inter_dim: int,
+    expert: int,
+    topk: int,
+    dtype: object,
+    q_dtype_a: object,
+    q_dtype_w: object,
+    q_type: object,
+    use_g1u1: bool,
+    activation: object,
+    doweight_stage1: bool,
+    hidden_pad: int,
+    intermediate_pad: int,
+    is_shuffled: bool = True,
+    gate_mode: object = "separated",
+    is_ep: bool = False,
+    has_stage2_bias: bool = False,
+) -> Moe1StageConfig | Moe2StageConfig:
+    raw_threshold = os.environ.get("PETIT_KERNEL_GPT_OSS_2STAGE_M_THRESHOLD")
+    try:
+        threshold = 128 if raw_threshold is None else int(raw_threshold)
+    except ValueError:
+        threshold = 128
+    return _get_2stage_cfgs_cached(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        q_type,
+        use_g1u1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        is_shuffled,
+        gate_mode,
+        is_ep,
+        has_stage2_bias,
+        threshold,
+        _gcn_arch_name().startswith("gfx950"),
+    )
+
+
+get_2stage_cfgs.cache_clear = _get_2stage_cfgs_cached.cache_clear
 
 
 def _gcn_arch_name(device: torch.device | int | str | None = None) -> str:
@@ -686,18 +1093,21 @@ def get_fp4_solutions(
 
 
 __all__ = [
-    "repack_nvfp4",
-    "repack_mxfp4",
-    "process_nvfp4_scales",
-    "process_mxfp4_scales",
-    "mul_nvfp4_a16",
-    "mul_mxfp4_a16",
+    "DataType",
+    "Moe1StageConfig",
+    "Moe2StageConfig",
+    "MoeKernelLayout",
+    "PetitSolutionHints",
+    "fused_moe_bf16_mxfp4",
     "fused_moe_fp8_blockscale_g1u1",
     "fused_moe_fp8_blockscale_g1u1_mxfp4",
-    "fused_moe_bf16_mxfp4",
+    "get_2stage_cfgs",
     "get_fp4_solutions",
-    "MoeKernelLayout",
+    "mul_mxfp4_a16",
+    "mul_nvfp4_a16",
+    "process_mxfp4_scales",
+    "process_nvfp4_scales",
     "repack_moe_kernel_layout",
-    "DataType",
-    "PetitSolutionHints",
+    "repack_mxfp4",
+    "repack_nvfp4",
 ]

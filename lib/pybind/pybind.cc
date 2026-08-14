@@ -21,7 +21,29 @@ PYBIND11_MODULE(ops, m) {
           pybind11::arg("num_persistent_tgs") = 0,
           pybind11::arg("w13_bias") = pybind11::none(),
           pybind11::arg("w2_bias") = pybind11::none(),
-          "Unified one-stage fused MoE matmul dispatcher with caller-provided output");
+          "Unified one-stage fused MoE matmul dispatcher with caller-provided "
+          "output");
+    m.def("fmoe_matmul_2stage_workspace_size", &FusedMoe2StageWorkspaceSize,
+          pybind11::arg("max_num_m_blocks"), pybind11::arg("inter_dim"),
+          pybind11::arg("solution_id"));
+    m.def("fmoe_matmul_2stage_stage1", &FusedMoeMatmul2Stage1,
+          pybind11::arg("intermediate"), pybind11::arg("input_q"),
+          pybind11::arg("w1_q"), pybind11::arg("sorted_token_ids"),
+          pybind11::arg("sorted_expert_ids"), pybind11::arg("num_valid_ids"),
+          pybind11::arg("topk"), pybind11::arg("input_scale"),
+          pybind11::arg("w1_scale"), pybind11::arg("inter_dim"),
+          pybind11::arg("num_experts"), pybind11::arg("solution_id"),
+          pybind11::arg("num_persistent_tgs") = 0,
+          pybind11::arg("w13_bias") = pybind11::none());
+    m.def("fmoe_matmul_2stage_stage2", &FusedMoeMatmul2Stage2,
+          pybind11::arg("out"), pybind11::arg("intermediate"),
+          pybind11::arg("w2_q"), pybind11::arg("sorted_token_ids"),
+          pybind11::arg("sorted_weights"), pybind11::arg("sorted_expert_ids"),
+          pybind11::arg("num_valid_ids"), pybind11::arg("topk"),
+          pybind11::arg("w2_scale"), pybind11::arg("inter_dim"),
+          pybind11::arg("num_experts"), pybind11::arg("solution_id"),
+          pybind11::arg("num_persistent_tgs") = 0,
+          pybind11::arg("w2_bias") = pybind11::none());
     m.def("get_nvfp4_solutions", &GetNvFp4Solutions,
           "Get possible fp4 solutions");
     m.def("get_fp4_solutions", &GetNvFp4Solutions,

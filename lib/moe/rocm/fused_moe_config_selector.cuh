@@ -18,6 +18,7 @@
 #include "moe/rocm/mem/input_mxfp4.cuh"
 #include "moe/rocm/mem/weight_blockscale_fp8.cuh"
 #include "moe/rocm/mem/weight_mxfp4.cuh"
+#include "moe/rocm/fused_moe_2stage_kernel.cuh"
 
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
@@ -310,10 +311,12 @@ struct HiddenShuffleSelector<FusedMoEDataType::kMxFp4, Config> {
                                 typename Config::Stage2Tiles::InputRegs>;
 };
 
-template <FusedMoESolutionId id> struct ConfigSelector {
+template <FusedMoESolutionId id, unsigned kTopK_ = 4>
+struct ConfigSelector {
+    using Self = ConfigSelector<id, kTopK_>;
     static constexpr unsigned kDim = id.Dim();
     static constexpr unsigned kInterDim = id.InterDim();
-    static constexpr unsigned kTopK = 4;
+    static constexpr unsigned kTopK = kTopK_;
     static_assert(FusedMoESolutionId::IsShapeEncodable(kDim, kInterDim));
     static constexpr unsigned kGroupM = 32;
     static constexpr unsigned kStage1GroupN =
@@ -335,10 +338,9 @@ template <FusedMoESolutionId id> struct ConfigSelector {
 
     using ActivationOp =
         typename FusedMoEActivationSelector<id.activation>::Type;
-    using Input =
-        typename FusedMoEInputSelector<id.act_dtype, ConfigSelector<id>>::Type;
-    using Weight = FusedMoEWeightSelector<id.weight_dtype, id.weight_ordering,
-                                          ConfigSelector<id>>;
+    using Input = typename FusedMoEInputSelector<id.act_dtype, Self>::Type;
+    using Weight =
+        FusedMoEWeightSelector<id.weight_dtype, id.weight_ordering, Self>;
     using W13Weights = typename Weight::W13Weights;
     using W2Weights = typename Weight::W2Weights;
     using W13 = typename W13Weights::W13;
@@ -350,18 +352,16 @@ template <FusedMoESolutionId id> struct ConfigSelector {
         typename BiasLayoutSelector<id.bias_dtype, id.weight_dtype, id.mfma,
                                     kNumWarps, kGroupN>::Type;
     using Stage1Tiles = typename FusedMoEStage1TilesSelector<
-        id.weight_dtype, id.weight_ordering, id.mfma,
-        ConfigSelector<id>>::Type;
+        id.weight_dtype, id.weight_ordering, id.mfma, Self>::Type;
     using Stage1Op =
         typename FusedMoEStage1OpSelector<id.stage1_buffering,
                                           Stage1Tiles>::Type;
     using Stage2Tiles = typename FusedMoEStage2TilesSelector<
-        id.weight_dtype, id.weight_ordering, id.mfma,
-        ConfigSelector<id>>::Type;
+        id.weight_dtype, id.weight_ordering, id.mfma, Self>::Type;
     using Stage2Op = OnestageFusedMoEStage2Op<Stage2Tiles>;
     using Weights = typename Weight::Weights;
     using QuantizeAndShuffleOp =
-        typename HiddenShuffleSelector<id.act_dtype, ConfigSelector<id>>::Type;
+        typename HiddenShuffleSelector<id.act_dtype, Self>::Type;
 
     template <class Kernel>
     __device__ static void
@@ -385,9 +385,8 @@ template <FusedMoESolutionId id> struct ConfigSelector {
         static_assert(kDim % kQuantBlockK == 0);
         static_assert(kInterDim % kGroupDim == 0);
         static constexpr unsigned kSplitK = kInterDim / kGroupDim;
-        using Epilogue =
-            OnestageFusedMoEStage1Epilogue<ConfigSelector<id>>;
-        using Kernel = FusedMoEStage1<ConfigSelector<id>, Epilogue>;
+        using Epilogue = OnestageFusedMoEStage1Epilogue<Self>;
+        using Kernel = FusedMoEStage1<Self, Epilogue>;
 
         if (params.out == nullptr || params.num_valid_ids == nullptr) {
             return kFusedMoEErrorInvalidArgument;
@@ -494,6 +493,22 @@ static constexpr FusedMoESolutionId kFusedMoEMxFp4NativeMxFp4BiasSolutionId =
         FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kNativeMxFp4,
         FusedMoEMfmaShape::kMfmaScaleFp4MxFp4, FusedMoEStages::kOneStage,
         FusedMoEActivationFunction::kOpenAISwiGLU,
+        FusedMoEStage1Buffering::kDoubleBuffer);
+
+static constexpr FusedMoESolutionId kFusedMoETwoStageMxFp4BiasSolutionId =
+    FusedMoESolutionId::Make(
+        FusedMoEDataType::kMxFp4, FusedMoEDataType::kMxFp4,
+        FusedMoEDataType::kBf16, FusedMoEWeightOrdering::kNativeMxFp4,
+        FusedMoEMfmaShape::kMfmaScaleFp4MxFp4, FusedMoEStages::kTwoStage,
+        FusedMoEActivationFunction::kOpenAISwiGLU,
+        FusedMoEStage1Buffering::kDoubleBuffer, 3072, 3072);
+
+static constexpr FusedMoESolutionId kFusedMoETwoStageMxFp4SiluSolutionId =
+    FusedMoESolutionId::MakeBase(
+        FusedMoEDataType::kMxFp4, FusedMoEDataType::kMxFp4,
+        FusedMoEDataType::kNone, FusedMoEWeightOrdering::kNativeMxFp4,
+        FusedMoEMfmaShape::kMfmaScaleFp4MxFp4, FusedMoEStages::kTwoStage,
+        FusedMoEActivationFunction::kSiluDot,
         FusedMoEStage1Buffering::kDoubleBuffer);
 
 } // namespace causalflow::petit::rocm::moe

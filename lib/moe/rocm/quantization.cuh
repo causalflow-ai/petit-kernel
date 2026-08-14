@@ -151,6 +151,42 @@ struct NativeMxFp4Quantization {
     }
 };
 
+struct AiterMxFp4Quantization {
+    using f32x4 = float __attribute__((ext_vector_type(4)));
+
+    __device__ static float MaximumAbs(float4 value) {
+        const f32x4 elements{value.x, value.y, value.z, value.w};
+        return __builtin_reduce_maximum(
+            __builtin_elementwise_abs(elements));
+    }
+
+    __device__ static MxFp4Scale EncodeScale(float max_abs) {
+        unsigned bits = reinterpret_cast<const unsigned &>(max_abs);
+        bits = (bits + 0x00400000u) & 0xff800000u;
+        const unsigned exponent = max(bits >> 23, 2u);
+        const unsigned scale_byte = exponent - 2;
+        const unsigned scale_bits = scale_byte << 23;
+        return {scale_byte, reinterpret_cast<const float &>(scale_bits)};
+    }
+
+    template <unsigned kVectors>
+    __device__ static void Pack(unsigned char *dst,
+                                const float4 values[kVectors],
+                                const MxFp4Scale &scale) {
+        auto *packed = reinterpret_cast<unsigned short *>(dst);
+#pragma unroll
+        for (unsigned vector = 0; vector < kVectors; ++vector) {
+            const float4 value = values[vector];
+            unsigned word = 0;
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(
+                word, value.x, value.y, scale.packing_scale, 0);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(
+                word, value.z, value.w, scale.packing_scale, 1);
+            packed[vector] = static_cast<unsigned short>(word);
+        }
+    }
+};
+
 template <class Quantization, unsigned kVectors>
 __device__ static inline unsigned
 QuantizeMxFp4(unsigned char *dst, const float4 values[kVectors],
