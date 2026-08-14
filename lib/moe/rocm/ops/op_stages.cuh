@@ -24,27 +24,20 @@ template <class TileOps_> struct W13TileSchedule {
         TileOps::kActivationFragments;
 
     Input &input;
-    Weight &w1, &w3;
-    Bias &w1_bias, &w3_bias;
+    Weight &w1;
+    Bias &w13_bias;
     typename TileOps::Tile w1_tile, w3_tile;
 
-    __device__ W13TileSchedule(Input &input, Weight &w1, Weight &w3,
-                               Bias &w1_bias, Bias &w3_bias)
-        : input(input), w1(w1), w3(w3), w1_bias(w1_bias), w3_bias(w3_bias) {}
+    __device__ W13TileSchedule(Input &input, Weight &w1, Bias &bias)
+        : input(input), w1(w1), w13_bias(bias) {}
 
-    __device__ void InitializeBias(const void *w13_bias, unsigned expert_id,
+    __device__ void InitializeBias(const void *bias_ptr, unsigned expert_id,
                                    unsigned tile_k) {
         const unsigned projection_stride =
             Bias::PackedStride(Config::kInterDim);
         const unsigned expert_stride = 2 * projection_stride;
-        const void *w3_bias_ptr =
-            w13_bias == nullptr ? nullptr
-                                : reinterpret_cast<const char *>(w13_bias) +
-                                      projection_stride * Bias::kElementBytes;
-        w1_bias.Initialize(w13_bias, expert_id, Config::kInterDim, tile_k,
-                           expert_stride);
-        w3_bias.Initialize(w3_bias_ptr, expert_id, Config::kInterDim, tile_k,
-                           expert_stride);
+        w13_bias.Initialize(bias_ptr, expert_id, Config::kInterDim, tile_k,
+                            expert_stride);
     }
 
     __device__ void PrefetchInput(Shm *shm, unsigned wid, unsigned wtid,
@@ -60,9 +53,8 @@ template <class TileOps_> struct W13TileSchedule {
 
     __device__ void LoadInitial(unsigned tid, unsigned wid, unsigned wtid) {
         TileOps::Load(w1, w1_tile, tid, wid, wtid);
-        TileOps::Load(w3, w3_tile, tid, wid, wtid);
+        LoadW3Tile(tid, wid, wtid);
         w1.template AdvanceStep<0, TileOps::kKStages>();
-        w3.template AdvanceStep<0, TileOps::kKStages>();
     }
 
     __device__ void Matmul(float4 gate[kAccumFragments],
@@ -72,15 +64,27 @@ template <class TileOps_> struct W13TileSchedule {
         TileOps::Matmul(gate, w1_tile, input_regs, wtid);
         TileOps::Matmul(up, w3_tile, input_regs, wtid);
         TileOps::Load(w1, w1_tile, tid, wid, wtid);
-        TileOps::Load(w3, w3_tile, tid, wid, wtid);
+        LoadW3Tile(tid, wid, wtid);
         w1.template AdvanceStep<0, TileOps::kKStages>();
-        w3.template AdvanceStep<0, TileOps::kKStages>();
     }
 
     __device__ void AddBias(float4 gate[kAccumFragments],
                             float4 up[kAccumFragments], unsigned tid) const {
-        w1_bias.AddToAccumulator(gate, 0, tid);
-        w3_bias.AddToAccumulator(up, 0, tid);
+        w13_bias.AddToAccumulator(gate, 0, tid);
+        w13_bias.AddToAccumulator(up, Bias::PackedStride(Config::kInterDim),
+                                  tid);
+    }
+
+  private:
+    __device__ void LoadW3Tile(unsigned tid, unsigned wid, unsigned wtid) {
+        static constexpr unsigned kValueOffset =
+            Weight::ValueProjectionOffsetBytes(Config::kDim,
+                                               Config::kInterDim);
+        static constexpr unsigned kScaleOffset =
+            Weight::ScaleProjectionOffsetBytes(Config::kDim,
+                                               Config::kInterDim);
+        TileOps::LoadProjection(w1, w3_tile, tid, wid, wtid, kValueOffset,
+                                kScaleOffset);
     }
 };
 

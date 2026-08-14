@@ -41,16 +41,18 @@ template <class Config> struct BlockScaleFp8W13 {
             scales_w13 + expert_id * (2 * k_blocks * n_blocks) +
             tile_k * kGroupDimScaleBlocks * (dim / kScaleBlockSize);
         const unsigned w13_value_range = Config::kGroupDim * dim;
+        const unsigned w13_combined_value_range =
+            inter_dim * dim + w13_value_range;
         const unsigned w13_scale_range =
             kGroupDimScaleBlocks * n_blocks * sizeof(float);
-        w1_.Initialize(w1_ptr, w13_value_range, scale_w1_ptr, w13_scale_range,
-                       dim);
-        w3_.Initialize(w1_ptr + inter_dim * dim / kVecSize, w13_value_range,
-                       scale_w1_ptr + k_blocks * n_blocks, w13_scale_range,
-                       dim);
+        const unsigned w13_combined_scale_range =
+            W13::ScaleProjectionOffsetBytes(dim, inter_dim) +
+            w13_scale_range;
+        w1_.Initialize(w1_ptr, w13_combined_value_range, scale_w1_ptr,
+                       w13_combined_scale_range, dim);
     }
 
-    W13 w1_, w3_;
+    W13 w1_;
 };
 
 template <class Config> struct BlockScaleFp8W2 {

@@ -129,8 +129,7 @@ template <class Config_, class Epilogue_> struct FusedMoEStage1 {
                            const unsigned tokens[kTokenBatch], unsigned m,
                            unsigned expert_id, unsigned tile_k,
                            const void *w13_bias) {
-        Stage1Tiles tiles{input_, w13_weights_.w1_, w13_weights_.w3_,
-                          w1_bias_, w3_bias_};
+        Stage1Tiles tiles{input_, w13_weights_.w1_, w13_bias_};
         tiles.InitializeBias(w13_bias, expert_id, tile_k);
         Stage1Op::Run(h, stage1_shm, tiles, tid, wid, wtid, tokens, m);
     }
@@ -213,7 +212,7 @@ template <class Config_, class Epilogue_> struct FusedMoEStage1 {
 
     Input input_;
     W13Weights w13_weights_;
-    Bias w1_bias_, w3_bias_;
+    Bias w13_bias_;
     Epilogue epilogue_;
 };
 

@@ -97,9 +97,8 @@ struct Bf16BiasLayout {
     }
 
     __device__ void Initialize(const void *value_ptr, unsigned expert_id,
-                               unsigned dim, unsigned tile_k,
+                               unsigned, unsigned tile_k,
                                unsigned expert_stride) {
-        const unsigned packed_stride = PackedStride(dim);
         const unsigned tile_col = tile_k * kGroupN;
         const unsigned value_offset = expert_id * expert_stride + tile_col;
         // Schedulers only issue in-range tiles. A zero descriptor range makes
@@ -109,7 +108,7 @@ struct Bf16BiasLayout {
                    value_offset * kElementBytes,
             .range = value_ptr == nullptr
                          ? 0
-                         : (packed_stride - tile_col) * kElementBytes,
+                         : (expert_stride - tile_col) * kElementBytes,
             .config = BufferResource::kDataFormatU32Config,
         };
     }

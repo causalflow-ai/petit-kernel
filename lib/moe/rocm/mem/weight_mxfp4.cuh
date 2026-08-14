@@ -64,17 +64,18 @@ template <class Config> struct MxFp4W13 {
                                        expert_id * w13_scale_words_per_expert +
                                        tile_k * scale_words_per_k_tile;
         const unsigned w13_value_range = W13::kGroupN * dim / 2;
+        const unsigned w13_combined_value_range =
+            inter_dim * dim / 2 + w13_value_range;
         const unsigned w13_scale_range =
             scale_words_per_k_tile * kScaleWordBytes;
-        w1_.Initialize(w1_ptr, w13_value_range, scale_w1_ptr, w13_scale_range,
-                       dim);
-        w3_.Initialize(w1_ptr + inter_dim * dim / kWeightVecSize,
-                       w13_value_range,
-                       scale_w1_ptr + w13_scale_words_per_expert / 2,
-                       w13_scale_range, dim);
+        const unsigned w13_combined_scale_range =
+            W13::ScaleProjectionOffsetBytes(dim, inter_dim) +
+            w13_scale_range;
+        w1_.Initialize(w1_ptr, w13_combined_value_range, scale_w1_ptr,
+                       w13_combined_scale_range, dim);
     }
 
-    W13 w1_, w3_;
+    W13 w1_;
 };
 
 template <class Config> struct MxFp4W2 {

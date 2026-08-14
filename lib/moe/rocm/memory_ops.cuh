@@ -112,14 +112,26 @@ struct W13Layout {
 
     static_assert(kGroupN % 32 == 0, "");
 
+    TAL_HOST_DEVICE static constexpr unsigned
+    ValueProjectionOffsetBytes(unsigned dim, unsigned inter_dim) {
+        return dim * inter_dim * sizeof(Scalar);
+    }
+
+    TAL_HOST_DEVICE static constexpr unsigned
+    ScaleProjectionOffsetBytes(unsigned dim, unsigned inter_dim) {
+        return (dim / kScaleBlockSize) * (inter_dim / kScaleBlockSize) *
+               sizeof(float);
+    }
+
     __device__ void Initialize(const void *value_ptr, unsigned value_range,
                                const void *scale_ptr, unsigned scale_range,
                                unsigned dim);
 
     template <int kAux = TargetWeightLoadPolicy::kAux>
     __device__ void LoadTile(uint4 reg[kTileLoads], unsigned stage,
-                             unsigned wid, unsigned wtid);
-    __device__ float LoadScale(unsigned tid);
+                             unsigned wid, unsigned wtid,
+                             unsigned value_offset = 0);
+    __device__ float LoadScale(unsigned tid, unsigned scale_offset = 0);
     template <int kTileN, int kTileK> __device__ void AdvanceStep();
 
   private:
@@ -150,7 +162,8 @@ __device__ void W13Layout<Scalar, kNumWarps_, kGroupN_>::Initialize(
 template <class Scalar, unsigned kNumWarps_, unsigned kGroupN_>
 template <int kAux>
 __device__ void W13Layout<Scalar, kNumWarps_, kGroupN_>::LoadTile(
-    uint4 reg[kTileLoads], unsigned stage, unsigned wid, unsigned wtid) {
+    uint4 reg[kTileLoads], unsigned stage, unsigned wid, unsigned wtid,
+    unsigned value_offset) {
     // Match reference assembly:
     //   v44 = (wid * 16 * stride_bytes) + (lane_id * 16)
     //   v45/v46/v47 = v44 + {64,128,192} * stride_bytes
@@ -161,7 +174,8 @@ __device__ void W13Layout<Scalar, kNumWarps_, kGroupN_>::LoadTile(
         for (int j = 0; j < 2; j++) {
             reg[i * 2 + j] = v_.template Load<kAux>(
                 voffset + i * row_stride_bytes +
-                    (stage * 2 + j) * kWarpSize * sizeof(uint4),
+                    (stage * 2 + j) * kWarpSize * sizeof(uint4) +
+                    value_offset,
                 v_offset_);
         }
     }
@@ -169,9 +183,10 @@ __device__ void W13Layout<Scalar, kNumWarps_, kGroupN_>::LoadTile(
 
 template <class Scalar, unsigned kNumWarps_, unsigned kGroupN_>
 __device__ float
-W13Layout<Scalar, kNumWarps_, kGroupN_>::LoadScale(unsigned tid) {
+W13Layout<Scalar, kNumWarps_, kGroupN_>::LoadScale(unsigned tid,
+                                                   unsigned scale_offset) {
     unsigned off = ((tid & 1) * stride_ / kScaleBlockSize) * sizeof(unsigned) +
-                   (tid & 2) * 2;
+                   (tid & 2) * 2 + scale_offset;
     const unsigned u =
         scales_.template LoadU32<BufferResource::kNone>(off, s_offset_);
     return reinterpret_cast<const float &>(u);
@@ -312,15 +327,27 @@ struct MxFp4WeightLayout {
 
     static_assert(kGroupN % 64 == 0, "");
 
+    TAL_HOST_DEVICE static constexpr unsigned
+    ValueProjectionOffsetBytes(unsigned dim, unsigned inter_dim) {
+        return dim * inter_dim / 2;
+    }
+
+    TAL_HOST_DEVICE static constexpr unsigned
+    ScaleProjectionOffsetBytes(unsigned dim, unsigned inter_dim) {
+        return dim * inter_dim / kRowGroupSize;
+    }
+
     __device__ void Initialize(const void *value_ptr, unsigned value_range,
                                const void *scale_ptr, unsigned scale_range,
                                unsigned stride_n);
 
     template <int kAux = TargetWeightLoadPolicy::kAux>
     __device__ void LoadTile(uint4 reg[kLoadGlobal], unsigned stage,
-                             unsigned wid, unsigned wtid);
+                             unsigned wid, unsigned wtid,
+                             unsigned value_offset = 0);
     __device__ unsigned LoadScale(unsigned wid, unsigned wtid,
-                                  unsigned n32_pair);
+                                  unsigned n32_pair,
+                                  unsigned scale_offset = 0);
 
     template <int kTileN, int kTileK> __device__ void AdvanceStep();
 
@@ -363,14 +390,15 @@ __device__ inline void MxFp4WeightLayout<kNumWarps_, kLayout_>::Initialize(
 template <unsigned kNumWarps_, MxFp4TileShape kLayout_>
 template <int kAux>
 __device__ inline void MxFp4WeightLayout<kNumWarps_, kLayout_>::LoadTile(
-    uint4 reg[kLoadGlobal], unsigned stage, unsigned wid, unsigned wtid) {
+    uint4 reg[kLoadGlobal], unsigned stage, unsigned wid, unsigned wtid,
+    unsigned value_offset) {
     const unsigned lane_k_offset = wtid * sizeof(uint4);
     const unsigned k_offset = LayoutSelector::K128OffsetBytes(stage);
 #pragma unroll
     for (unsigned fragment = 0; fragment < kLoadGlobal; ++fragment) {
         const unsigned voffset =
             LayoutSelector::ValueOffsetBytes(wid, fragment, stride_n_) +
-            lane_k_offset + k_offset;
+            lane_k_offset + k_offset + value_offset;
         reg[fragment] = v_.template Load<kAux>(voffset, v_offset_);
     }
 }
@@ -378,22 +406,22 @@ __device__ inline void MxFp4WeightLayout<kNumWarps_, kLayout_>::LoadTile(
 template <unsigned kNumWarps_, MxFp4TileShape kLayout_>
 __device__ inline unsigned
 MxFp4WeightLayout<kNumWarps_, kLayout_>::LoadScale(unsigned wid, unsigned wtid,
-                                                   unsigned n32_pair) {
+                                                   unsigned n32_pair,
+                                                   unsigned scale_offset) {
     if constexpr (kLayout_ == MxFp4TileShape::kN128) {
-        const unsigned off = wid * stride_n_ + wtid * sizeof(unsigned);
+        const unsigned off = wid * stride_n_ + wtid * sizeof(unsigned) +
+                             scale_offset;
         return scales_.template LoadU32<BufferResource::kNone>(off, s_offset_);
+    } else {
+        const unsigned k256_blocks = stride_n_ / 256;
+        // scale_word = ([N32] * K256_blocks + K256) * 64 + lane. The K256
+        // component is carried by s_offset_ or folded into the W2 resource
+        // base.
+        const unsigned n32 = LayoutSelector::N32Offset(wid, n32_pair);
+        const unsigned word = n32 * k256_blocks * kWarpSize + wtid;
+        return scales_.template LoadU32<BufferResource::kNone>(
+            word * sizeof(unsigned) + scale_offset, s_offset_);
     }
-    const unsigned k256_blocks = stride_n_ / 256;
-    // scale_word = ([N32] * K256_blocks + K256) * 64 + lane. The K256
-    // component is carried by s_offset_ or folded into the W2 resource base.
-    const unsigned n32 = [&] {
-        if constexpr (kLayout_ == MxFp4TileShape::kM64N256)
-            return LayoutSelector::N32Offset(wid, n32_pair);
-        return 2 * wid + n32_pair;
-    }();
-    const unsigned word = n32 * k256_blocks * kWarpSize + wtid;
-    return scales_.template LoadU32<BufferResource::kNone>(
-        word * sizeof(unsigned), s_offset_);
 }
 
 template <class Scalar, unsigned kNumWarps_, unsigned kGroupN_>

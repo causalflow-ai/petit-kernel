@@ -69,6 +69,15 @@ template <class Config_, class Weight_> struct BlockScaleFp8TileOps {
         tile.scale = weight.LoadScale(tid);
     }
 
+    __device__ static void
+    LoadProjection(Weight &weight, Tile &tile, unsigned tid, unsigned wid,
+                   unsigned wtid, unsigned value_offset,
+                   unsigned scale_offset) {
+        weight.LoadTile(tile.value[0], 0, wid, wtid, value_offset);
+        weight.LoadTile(tile.value[1], 1, wid, wtid, value_offset);
+        tile.scale = weight.LoadScale(tid, scale_offset);
+    }
+
     __device__ static void Matmul(float4 t[kAccumFragments], const Tile &tile,
                                   const InputRegs &input, unsigned) {
         MatmulOp::Matmul(t, tile.value[0], input.x, input.scale, tile.scale,
@@ -134,6 +143,16 @@ template <class Config_, class Weight_> struct PetitMxFp4TileOps {
         tile.scale[1] = weight.LoadScale(wid, wtid, 1);
     }
 
+    __device__ static void
+    LoadProjection(Weight &weight, Tile &tile, unsigned, unsigned wid,
+                   unsigned wtid, unsigned value_offset,
+                   unsigned scale_offset) {
+        weight.LoadTile(tile.value[0], 0, wid, wtid, value_offset);
+        weight.LoadTile(tile.value[1], 1, wid, wtid, value_offset);
+        tile.scale[0] = weight.LoadScale(wid, wtid, 0, scale_offset);
+        tile.scale[1] = weight.LoadScale(wid, wtid, 1, scale_offset);
+    }
+
     __device__ static void Matmul(float4 t[kAccumFragments], const Tile &tile,
                                   const InputRegs &input, unsigned) {
 #pragma unroll
@@ -194,6 +213,16 @@ template <class Config_, class Weight_> struct Bf16MxFp4TileOps {
         weight.LoadTile(tile.value[1], 1, wid, wtid);
         tile.scale[0] = weight.LoadScale(wid, wtid, 0);
         tile.scale[1] = weight.LoadScale(wid, wtid, 1);
+    }
+
+    __device__ static void
+    LoadProjection(Weight &weight, Tile &tile, unsigned, unsigned wid,
+                   unsigned wtid, unsigned value_offset,
+                   unsigned scale_offset) {
+        weight.LoadTile(tile.value[0], 0, wid, wtid, value_offset);
+        weight.LoadTile(tile.value[1], 1, wid, wtid, value_offset);
+        tile.scale[0] = weight.LoadScale(wid, wtid, 0, scale_offset);
+        tile.scale[1] = weight.LoadScale(wid, wtid, 1, scale_offset);
     }
 
     __device__ static void Matmul(float4 t[kAccumFragments], const Tile &tile,
@@ -260,6 +289,19 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
              n32_pair < Weight::kLoadGlobal / 2; ++n32_pair)
             tile.scale[n32_pair] =
                 weight.LoadScale(wid, wtid, n32_pair);
+    }
+
+    __device__ static void
+    LoadProjection(Weight &weight, Tile &tile, unsigned, unsigned wid,
+                   unsigned wtid, unsigned value_offset,
+                   unsigned scale_offset) {
+        weight.LoadTile(tile.value[0], 0, wid, wtid, value_offset);
+        weight.LoadTile(tile.value[1], 1, wid, wtid, value_offset);
+#pragma unroll
+        for (unsigned n32_pair = 0;
+             n32_pair < Weight::kLoadGlobal / 2; ++n32_pair)
+            tile.scale[n32_pair] =
+                weight.LoadScale(wid, wtid, n32_pair, scale_offset);
     }
 
     __device__ static void Matmul(float4 t[kAccumFragments], const Tile &tile,
