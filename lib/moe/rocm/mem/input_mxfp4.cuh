@@ -22,7 +22,6 @@ template <class Config> struct MxFp4Input {
     static constexpr unsigned kK32PerTile = 4;
     static constexpr unsigned kRowVecsPerTile = kK128Tiles * kK32PerTile;
     static constexpr unsigned kMmaRows = 16;
-    static constexpr unsigned kTokenSubRows = kMmaRows / kNumWarps;
     static constexpr unsigned kAsyncVecsPerWarp =
         kTokenBatch * kRowVecsPerTile;
     static constexpr unsigned kLoadIterations =
@@ -55,17 +54,9 @@ template <class Config> struct MxFp4Input {
             tal::make_stride(tal::C<kK32PerTile>{}, tal::_1{}));
     }
 
-    __device__ static auto MakeSharedReadLayout() {
-        using namespace tal;
-        using ReadLayout = Layout<
-            Shape<_2, C<kK128Tiles>,
-                  Shape<Shape<C<kNumWarps>, C<kTokenSubRows>>,
-                        C<kK32PerTile>>>,
-            Stride<C<kMmaRows * kRowVecsPerTile>, C<kK32PerTile>,
-                   Stride<Stride<C<kRowVecsPerTile>,
-                                 C<kNumWarps * kRowVecsPerTile>>,
-                          _1>>>;
-        return ReadLayout{};
+    TAL_HOST_DEVICE static constexpr unsigned
+    SwizzledVector(unsigned row, unsigned vector) {
+        return vector ^ (row & (kRowVecsPerTile - 1));
     }
 
     __device__ void Initialize(const void *value_ptr, const void *scale_ptr,
@@ -99,11 +90,12 @@ template <class Config> struct MxFp4Input {
             }
             const unsigned token_idx = linear / kRowVecsPerTile;
             const unsigned row_vec = linear - token_idx * kRowVecsPerTile;
-            const unsigned k128 = row_vec / kK32PerTile;
-            const unsigned k32 = row_vec - k128 * kK32PerTile;
-            const unsigned dst_idx =
-                load * kThreads +
-                wid * kTokenBatch * kRowVecsPerTile;
+            const unsigned source_row_vec =
+                SwizzledVector(token_idx, row_vec);
+            const unsigned k128 = source_row_vec / kK32PerTile;
+            const unsigned k32 = source_row_vec - k128 * kK32PerTile;
+            const unsigned dst_idx = wid * kAsyncVecsPerWarp +
+                                     load * kWarpSize;
             auto lds_ptr =
                 (__attribute__((address_space(3))) unsigned *)(shm_x +
                                                                dst_idx);
@@ -137,16 +129,21 @@ template <class Config> struct MxFp4Input {
 
     __device__ void FetchToRegs(uint4 regs[kActivationFragments],
                                 const uint4 *shm_x, unsigned wtid) const {
-        using namespace tal;
-        const auto shared_layout = MakeSharedReadLayout();
-        for (unsigned row = 0; row < 2; ++row) {
-            for (unsigned k128 = 0; k128 < kK128Tiles; ++k128) {
-                const unsigned out_idx = row * kK128Tiles + k128;
-                const unsigned src_idx =
-                    shared_layout(make_coord(row, k128, wtid));
-                regs[out_idx] = shm_x[src_idx];
-            }
-        }
+        const unsigned wid = threadIdx.x / kWarpSize;
+        const unsigned wave_m = wid / kWarpsN;
+        const unsigned row = wtid & (kMmaRows - 1);
+        const unsigned vector = wtid / kMmaRows;
+        const unsigned row_base =
+            (wave_m * 32 + row) * kRowVecsPerTile;
+        const uint4 *const k0 =
+            shm_x + row_base + SwizzledVector(row, vector);
+        const uint4 *const k1 =
+            shm_x + row_base + SwizzledVector(row, vector + kK32PerTile);
+        static constexpr unsigned kNextRow = kMmaRows * kRowVecsPerTile;
+        regs[0] = k0[0];
+        regs[1] = k1[0];
+        regs[2] = k0[kNextRow];
+        regs[3] = k1[kNextRow];
     }
 
     __device__ unsigned FetchScaleToReg(const unsigned *shm_scale,
