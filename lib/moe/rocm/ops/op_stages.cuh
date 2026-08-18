@@ -302,6 +302,7 @@ template <class TileSchedule> struct TwoStageStage2Epilogue {
     struct Shm {
         unsigned short output[kTileRows * kTileCols];
         unsigned output_row_offsets[kTileRows];
+        float route_weights[kTileRows];
     };
 
     static_assert(kTileRows == Config::kStage2GroupM,
@@ -328,6 +329,17 @@ template <class TileSchedule> struct TwoStageStage2Epilogue {
                                                 unsigned offset) {
         if (row < kTileRows)
             shm.output_row_offsets[row] = offset;
+    }
+
+    __device__ static void StoreRouteWeight(Shm &shm, unsigned row,
+                                            unsigned weight) {
+        if (row < kTileRows)
+            shm.route_weights[row] = reinterpret_cast<const float &>(weight);
+    }
+
+    __device__ static float2 LoadRouteWeights(const Shm &shm, unsigned wtid) {
+        const unsigned row = wtid % 16;
+        return {shm.route_weights[row], shm.route_weights[row + 16]};
     }
 
     __device__ static void WriteShm(Shm &shm,
