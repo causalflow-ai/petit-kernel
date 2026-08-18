@@ -17,6 +17,17 @@ from petit_kernel.moe_mxfp4 import MoeKernelLayout
 BLOCK_N = 128
 BLOCK_K = 128
 SORTED_TOKEN_PADDING = 32
+AITER_STAGE1_TUNING_NAME = "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2"
+AITER_STAGE1_KERNEL_SYMBOL = (
+    "mfma_moe1_silu_mul_afp4_wfp4_bf16_t32x128x256_pm1_async_swiglu_v32"
+)
+AITER_STAGE2_TUNING_NAME = (
+    "flydsl_moe2_afp4_wfp4_bf16_t32x256x256_atomic_bnt2_persist"
+)
+AITER_STAGE2_KERNEL_SYMBOL = (
+    "mfma_moe2_afp4_wfp4_bf16_cshuffle_t32x256x256_vscale_fix3_"
+    "fp4opt_v1_persist_cu256"
+)
 
 
 KERNEL_VARIANTS = (
@@ -24,11 +35,38 @@ KERNEL_VARIANTS = (
     "fp8_petit_mxfp4_silu",
     "fp8_petit_mxfp4_openai_bias",
     "bf16_native_mxfp4_openai_bias",
+    "mxfp4_native_mxfp4_silu",
     "mxfp4_native_mxfp4_openai_bias",
+    "mxfp4_native_mxfp4_openai_bias_2stage",
+    "mxfp4_native_mxfp4_openai_bias_2stage_m64_n512",
+    "mxfp4_native_mxfp4_silu_2stage",
     "aiter_fp8_blockscale_silu",
     "aiter_dynamic_fp8_blockscale_silu",
     "aiter_dynamic_mxfp4_silu",
+    "aiter_mxfp4_silu",
+    "aiter_mxfp4_openai_bias_2stage",
+    "aiter_dynamic_mxfp4_openai_bias",
 )
+
+MODEL_PRESETS = {
+    "gpt-oss-120b": (3072, 3072, 16, 4),
+    "deepseekv3": (7168, 2048, 33, 9),
+    "deepseekv4": (7168, 3072, 49, 7),
+}
+MODEL_KERNEL_VARIANTS = {
+    "gpt-oss-120b": {
+        "petit": "mxfp4_native_mxfp4_openai_bias_2stage",
+        "aiter": "aiter_mxfp4_openai_bias_2stage",
+    },
+    "deepseekv3": {
+        "petit": "mxfp4_native_mxfp4_silu_2stage",
+        "aiter": "aiter_mxfp4_silu",
+    },
+    "deepseekv4": {
+        "petit": "mxfp4_native_mxfp4_silu_2stage",
+        "aiter": "aiter_mxfp4_silu",
+    },
+}
 
 
 def make_solution_id(
@@ -63,6 +101,9 @@ class KernelVariant:
     has_bias: bool = False
     aiter_supported: bool = False
     activation_quantization: str | None = None
+    two_stage: bool = False
+    aiter_activation: str = "silu"
+    sorted_token_padding: int = SORTED_TOKEN_PADDING
 
 
 VARIANTS = {
@@ -96,6 +137,13 @@ VARIANTS = {
         solution_id=make_solution_id(5, 1, 5, 0, 1, 0, 1, 1),
         has_bias=True,
     ),
+    "mxfp4_native_mxfp4_silu": KernelVariant(
+        name="mxfp4_native_mxfp4_silu",
+        act_format="mxfp4",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.native_mxfp4,
+        solution_id=make_solution_id(1, 1, 0, 0, 2, 0, 0, 1),
+    ),
     "mxfp4_native_mxfp4_openai_bias": KernelVariant(
         name="mxfp4_native_mxfp4_openai_bias",
         act_format="mxfp4",
@@ -103,6 +151,37 @@ VARIANTS = {
         weight_layout=MoeKernelLayout.native_mxfp4,
         solution_id=make_solution_id(1, 1, 5, 0, 2, 0, 1, 1),
         has_bias=True,
+    ),
+    "mxfp4_native_mxfp4_openai_bias_2stage": KernelVariant(
+        name="mxfp4_native_mxfp4_openai_bias_2stage",
+        act_format="mxfp4",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.native_mxfp4,
+        solution_id=petit_kernel._FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID,
+        has_bias=True,
+        two_stage=True,
+        aiter_activation="swiglu",
+    ),
+    "mxfp4_native_mxfp4_openai_bias_2stage_m64_n512": KernelVariant(
+        name="mxfp4_native_mxfp4_openai_bias_2stage_m64_n512",
+        act_format="mxfp4",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.native_mxfp4,
+        solution_id=(
+            petit_kernel._FUSED_MOE_TWO_STAGE_MXFP4_BIAS_M64_N512_SOLUTION_ID
+        ),
+        has_bias=True,
+        two_stage=True,
+        aiter_activation="swiglu",
+        sorted_token_padding=64,
+    ),
+    "mxfp4_native_mxfp4_silu_2stage": KernelVariant(
+        name="mxfp4_native_mxfp4_silu_2stage",
+        act_format="mxfp4",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.native_mxfp4,
+        solution_id=0,
+        two_stage=True,
     ),
     "aiter_fp8_blockscale_silu": KernelVariant(
         name="aiter_fp8_blockscale_silu",
@@ -131,6 +210,37 @@ VARIANTS = {
         aiter_supported=True,
         activation_quantization="dynamic_mxfp4",
     ),
+    "aiter_mxfp4_silu": KernelVariant(
+        name="aiter_mxfp4_silu",
+        act_format="mxfp4",
+        weight_kind="aiter_mxfp4",
+        weight_layout=None,
+        solution_id=0,
+        aiter_supported=True,
+        activation_quantization="static_mxfp4",
+    ),
+    "aiter_mxfp4_openai_bias_2stage": KernelVariant(
+        name="aiter_mxfp4_openai_bias_2stage",
+        act_format="mxfp4",
+        weight_kind="mxfp4",
+        weight_layout=MoeKernelLayout.native_mxfp4,
+        solution_id=0,
+        has_bias=True,
+        aiter_supported=True,
+        two_stage=True,
+        aiter_activation="swiglu",
+    ),
+    "aiter_dynamic_mxfp4_openai_bias": KernelVariant(
+        name="aiter_dynamic_mxfp4_openai_bias",
+        act_format="bf16",
+        weight_kind="aiter_mxfp4",
+        weight_layout=None,
+        solution_id=0,
+        has_bias=True,
+        aiter_supported=True,
+        activation_quantization="dynamic_mxfp4",
+        aiter_activation="swiglu",
+    ),
 }
 
 
@@ -146,6 +256,11 @@ def native_fp8_e4m3_dtype(device: torch.device) -> torch.dtype:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Fused MoE kernels.")
     parser.add_argument(
+        "--model",
+        choices=MODEL_PRESETS,
+        help="Apply a predefined local MoE shape; explicit shape arguments override it.",
+    )
+    parser.add_argument(
         "--backend",
         type=str,
         default="petit",
@@ -155,15 +270,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kernel-variant",
         type=str,
-        default="fp8_blockscale_silu",
         choices=KERNEL_VARIANTS,
-        help="Unique fused MoE kernel variant to benchmark.",
+        help="Kernel variant; defaults to the model/backend preset when available.",
     )
     parser.add_argument("--tokens", type=int, default=256, help="Number of tokens.")
-    parser.add_argument("--dim", type=int, default=4096, help="Model dimension.")
-    parser.add_argument("--inter-dim", "--inter_dim", dest="inter_dim", type=int, default=1024, help="Intermediate dimension.")
-    parser.add_argument("--experts", type=int, default=8, help="Number of experts.")
-    parser.add_argument("--topk", type=int, default=2, help="Top-k routes per token.")
+    parser.add_argument("--dim", type=int, help="Model dimension.")
+    parser.add_argument("--inter-dim", "--inter_dim", dest="inter_dim", type=int, help="Intermediate dimension.")
+    parser.add_argument("--experts", type=int, help="Number of local experts.")
+    parser.add_argument("--topk", type=int, help="Top-k local routes per token.")
     parser.add_argument(
         "--persistent",
         action="store_true",
@@ -190,7 +304,16 @@ def parse_args() -> argparse.Namespace:
         help="Iterations captured in each CUDA graph replay.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    defaults = MODEL_PRESETS.get(args.model, (4096, 1024, 8, 2))
+    for field, value in zip(("dim", "inter_dim", "experts", "topk"), defaults):
+        if getattr(args, field) is None:
+            setattr(args, field, value)
+    if args.kernel_variant is None:
+        args.kernel_variant = MODEL_KERNEL_VARIANTS.get(args.model, {}).get(
+            args.backend, "fp8_blockscale_silu"
+        )
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -213,6 +336,25 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.num_persistent_tgs < 0 or args.persistent_tgs_per_cu <= 0:
         raise ValueError("num-persistent-tgs must be >= 0 and persistent-tgs-per-cu must be > 0.")
     variant = VARIANTS[args.kernel_variant]
+    if variant.two_stage:
+        two_stage_shapes = {
+            "mxfp4_native_mxfp4_openai_bias_2stage": {(3072, 3072, 4)},
+            "mxfp4_native_mxfp4_openai_bias_2stage_m64_n512": {
+                (3072, 3072, 4),
+            },
+            "mxfp4_native_mxfp4_silu_2stage": {
+                (7168, 2048, 9),
+                (7168, 3072, 7),
+            },
+            "aiter_mxfp4_openai_bias_2stage": {(3072, 3072, 4)},
+        }
+        if (args.dim, args.inter_dim, args.topk) not in two_stage_shapes[
+            variant.name
+        ]:
+            raise ValueError(
+                f"unsupported two-stage MXFP4 shape for {variant.name}: "
+                f"dim={args.dim}, inter-dim={args.inter_dim}, topk={args.topk}."
+            )
     if args.backend == "aiter" and not variant.aiter_supported:
         supported = ", ".join(v.name for v in VARIANTS.values() if v.aiter_supported)
         raise ValueError(
@@ -263,6 +405,17 @@ class FusedMoEInputBuilder:
         self.experts = experts
         self.topk = topk
         self.variant = variant
+        self.sorted_token_padding = variant.sorted_token_padding
+        self.solution_id = variant.solution_id
+        if variant.name == "mxfp4_native_mxfp4_silu_2stage":
+            self.solution_id = {
+                (7168, 2048): petit_kernel._FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X2048_SOLUTION_ID,
+                (7168, 3072): petit_kernel._FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X3072_SOLUTION_ID,
+            }[(dim, inter_dim)]
+        if self.solution_id and not variant.two_stage:
+            self.solution_id = petit_kernel._with_fused_moe_shape(
+                self.solution_id, dim, inter_dim
+            )
 
     def _rand_positive_normal(
         self, shape: Tuple[int, ...], mean: float, std: float
@@ -290,8 +443,9 @@ class FusedMoEInputBuilder:
     def _build_padded_sorted_routing(
         self, topk_ids: torch.Tensor, topk_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        max_num_tokens_padded = int(topk_ids.numel() + self.experts * SORTED_TOKEN_PADDING - self.topk)
-        max_num_m_blocks = (max_num_tokens_padded + SORTED_TOKEN_PADDING - 1) // SORTED_TOKEN_PADDING
+        padding = self.sorted_token_padding
+        max_num_tokens_padded = int(topk_ids.numel() + self.experts * padding - self.topk)
+        max_num_m_blocks = (max_num_tokens_padded + padding - 1) // padding
         init_val = (self.topk << 24) | self.tokens
 
         sorted_token_ids = torch.full((max_num_tokens_padded,), init_val, dtype=torch.int32)
@@ -331,8 +485,8 @@ class FusedMoEInputBuilder:
                 route_begin:route_end
             ]
 
-            sorted_expert_ids_num = (tokens_num + SORTED_TOKEN_PADDING - 1) // SORTED_TOKEN_PADDING
-            tokens_num_pad = sorted_expert_ids_num * SORTED_TOKEN_PADDING
+            sorted_expert_ids_num = (tokens_num + padding - 1) // padding
+            tokens_num_pad = sorted_expert_ids_num * padding
             sorted_expert_ids[
                 sorted_expert_ids_begin:sorted_expert_ids_begin + sorted_expert_ids_num
             ] = expert
@@ -435,6 +589,63 @@ class FusedMoEInputBuilder:
             fc2_scale.contiguous().view(dtypes.fp8_e8m0),
         )
 
+    def _build_aiter_openai_mxfp4_weights(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        try:
+            from aiter import dtypes  # type: ignore
+            from aiter.ops.shuffle import (  # type: ignore
+                shuffle_scale_a16w4,
+                shuffle_weight,
+                shuffle_weight_a16w4,
+            )
+            from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp  # type: ignore
+            from aiter.utility.fp4_utils import e8m0_shuffle  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "AITER OpenAI MXFP4 weight generation requires aiter."
+            ) from exc
+
+        w13 = (
+            torch.randn(
+                (self.experts, self.inter_dim * 2, self.dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            * self.WEIGHT_STD
+            + self.WEIGHT_MEAN
+        ).to(torch.bfloat16)
+        w2 = (
+            torch.randn(
+                (self.experts, self.dim, self.inter_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            * self.WEIGHT_STD
+            + self.WEIGHT_MEAN
+        ).to(torch.bfloat16)
+        w13_q, fc1_scale = downcast_to_mxfp(w13, torch.uint8, axis=-1)
+        w2_q, fc2_scale = downcast_to_mxfp(w2, torch.uint8, axis=-1)
+
+        w13_q = shuffle_weight(w13_q.view(dtypes.fp4x2), (16, 16))
+        w2_q = shuffle_weight_a16w4(
+            w2_q.view(dtypes.fp4x2), 16, gate_up=False
+        )
+        fc1_scale = e8m0_shuffle(
+            fc1_scale.view(self.experts * self.inter_dim * 2, self.dim // 32)
+        )
+        fc2_scale = shuffle_scale_a16w4(
+            fc2_scale.view(self.experts * self.dim, self.inter_dim // 32),
+            self.experts,
+            gate_up=False,
+        )
+        return (
+            w13_q.contiguous(),
+            w2_q.contiguous(),
+            fc1_scale.contiguous().view(dtypes.fp8_e8m0),
+            fc2_scale.contiguous().view(dtypes.fp8_e8m0),
+        )
+
     def _build_mxfp4_activations(self) -> Tuple[torch.Tensor, torch.Tensor]:
         act_words = torch.randint(
             0,
@@ -473,27 +684,31 @@ class FusedMoEInputBuilder:
             sorted_ids=sorted_token_ids,
             num_valid_ids=num_valid_ids,
             token_num=self.tokens,
-            block_size=SORTED_TOKEN_PADDING,
+            block_size=self.sorted_token_padding,
         ).contiguous()
 
     def _build_biases(self) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
         if not self.variant.has_bias:
             return None, None
+        w13_bias = torch.randn(
+            (self.experts, 2, self.inter_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        w2_bias = torch.randn(
+            (self.experts, self.dim), dtype=torch.float32, device=self.device
+        )
+        if self.variant.aiter_supported:
+            return w13_bias.contiguous(), w2_bias.contiguous()
         if self.variant.weight_layout is None:
             raise RuntimeError("biased Petit kernels require an MXFP4 layout")
-        w13_bias = torch.randn(
-            (2, self.inter_dim), dtype=torch.float32, device=self.device
-        ).to(torch.bfloat16)
-        w2_bias = torch.randn(
-            (1, self.dim), dtype=torch.float32, device=self.device
-        ).to(torch.bfloat16)
         return (
             petit_kernel.repack_moe_kernel_layout(
-                w13_bias.contiguous(),
+                w13_bias.to(torch.bfloat16),
                 layout=self.variant.weight_layout,
             ),
             petit_kernel.repack_moe_kernel_layout(
-                w2_bias.contiguous(),
+                w2_bias.to(torch.bfloat16),
                 layout=self.variant.weight_layout,
             ),
         )
@@ -516,6 +731,15 @@ class FusedMoEInputBuilder:
             input_scale = torch.empty((0,), dtype=torch.float32, device=self.device)
         elif self.variant.act_format == "mxfp4":
             input_q, input_scale = self._build_mxfp4_activations()
+            if self.variant.aiter_supported:
+                try:
+                    from aiter import dtypes  # type: ignore
+                except Exception as exc:
+                    raise RuntimeError(
+                        "AITER MXFP4 activation generation requires aiter."
+                    ) from exc
+                input_q = input_q.view(dtypes.fp4x2)
+                input_scale = input_scale.view(dtypes.fp8_e8m0)
         else:
             assert fp8_dtype is not None
             input_q = self._sample_spiky_input((self.tokens, dim)).to(fp8_dtype)
@@ -541,16 +765,35 @@ class FusedMoEInputBuilder:
                 (experts, w2_row_blocks * inter_blocks), self.SCALE_INV_MEAN, self.SCALE_INV_STD
             )
         elif self.variant.weight_kind == "aiter_mxfp4":
-            w1_q, w2_q, fc1_scale, fc2_scale = self._build_aiter_mxfp4_weights()
+            if self.variant.aiter_activation == "swiglu":
+                w1_q, w2_q, fc1_scale, fc2_scale = (
+                    self._build_aiter_openai_mxfp4_weights()
+                )
+            else:
+                w1_q, w2_q, fc1_scale, fc2_scale = (
+                    self._build_aiter_mxfp4_weights()
+                )
         else:
             w1_q, w2_q, fc1_scale, fc2_scale = self._build_mxfp4_weights()
 
+        routing_generator = torch.Generator(device=self.device)
+        routing_generator.manual_seed(torch.initial_seed())
         topk_ids = (
-            torch.rand((self.tokens, experts), dtype=torch.float32, device=self.device)
+            torch.rand(
+                (self.tokens, experts),
+                dtype=torch.float32,
+                device=self.device,
+                generator=routing_generator,
+            )
             .topk(self.topk, dim=-1)
             .indices.to(torch.int32)
         )
-        topk_weights = torch.rand((self.tokens, self.topk), dtype=torch.float32, device=self.device)
+        topk_weights = torch.rand(
+            (self.tokens, self.topk),
+            dtype=torch.float32,
+            device=self.device,
+            generator=routing_generator,
+        )
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
         (
@@ -608,10 +851,14 @@ class FusedMoEInputBuilder:
                 else input_scale.contiguous()
             )
         if self.variant.act_format == "mxfp4":
-            input_scale_kernel = self._pack_aiter_sorted_mxfp4_activation_scales(
-                input_scale,
-                sorted_token_ids,
-                num_valid_ids,
+            input_scale_kernel = (
+                input_scale.contiguous()
+                if self.variant.aiter_supported
+                else self._pack_aiter_sorted_mxfp4_activation_scales(
+                    input_scale,
+                    sorted_token_ids,
+                    num_valid_ids,
+                )
             )
             input_q = input_q.contiguous()
         w13_bias, w2_bias = self._build_biases()
@@ -627,6 +874,7 @@ class FusedMoEInputBuilder:
             "sorted_expert_ids": sorted_expert_ids,
             "num_valid_ids": num_valid_ids,
             "num_valid_m_blocks": num_valid_m_blocks,
+            "sorted_token_padding": self.sorted_token_padding,
             "topk": self.topk,
             "input_scale": input_scale.contiguous(),
             "input_scale_kernel": input_scale_kernel,
@@ -635,11 +883,129 @@ class FusedMoEInputBuilder:
             "w13_bias": w13_bias,
             "w2_bias": w2_bias,
             "kernel_variant": self.variant.name,
-            "solution_id": self.variant.solution_id,
+            "solution_id": self.solution_id,
             "activation_quantization": self.variant.activation_quantization,
+            "two_stage": self.variant.two_stage,
+            "aiter_activation": self.variant.aiter_activation,
             "tokens": self.tokens,
             "dim": self.dim,
+            "inter_dim": self.inter_dim,
         }
+
+
+def make_explicit_gptoss_run_fn(
+    data: Dict[str, object],
+) -> Tuple[Callable[[], torch.Tensor], str]:
+    try:
+        from aiter import ActivationType  # type: ignore
+        from aiter._version import __version__ as aiter_version  # type: ignore
+        from aiter.fused_moe import (  # type: ignore
+            _flydsl_stage1_wrapper,
+            _flydsl_stage2_wrapper,
+        )
+        from aiter.ops.quant import (  # type: ignore
+            fused_dynamic_mxfp4_quant_moe_sort,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "The explicit GPT-OSS benchmark requires AITER v0.1.19.post2 "
+            "with FlyDSL."
+        ) from exc
+    if aiter_version != "0.1.19.post2":
+        raise RuntimeError(
+            "The explicit GPT-OSS kernel pair requires AITER v0.1.19.post2; "
+            f"found {aiter_version}."
+        )
+
+    hidden_states = data["input_q"]
+    w1 = data["w1_q_kernel"]
+    w2 = data["w2_q_kernel"]
+    sorted_ids = data["sorted_token_ids"]
+    sorted_weights = data["sorted_weights"]
+    sorted_expert_ids = data["sorted_expert_ids"]
+    num_valid_ids = data["num_valid_ids"]
+    topk_ids = data["topk_ids"]
+    for tensor in (
+        hidden_states,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk_ids,
+    ):
+        assert isinstance(tensor, torch.Tensor)
+
+    tokens = int(data["tokens"])
+    topk = int(data["topk"])
+    dim = int(data["dim"])
+    inter_dim = int(data["inter_dim"])
+    stage1_out = torch.empty(
+        (tokens, topk, inter_dim),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    out = torch.empty(
+        (tokens, dim), dtype=torch.bfloat16, device=hidden_states.device
+    )
+
+    def run() -> torch.Tensor:
+        a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            hidden_states,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=tokens,
+            topk=topk,
+            block_size=int(data["sorted_token_padding"]),
+            sorted_weights=sorted_weights,
+        )
+        _flydsl_stage1_wrapper(
+            a1,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            stage1_out,
+            topk,
+            kernelName=AITER_STAGE1_TUNING_NAME,
+            activation=ActivationType.Swiglu,
+            w1_scale=data["fc1_scale_kernel"],
+            a1_scale=a1_scale,
+            bias1=data["w13_bias"],
+            topk_ids=topk_ids,
+            swiglu_limit=7.0,
+        )
+        a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            stage1_out.view(-1, inter_dim),
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=tokens,
+            topk=topk,
+            block_size=int(data["sorted_token_padding"]),
+            sorted_weights=sorted_weights,
+        )
+        a2 = a2.view(tokens, topk, -1)
+        out.zero_()
+        _flydsl_stage2_wrapper(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out,
+            topk,
+            kernelName=AITER_STAGE2_TUNING_NAME,
+            w2_scale=data["fc2_scale_kernel"],
+            a2_scale=a2_scale,
+            sorted_weights=sorted_weights,
+            bias2=data["w2_bias"],
+        )
+        return out
+
+    return run, f"{AITER_STAGE1_KERNEL_SYMBOL}+{AITER_STAGE2_KERNEL_SYMBOL}"
 
 
 def make_run_fn(
@@ -653,6 +1019,51 @@ def make_run_fn(
             dtype=torch.bfloat16,
             device=input_q.device,
         )
+
+        if bool(data["two_stage"]):
+            config = petit_kernel.Moe2StageConfig(
+                int(data["tokens"]),
+                int(data["dim"]),
+                int(data["inter_dim"]),
+                int(data["w2_q_kernel"].size(0)),
+                int(data["topk"]),
+                block_m=int(data["sorted_token_padding"]),
+                _solution_id=int(data["solution_id"]),
+            )
+            intermediate = torch.empty(
+                config.workspace_size(data["sorted_expert_ids"].numel()),
+                dtype=torch.uint8,
+                device=input_q.device,
+            )
+
+            def run_two_stage() -> torch.Tensor:
+                config.stage1(
+                    intermediate,
+                    data["input_q"],
+                    data["w1_q_kernel"],
+                    data["sorted_token_ids"],
+                    data["sorted_expert_ids"],
+                    data["num_valid_ids"],
+                    data["input_scale_kernel"],
+                    data["fc1_scale_kernel"],
+                    num_persistent_tgs=num_persistent_tgs,
+                    bias1=data["w13_bias"],
+                )
+                out.zero_()
+                return config.stage2(
+                    out,
+                    intermediate,
+                    data["w2_q_kernel"],
+                    data["sorted_token_ids"],
+                    data["sorted_weights"],
+                    data["sorted_expert_ids"],
+                    data["num_valid_ids"],
+                    data["fc2_scale_kernel"],
+                    num_persistent_tgs=num_persistent_tgs,
+                    bias2=data["w2_bias"],
+                )
+
+            return run_two_stage, "matmul_2stage"
 
         def run() -> torch.Tensor:
             out.zero_()
@@ -683,6 +1094,80 @@ def make_run_fn(
             "backend=aiter uses its own kernel heuristic."
         )
 
+    if bool(data["two_stage"]):
+        try:
+            from aiter import dtypes  # type: ignore
+            from aiter.ops.flydsl import moe_kernels  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "The AITER two-stage benchmark requires FlyDSL."
+            ) from exc
+
+        out = torch.empty(
+            (int(data["tokens"]), int(data["dim"])),
+            dtype=torch.bfloat16,
+            device=input_q.device,
+        )
+        input_fp4 = input_q.view(dtypes.fp4x2)
+        w1_fp4 = data["w1_q_kernel"].view(dtypes.fp4x2)
+        w2_fp4 = data["w2_q_kernel"].view(dtypes.fp4x2)
+        input_scale = data["input_scale_kernel"].view(dtypes.fp8_e8m0)
+        w1_scale = data["fc1_scale_kernel"].view(dtypes.fp8_e8m0)
+        w2_scale = data["fc2_scale_kernel"].view(dtypes.fp8_e8m0)
+
+        def run_aiter_two_stage() -> torch.Tensor:
+            intermediate, intermediate_scale = moe_kernels.flydsl_moe_stage1(
+                a=input_fp4,
+                w1=w1_fp4,
+                sorted_token_ids=data["sorted_token_ids"],
+                sorted_expert_ids=data["sorted_expert_ids"],
+                num_valid_ids=data["num_valid_ids"],
+                topk=int(data["topk"]),
+                tile_m=32,
+                tile_n=128,
+                tile_k=256,
+                a_dtype="fp4",
+                b_dtype="fp4",
+                out_dtype="fp4",
+                act="swiglu",
+                w1_scale=w1_scale,
+                a1_scale=input_scale,
+                use_async_copy=True,
+                waves_per_eu=2,
+                b_nt=2,
+                gate_mode="separated",
+                bias=data["w13_bias"],
+                swiglu_limit=7.0,
+            )
+            out.zero_()
+            return moe_kernels.flydsl_moe_stage2(
+                inter_states=intermediate,
+                w2=w2_fp4,
+                sorted_token_ids=data["sorted_token_ids"],
+                sorted_expert_ids=data["sorted_expert_ids"],
+                num_valid_ids=data["num_valid_ids"],
+                out=out,
+                topk=int(data["topk"]),
+                tile_m=32,
+                tile_n=256,
+                tile_k=256,
+                a_dtype="fp4",
+                b_dtype="fp4",
+                out_dtype="bf16",
+                mode="atomic",
+                w2_scale=w2_scale,
+                a2_scale=intermediate_scale,
+                sorted_weights=data["sorted_weights"],
+                b_nt=2,
+                bias=data["w2_bias"],
+                persist=True,
+            )
+
+        return run_aiter_two_stage, "flydsl_moe_stage1+flydsl_moe_stage2"
+
+    if data["aiter_activation"] == "swiglu":
+        return make_explicit_gptoss_run_fn(data)
+
     try:
         from aiter import ActivationType, QuantType  # type: ignore
         from aiter.fused_moe import fused_moe  # type: ignore
@@ -708,6 +1193,11 @@ def make_run_fn(
         quant_type = QuantType.per_1x32
         impl = "fused_moe_dynamic_mxfp4"
         a1_scale = None
+        num_local_tokens = None
+    elif activation_quantization == "static_mxfp4":
+        quant_type = QuantType.per_1x32
+        impl = "fused_moe_mxfp4"
+        a1_scale = data["input_scale_kernel"]
         num_local_tokens = None
     else:
         raise RuntimeError(
@@ -868,8 +1358,10 @@ def main() -> int:
         if activation_quantization is not None
         else ""
     )
+    model_field = f"model={args.model} " if args.model is not None else ""
     print(
         f"backend={args.backend} impl={impl} graph={1 if used_graph else 0} "
+        f"{model_field}"
         f"kernel_variant={args.kernel_variant} solution_id={int(data['solution_id'])} "
         f"{activation_quantization_field}"
         f"tokens={args.tokens} dim={args.dim} inter_dim={args.inter_dim} "
