@@ -53,6 +53,11 @@ enum class FusedMoEStage1Buffering : unsigned {
 // M64 x (N256 gate + N256 up) with the same four waves.
 enum class FusedMoEStage1TileShape : unsigned { kM32N256, kM64N512 };
 
+enum class FusedMoEWeightLoadPolicy : unsigned {
+    kCached,
+    kNonTemporal,
+};
+
 struct FusedMoESolutionId {
     FusedMoEDataType act_dtype : 4;
     FusedMoEDataType weight_dtype : 4;
@@ -64,7 +69,8 @@ struct FusedMoESolutionId {
     FusedMoEStage1Buffering stage1_buffering : 1;
     unsigned long dim_div64 : 8;
     unsigned long inter_dim_div64 : 8;
-    unsigned long padding : 24;
+    FusedMoEWeightLoadPolicy weight_load_policy : 1;
+    unsigned long padding : 23;
 
     static constexpr unsigned kShapeAlignment = 64;
     static constexpr unsigned kMaxShapeDiv64 = 0xff;
@@ -94,7 +100,26 @@ struct FusedMoESolutionId {
             stage1_buffering,
             dim / kShapeAlignment,
             inter_dim / kShapeAlignment,
+            weight_load_policy,
             0,
+        };
+    }
+
+    constexpr FusedMoESolutionId
+    WithWeightLoadPolicy(FusedMoEWeightLoadPolicy policy) const {
+        return FusedMoESolutionId{
+            act_dtype,
+            weight_dtype,
+            bias_dtype,
+            weight_ordering,
+            mfma,
+            stages,
+            activation,
+            stage1_buffering,
+            dim_div64,
+            inter_dim_div64,
+            policy,
+            padding,
         };
     }
 
@@ -128,7 +153,8 @@ struct FusedMoESolutionId {
                (static_cast<unsigned long>(stage1_buffering) << 23) |
                (static_cast<unsigned long>(dim_div64) << 24) |
                (static_cast<unsigned long>(inter_dim_div64) << 32) |
-               (static_cast<unsigned long>(padding) << 40);
+               (static_cast<unsigned long>(weight_load_policy) << 40) |
+               (static_cast<unsigned long>(padding) << 41);
     }
 
     static constexpr FusedMoESolutionId FromRepr(unsigned long repr) {
@@ -143,7 +169,8 @@ struct FusedMoESolutionId {
             static_cast<FusedMoEStage1Buffering>((repr >> 23) & 0x1),
             (repr >> 24) & 0xff,
             (repr >> 32) & 0xff,
-            (repr >> 40) & 0xffffff,
+            static_cast<FusedMoEWeightLoadPolicy>((repr >> 40) & 0x1),
+            (repr >> 41) & 0x7fffff,
         };
     }
 
@@ -159,6 +186,7 @@ struct FusedMoESolutionId {
             mfma,       stages,
             activation, stage1_buffering,
             0,          0,
+            FusedMoEWeightLoadPolicy::kCached,
             0,
         };
     }

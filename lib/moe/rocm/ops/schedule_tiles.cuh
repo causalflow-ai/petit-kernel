@@ -250,6 +250,12 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
     static constexpr unsigned kAccumFragments = 2 * Weight::kLoadGlobal;
     static constexpr unsigned kOutputPacksPerToken = Config::kGroupN / 128;
     static constexpr bool kStage2BiasUsesTileK = false;
+    static constexpr int kWeightLoadAux = [] {
+        if constexpr (requires { Config::kWeightLoadAux; })
+            return Config::kWeightLoadAux;
+        else
+            return TargetWeightLoadPolicy::kAux;
+    }();
 
     using Shm = typename Input::Shm;
     struct InputRegs {
@@ -282,8 +288,8 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
 
     __device__ static void Load(Weight &weight, Tile &tile, unsigned,
                                 unsigned wid, unsigned wtid) {
-        weight.LoadTile(tile.value[0], 0, wid, wtid);
-        weight.LoadTile(tile.value[1], 1, wid, wtid);
+        weight.template LoadTile<kWeightLoadAux>(tile.value[0], 0, wid, wtid);
+        weight.template LoadTile<kWeightLoadAux>(tile.value[1], 1, wid, wtid);
 #pragma unroll
         for (unsigned n32_pair = 0;
              n32_pair < Weight::kLoadGlobal / 2; ++n32_pair)
@@ -295,8 +301,10 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
     LoadProjection(Weight &weight, Tile &tile, unsigned, unsigned wid,
                    unsigned wtid, unsigned value_offset,
                    unsigned scale_offset) {
-        weight.LoadTile(tile.value[0], 0, wid, wtid, value_offset);
-        weight.LoadTile(tile.value[1], 1, wid, wtid, value_offset);
+        weight.template LoadTile<kWeightLoadAux>(tile.value[0], 0, wid, wtid,
+                                                 value_offset);
+        weight.template LoadTile<kWeightLoadAux>(tile.value[1], 1, wid, wtid,
+                                                 value_offset);
 #pragma unroll
         for (unsigned n32_pair = 0;
              n32_pair < Weight::kLoadGlobal / 2; ++n32_pair)

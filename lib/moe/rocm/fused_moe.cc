@@ -154,12 +154,20 @@ template <FusedMoESolutionId kBaseId, unsigned kDim, unsigned kInterDim,
 void RegisterTwoStageShape(
     std::unordered_map<unsigned long, TwoStageRegistration> &calls) {
     static_assert(FusedMoESolutionId::IsShapeEncodable(kDim, kInterDim));
-    static constexpr auto kId = kBaseId.WithShape(kDim, kInterDim);
-    using Config = ConfigSelector<kId, kTopK>;
-    calls.emplace(kId.Repr(),
-                  TwoStageRegistration{TwoStageWorkspaceSize<Config>,
-                                       InvokeTwoStage1<Config>,
-                                       InvokeTwoStage2<Config>});
+    static constexpr auto kCachedId = kBaseId.WithShape(kDim, kInterDim);
+    static constexpr auto kNonTemporalId = kCachedId.WithWeightLoadPolicy(
+        FusedMoEWeightLoadPolicy::kNonTemporal);
+    using CachedConfig = ConfigSelector<kCachedId, kTopK>;
+    using NonTemporalConfig = ConfigSelector<kNonTemporalId, kTopK>;
+    calls.emplace(kCachedId.Repr(),
+                  TwoStageRegistration{TwoStageWorkspaceSize<CachedConfig>,
+                                       InvokeTwoStage1<CachedConfig>,
+                                       InvokeTwoStage2<CachedConfig>});
+    calls.emplace(
+        kNonTemporalId.Repr(),
+        TwoStageRegistration{TwoStageWorkspaceSize<NonTemporalConfig>,
+                             InvokeTwoStage1<NonTemporalConfig>,
+                             InvokeTwoStage2<NonTemporalConfig>});
 }
 
 template <FusedMoESolutionId kBaseId, unsigned kDim, unsigned kInterDim,

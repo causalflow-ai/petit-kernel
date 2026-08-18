@@ -64,6 +64,11 @@ class _FusedMoeStage1TileShape(enum.IntEnum):
     m64_n512 = 1
 
 
+class _FusedMoeWeightLoadPolicy(enum.IntEnum):
+    cached = 0
+    non_temporal = 1
+
+
 def _make_fused_moe_base_solution_id(
     activation_type: _FusedMoeDataType | int,
     weight_type: _FusedMoeDataType | int,
@@ -73,6 +78,9 @@ def _make_fused_moe_base_solution_id(
     stages: _FusedMoeStages | int,
     activation: _FusedMoeActivationFunction | int,
     stage1_buffering: _FusedMoeStage1Buffering | int,
+    weight_load_policy: _FusedMoeWeightLoadPolicy | int = (
+        _FusedMoeWeightLoadPolicy.cached
+    ),
 ) -> int:
     return (
         (int(_FusedMoeDataType(activation_type)) & 0xF)
@@ -83,6 +91,7 @@ def _make_fused_moe_base_solution_id(
         | ((int(_FusedMoeStages(stages)) & 0xF) << 16)
         | ((int(_FusedMoeActivationFunction(activation)) & 0x7) << 20)
         | ((int(_FusedMoeStage1Buffering(stage1_buffering)) & 0x1) << 23)
+        | ((int(_FusedMoeWeightLoadPolicy(weight_load_policy)) & 0x1) << 40)
     )
 
 
@@ -109,6 +118,15 @@ def _with_fused_moe_stage1_tile_shape(
     shape_mask = 1 << 41
     return (int(solution_id) & ~shape_mask) | (
         (int(_FusedMoeStage1TileShape(shape)) & 0x1) << 41
+    )
+
+
+def _with_fused_moe_weight_load_policy(
+    solution_id: int, policy: _FusedMoeWeightLoadPolicy | int
+) -> int:
+    policy_mask = 1 << 40
+    return (int(solution_id) & ~policy_mask) | (
+        (int(_FusedMoeWeightLoadPolicy(policy)) & 0x1) << 40
     )
 
 
@@ -497,8 +515,15 @@ def _get_2stage_cfgs_cached(
     )
     if profile_solution_id is None:
         return one_stage
+    is_gpt_oss_profile = (
+        profile_solution_id == _FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID
+    )
+    if token * topk // expert < 64:
+        profile_solution_id = _with_fused_moe_weight_load_policy(
+            profile_solution_id, _FusedMoeWeightLoadPolicy.non_temporal
+        )
 
-    if profile_solution_id != _FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID:
+    if not is_gpt_oss_profile:
         return Moe2StageConfig(
             int(token),
             int(model_dim),

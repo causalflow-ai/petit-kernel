@@ -355,6 +355,14 @@ struct ConfigSelector {
         kGroupM / kStage2GroupM;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kStage2GroupInterDim = kGroupDim;
+    static constexpr bool kUseNonTemporalWeightLoads =
+        id.stages == FusedMoEStages::kOneStage
+            ? TargetWeightLoadPolicy::kAux == BufferResource::kNTBit
+            : id.weight_load_policy ==
+                  FusedMoEWeightLoadPolicy::kNonTemporal;
+    static constexpr int kWeightLoadAux =
+        kUseNonTemporalWeightLoads ? BufferResource::kNTBit
+                                   : BufferResource::kNone;
     static constexpr FusedMoEDataType kActDType = id.act_dtype;
     static constexpr FusedMoEDataType kWeightDType = id.weight_dtype;
     static constexpr FusedMoEMfmaShape kMfmaShape = id.mfma;
