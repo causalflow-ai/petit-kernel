@@ -18,6 +18,13 @@ class CMakeBuild(build_ext):
         if not extdir.endswith(os.path.sep):
             extdir += os.path.sep
 
+        # A test-only module may be left behind by an explicit internal build.
+        # Never let a stale copy leak into a public wheel.
+        for filename in ("_test_ops.so", "_test_ops.pyd"):
+            test_module = os.path.join(extdir, filename)
+            if os.path.isfile(test_module):
+                os.remove(test_module)
+
         cfg = "Debug" if self.debug else "Release"
         output_name = os.path.basename(self.get_ext_fullpath(ext.name))
         
@@ -38,7 +45,10 @@ class CMakeBuild(build_ext):
         os.makedirs(build_temp, exist_ok=True)
 
         subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp)
-        subprocess.check_call(["cmake", "--build", "."], cwd=build_temp)
+        subprocess.check_call(
+            ["cmake", "--build", ".", "--target", "petit_kernels"],
+            cwd=build_temp,
+        )
 
 setup(
     name="petit_kernel",
@@ -46,4 +56,3 @@ setup(
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
 )
-
