@@ -30,6 +30,34 @@ __device__ __forceinline__ void buffer_wbl2_sc0_sc1() {
     asm volatile("buffer_wbl2 sc0 sc1\n" ::: "memory");
 }
 
+// Scoped buffer stores already place data at the visibility point selected by
+// SC[1:0].  Before publishing a signal for those stores, only their VMEM
+// completion is required; writing back unrelated dirty L2 lines would be both
+// broader and more expensive.  The compiler barriers keep protected stores
+// before the wait and the subsequent signal after it.
+__device__ __forceinline__ void complete_scoped_vmem() {
+    asm volatile("" ::: "memory");
+    amdgcn_s_waitcnt<0>();
+    asm volatile("" ::: "memory");
+}
+
+template <class Workspace>
+__device__ __forceinline__ void
+store_xgpu_epoch_relaxed(const Workspace &workspace, unsigned signal_offset,
+                         unsigned epoch) {
+    workspace.br_.template StoreU32<BufferResource::kSC0Bit |
+                                    BufferResource::kSC1Bit>(
+        signal_offset, 0, epoch);
+}
+
+template <class Workspace>
+__device__ __forceinline__ void
+store_xgpu_epoch_release(const Workspace &workspace, unsigned signal_offset,
+                         unsigned epoch) {
+    system_fence_release();
+    store_xgpu_epoch_relaxed(workspace, signal_offset, epoch);
+}
+
 template <class Workspace>
 __device__ __forceinline__ void
 wait_xgpu_signal(const Workspace &workspace, unsigned signal_offset,
@@ -37,6 +65,41 @@ wait_xgpu_signal(const Workspace &workspace, unsigned signal_offset,
     while (static_cast<std::int32_t>(workspace.br_.template LoadU32<
                BufferResource::kAtomicScopeSystem>(signal_offset, 0)) !=
            target) {
+    }
+}
+
+// Poll a system-scope atomic with relaxed ordering, then let the caller perform
+// one acquire fence after the readiness condition has been observed. Keeping
+// acquire out of the loop is important on gfx950, where an acquire load
+// otherwise invalidates the vector caches on every unsuccessful poll.
+template <class Workspace>
+__device__ __forceinline__ void
+wait_xgpu_signal_relaxed(const Workspace &workspace, unsigned signal_offset,
+                         std::int32_t target) {
+    while (true) {
+        // Raw-buffer loads are non-atomic LLVM memory operations. Keep each
+        // poll in the loop even though the writer is another GPU.
+        asm volatile("" ::: "memory");
+        const auto observed = static_cast<std::int32_t>(
+            workspace.br_.template LoadU32<BufferResource::kSC0Bit |
+                                            BufferResource::kSC1Bit>(
+                signal_offset, 0));
+        if (observed == target)
+            return;
+    }
+}
+
+template <class Workspace>
+__device__ __forceinline__ void
+wait_xgpu_epoch_relaxed(const Workspace &workspace, unsigned signal_offset,
+                        unsigned expected) {
+    while (true) {
+        asm volatile("" ::: "memory");
+        const unsigned observed = workspace.br_.template LoadU32<
+            BufferResource::kSC0Bit | BufferResource::kSC1Bit>(signal_offset,
+                                                               0);
+        if (static_cast<std::int32_t>(observed - expected) >= 0)
+            return;
     }
 }
 

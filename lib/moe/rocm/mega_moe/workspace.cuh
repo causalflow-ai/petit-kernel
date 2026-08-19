@@ -2,6 +2,7 @@
 
 #include "causalflow/petit/tal/algorithm.h"
 #include "moe/rocm/fused_moe.cuh"
+#include "moe/rocm/ops/mxfp4_activation.cuh"
 
 #include <type_traits>
 
@@ -15,17 +16,6 @@ template <class Layout>
 struct GridSyncSlotCount<Layout,
                          std::void_t<decltype(Layout::kGridSyncSlots)>> {
     static constexpr unsigned value = Layout::kGridSyncSlots;
-};
-
-template <class Layout, class = void> struct UsesDirectRemoteCombine {
-    static constexpr bool value = false;
-};
-
-template <class Layout>
-struct UsesDirectRemoteCombine<
-    Layout, std::void_t<decltype(Layout::kSolution)>> {
-    static constexpr bool value =
-        Layout::kSolution.stages == FusedMoEStages::kTwoStage;
 };
 
 ///
@@ -47,8 +37,7 @@ struct UsesDirectRemoteCombine<
 //     received [src_rank][local_experts][slots] = src_token_topk_idx
 //     - Input TokenTopK Expert Weight: (max_tokens_per_rank, kTopK), f32
 //     - Input Tokens: max_tokens_per_rank tokens (in input format)
-//     - Combine Buffer: max_tokens_per_rank tokens fragments (in combine
-//     format)
+//     - Route output: source-owned (token, top-k) BF16 rows
 //     - Aligned to 4KB page boundary (slot_stride_)
 // Aligned to 2MB page boundary
 //
@@ -56,14 +45,11 @@ struct UsesDirectRemoteCombine<
 // - Grid sync barrier (aligned to 64-byte cache line size)
 // - Input TokenTopK Expert ID: (max_tokens_per_rank, kTopK), i32
 // - Token metadata: worst-case routed tokens, u64
-// - Compact local-combine publication metadata: valid routed tokens, u64
-//   (one-stage only)
 // - L1 token buffer: worst-case routed tokens * Layout::kInputTokenBytes
 // - L1 token weights: worst-case routed tokens * f32
 // - L2 arrival masks: one u32 bit mask per M32 routed-token block
-// - L2 token buffer: two-stage MXFP4 intermediates for all routed tokens
+// - L2 token buffer: stage-2 MXFP4 activation values for all routed tokens
 // - L2 scale buffer: padded E8M0 scales for the L2 token buffer
-// - L1 combine buffer: private route rows (one-stage only)
 //
 // We require the total VMA address space to be within 4GB so that we can use
 // buffer_load instructions for efficient memory access.
@@ -73,6 +59,7 @@ struct UsesDirectRemoteCombine<
 //     - EpochCounter: i32, the locally owned publication generation
 //     - EpochSignal: (kNumRanks,), i32, one publication per source rank
 template <class Layout> class MegaMoEWorkspace {
+    using ActivationLayout = MxFp4ActivationLayout;
     static constexpr unsigned kXGpuBarrierCounterOffset = 0;
 
     static constexpr unsigned kCacheLineBytes = 64;
@@ -85,7 +72,10 @@ template <class Layout> class MegaMoEWorkspace {
     // on an independently owned page, matching the legacy symmetric-buffer
     // layout.  Packing records 64 bytes apart puts every rank's system-scope
     // atomic traffic on one GPU-owned backing page at world size eight.
-    static constexpr unsigned kXGpuBarrierRecordBytes = kPageBytes;
+    // Larger expert configurations need a second page for direct-push
+    // controls. Preserve the compact record for GPT-OSS shapes.
+    static constexpr unsigned kXGpuBarrierRecordBytes =
+        Layout::kNumExperts > 128 ? 2 * kPageBytes : kPageBytes;
     static constexpr unsigned kMaxGridSyncSlots =
         GridSyncSlotCount<Layout>::value;
     static_assert(kMaxGridSyncSlots * sizeof(unsigned) + sizeof(unsigned) <
@@ -102,14 +92,6 @@ template <class Layout> class MegaMoEWorkspace {
     static constexpr unsigned kSortedTokenBlock = 32;
     static constexpr unsigned kMaxExpertsPerToken =
         kTopK < kNumExpertsPerRank ? kTopK : kNumExpertsPerRank;
-    static constexpr unsigned kMaxLocalCombineSlots =
-        kNumRanks * kMaxTokensPerRank * kMaxExpertsPerToken;
-    static constexpr unsigned long kLocalCombinePublishMetadataCapacityBytes =
-        static_cast<unsigned long>(kMaxLocalCombineSlots) *
-        sizeof(TokenMetadata);
-    static constexpr unsigned long kLocalCombineBufferCapacityBytes =
-        static_cast<unsigned long>(kMaxTokensPerRank) *
-        Layout::kCombineBufferBytes;
     // PullTokens lays out routed entries per local expert and pads every
     // expert's run to kSortedTokenBlock.  Account for the worst-case top-k
     // fanout plus all per-expert tails, as the legacy dispatcher does.
@@ -119,22 +101,12 @@ template <class Layout> class MegaMoEWorkspace {
         kSortedTokenBlock);
 
   public:
-    static constexpr bool kUsesDirectRemoteCombine =
-        UsesDirectRemoteCombine<Layout>::value;
     static constexpr unsigned kMaxPoolBlocks =
         kMaxPoolTokens / kSortedTokenBlock;
     static constexpr unsigned kL2ScaleRows =
-        tal::CeilingDiv<unsigned>(kMaxPoolTokens, 256) * 256;
+        ActivationLayout::PaddedScaleRows(kMaxPoolTokens);
     static constexpr unsigned kL2ScaleCols =
-        tal::CeilingDiv<unsigned>(Layout::kInterDim / 32, 8) * 8;
-    static constexpr unsigned long kLocalCombinePublishMetadataBytes =
-        kUsesDirectRemoteCombine
-            ? 0
-            : kLocalCombinePublishMetadataCapacityBytes;
-    static constexpr unsigned long kLocalCombineBufferBytes =
-        kUsesDirectRemoteCombine
-            ? 0
-            : kLocalCombineBufferCapacityBytes;
+        ActivationLayout::ScaleCols(Layout::kInterDim);
 
   private:
     static constexpr unsigned long kL2ArrivalMaskBytes =
@@ -155,7 +127,7 @@ template <class Layout> class MegaMoEWorkspace {
                 sizeof(unsigned) +
             kMaxTokensPerRank * kTopK * sizeof(float) +
             kMaxTokensPerRank * Layout::kInputTokenBytes +
-            kMaxTokensPerRank * Layout::kCombineBufferBytes,
+            kMaxTokensPerRank * Layout::kRouteOutputBufferBytes,
         kRankSymBufferBase);
     static constexpr unsigned kLocalOffsetBase = tal::AlignUp(
         kRankSymBufferBase + kNumRanks * kSlotStride, kLargePageBytes);
@@ -175,20 +147,7 @@ template <class Layout> class MegaMoEWorkspace {
         static_cast<unsigned long>(kMaxPoolTokens) * Layout::kInputTokenBytes +
         kMaxPoolTokens * sizeof(float) + kL2ArrivalMaskBytes +
         kL2TokenBufferBytes + kL2ScaleBufferBytes;
-    static constexpr unsigned long kLegacyLocalBytes64 =
-        kLocalDataBytes64 + kLocalCombinePublishMetadataCapacityBytes +
-        kLocalCombineBufferCapacityBytes;
-    static constexpr unsigned long kLocalBytes64 =
-        kLocalDataBytes64 + kLocalCombinePublishMetadataBytes +
-        kLocalCombineBufferBytes;
-    static_assert(
-        !kUsesDirectRemoteCombine || kLocalBytes64 < kLegacyLocalBytes64,
-        "two-stage workspace must omit local-combine publication storage");
-    static_assert(
-        kUsesDirectRemoteCombine
-            ? kLocalBytes64 == kLocalDataBytes64
-            : kLocalBytes64 == kLegacyLocalBytes64,
-        "invalid stage-specific local-combine workspace layout");
+    static constexpr unsigned long kLocalBytes64 = kLocalDataBytes64;
     static_assert(kLocalBytes64 <= (1ull << 32),
                   "MegaMoE local workspace exceeds 32-bit offsets");
     static constexpr unsigned kLocalBytes =
@@ -314,7 +273,7 @@ template <class Layout> class MegaMoEWorkspace {
                kMaxTokensPerRank * kTopK * sizeof(float);
     }
 
-    TAL_HOST_DEVICE inline unsigned CombineBufferOffset(unsigned rank) {
+    TAL_HOST_DEVICE inline unsigned RouteOutputBufferOffset(unsigned rank) {
         [[assume(rank < kNumRanks)]];
         return InputTokensOffset(rank) +
                kMaxTokensPerRank * Layout::kInputTokenBytes;
@@ -325,10 +284,6 @@ template <class Layout> class MegaMoEWorkspace {
     //
     TAL_HOST_DEVICE inline unsigned GridSyncBarrierOffset() const {
         return kLocalOffsetBase;
-    }
-
-    TAL_HOST_DEVICE inline unsigned LocalCombineSlotOffset() const {
-        return GridSyncBarrierOffset() + kMaxGridSyncSlots * sizeof(unsigned);
     }
 
     TAL_HOST_DEVICE inline unsigned InputTokenTopKExpertIDOffset() const {
@@ -344,19 +299,11 @@ template <class Layout> class MegaMoEWorkspace {
     }
 
     TAL_HOST_DEVICE inline unsigned
-    LocalCombinePublishMetadataOffset(unsigned slot) const {
-        [[assume(slot < kMaxLocalCombineSlots)]];
-        return TokenMetadataOffset(kMaxPoolTokens - 1) + sizeof(TokenMetadata) +
-               slot * sizeof(TokenMetadata);
-    }
-
-    TAL_HOST_DEVICE inline unsigned
     L1TokenBufferOffset(unsigned pool_token_index) const {
         [[assume(pool_token_index < kMaxPoolTokens)]];
         return InputTokenTopKExpertIDOffset() +
                kMaxTokensPerRank * kTopK * sizeof(unsigned) +
                kMaxPoolTokens * sizeof(TokenMetadata) +
-               static_cast<unsigned>(kLocalCombinePublishMetadataBytes) +
                pool_token_index * Layout::kInputTokenBytes;
     }
 
@@ -366,7 +313,6 @@ template <class Layout> class MegaMoEWorkspace {
         return InputTokenTopKExpertIDOffset() +
                kMaxTokensPerRank * kTopK * sizeof(unsigned) +
                kMaxPoolTokens * sizeof(TokenMetadata) +
-               static_cast<unsigned>(kLocalCombinePublishMetadataBytes) +
                kMaxPoolTokens * Layout::kInputTokenBytes +
                pool_token_index * sizeof(float);
     }
@@ -389,12 +335,6 @@ template <class Layout> class MegaMoEWorkspace {
     TAL_HOST_DEVICE inline unsigned L2ScaleBufferOffset() const {
         return L1TokenWeightsOffset(kMaxPoolTokens - 1) + sizeof(float) +
                static_cast<unsigned>(kL2ArrivalMaskBytes + kL2TokenBufferBytes);
-    }
-
-    TAL_HOST_DEVICE inline unsigned CombineBufferOffset() const {
-        return L1TokenWeightsOffset(kMaxPoolTokens - 1) + sizeof(float) +
-               static_cast<unsigned>(kL2ArrivalMaskBytes + kL2TokenBufferBytes +
-                                     kL2ScaleBufferBytes);
     }
 
     TAL_HOST_DEVICE inline unsigned Rank() const { return rank_id_; }

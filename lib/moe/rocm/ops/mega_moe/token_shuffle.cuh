@@ -2,6 +2,7 @@
 
 #include "moe/rocm/comm/barrier.cuh"
 #include "moe/rocm/mega_moe/workspace.cuh"
+#include "moe/rocm/ops/mega_moe/token_shuffle_common.cuh"
 #include "dataformat_bf16.cuh"
 #include "dataformat_mxfp4.cuh"
 
@@ -36,6 +37,8 @@ struct RemoteInputTransportSelector<
 template <class Config> struct TokenShuffle {
   public:
     using Workspace = MegaMoEWorkspace<Config>;
+    using Common = TokenShuffleCommon<Config>;
+    using XGpuSync = typename Config::XGpuSync;
 
     static constexpr unsigned kNumSMs = Config::kNumSMs;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
@@ -70,69 +73,27 @@ template <class Config> struct TokenShuffle {
 
     TAL_DEVICE void Run(unsigned sm_id, unsigned tid, unsigned wid, unsigned wtid) {
         PushTokenTopKToRemote(sm_id, tid, wid, wtid);
+        const auto sync_ticket =
+            XGpuSync::template Begin<kDispatchGridSyncIndex>(
+                *ws_, sm_id, tid, [=]() { __syncthreads(); });
         PopulateRemoveRecvCounter(sm_id, tid, wid, wtid);
         __syncthreads();
 
-        // Only SM0 writes the recv counter, the xgpu barrier ensures that all
-        // SM0 of each ranks are synchronized. Barrier before pulling remote tokens.
-        // Pull-side counters, metadata, weights, and activation rows use
-        // coherent loads, but every CTA must acquire the epilogue payload
-        // before it starts pulling remote tokens.
-        xgpu_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                     kEpilogueGridSyncIndex,
-                     /* kAcquireProloguePayload */ false,
-                     /* kAcquireEpiloguePayload */ true>(
-            *ws_, sm_id, tid, [=]() { __syncthreads(); },
-            /* After the grid sync above, there is no more writes by other
-            SMs
-               (except 0) */
-            false,
-            /* After the xGPU barrier, there is a grid sync */ true);
+        // Only SM0 writes the receive counters. Publish their completion to
+        // peers, then acquire all peer publications before pulling tokens.
+        XGpuSync::template Finish<kEpilogueGridSyncIndex>(
+            *ws_, sm_id, tid, sync_ticket, [=]() { __syncthreads(); });
 
         PullTokens(sm_id, tid, wid, wtid);
     }
 
   public:
     TAL_DEVICE unsigned LoadLocalNumTokens(unsigned wtid) const {
-        // Every locally sent route produces one result pushed back by its
-        // remote expert rank.  Keep this expected receive count in the send
-        // row until the separate owner-reduction kernel has consumed it.
-        unsigned routes = 0;
-        for (unsigned expert = wtid; expert < kNumExperts;
-             expert += kWarpSize) {
-            routes += ws_->br_.template LoadU64<BufferResource::kNone>(
-                expert * sizeof(unsigned long),
-                ws_->SendCounterOffset(ws_->Rank(), 0)).x;
-        }
-        routes = __reduce_add_sync(~0ull, routes);
-        return routes / kNumTopK;
+        return Common::LoadLocalNumTokens(*ws_, wtid);
     }
 
     TAL_DEVICE void ResetRoutingCounters(unsigned sm_id, unsigned tid) {
-        // CTA 0 owns these rows. They can be cleared while the other CTAs
-        // publish because no combine phase reads them.
-        if (sm_id == 0) {
-            for (unsigned expert = tid; expert < kNumExperts;
-                 expert += kNumDispatchThreads) {
-                ws_->br_.template StoreU64<BufferResource::kNone>(
-                    expert * sizeof(unsigned long),
-                    ws_->SendCounterOffset(ws_->Rank(), 0), {0, 0});
-            }
-            for (unsigned i = tid; i < kNumRanks * kNumExpertsPerRank;
-                 i += kNumDispatchThreads) {
-                ws_->br_.template StoreU64<BufferResource::kAtomicScopeSystem>(
-                    i * sizeof(unsigned long),
-                    ws_->RecvCounterOffset(ws_->Rank(), 0, 0), {0, 0});
-            }
-            for (unsigned local_expert = tid;
-                 local_expert < kNumExpertsPerRank;
-                 local_expert += kNumDispatchThreads) {
-                ws_->br_.template StoreU64<BufferResource::kAtomicScopeSystem>(
-                    local_expert * sizeof(unsigned long),
-                    ws_->RecvSumCounterOffset(ws_->Rank(), 0), {0, 0});
-            }
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-        }
+        Common::ResetRoutingCounters(*ws_, sm_id, tid);
     }
 
     TAL_DEVICE void ResetLocalCombineSlot(unsigned sm_id, unsigned tid) {
@@ -260,8 +221,8 @@ template <class Config> struct TokenShuffle {
                         __builtin_bit_cast(uint2, d));
                 }
             }
-            TransferTokenToLocalAsync(wid, wtid, src_rank,
-                                      token_topk_idx, pool_token_idx);
+            TransferTokenToLocalAsync(wid, wtid, src_rank, token_topk_idx,
+                                      pool_token_idx);
         }
     }
 
@@ -274,17 +235,17 @@ template <class Config> struct TokenShuffle {
                               src_token * InputTransport::kInputTokenBytes;
         unsigned dst_offset = ws_->L1TokenBufferOffset(pool_token_idx);
         if (wid % kWarpsPerPullToken == 0 && wtid == 0) {
-            const unsigned weight = ws_->br_.template LoadU32<
-                BufferResource::kSC1Bit>(
-                ws_->InputTokenTopKExpertWeightOffset(src_rank) +
-                    token_topk_idx * sizeof(float), 0);
+            const unsigned weight =
+                ws_->br_.template LoadU32<BufferResource::kSC1Bit>(
+                    ws_->InputTokenTopKExpertWeightOffset(src_rank) +
+                        token_topk_idx * sizeof(float),
+                    0);
             // TODO: Try coalesing with TokenMetadata
             ws_->br_.template StoreU32<BufferResource::kNone>(
-                ws_->L1TokenWeightsOffset(pool_token_idx), 0,
-                weight);
+                ws_->L1TokenWeightsOffset(pool_token_idx), 0, weight);
         }
-        using LdsInputShm = __attribute__((address_space(3)))
-            typename InputTransport::Shm;
+        using LdsInputShm =
+            __attribute__((address_space(3))) typename InputTransport::Shm;
         InputTransport::Copy(*ws_, (LdsInputShm *)&shm_->inputs,
                              wid, wtid, src_offset, dst_offset);
     }
@@ -292,10 +253,7 @@ template <class Config> struct TokenShuffle {
     TAL_DEVICE void PushTokenTopKToRemote(unsigned sm_id, unsigned tid,
                                           unsigned wid, unsigned wtid) {
         [[assume(tid < kThreads)]];
-        for (unsigned i = tid; i < kNumExperts; i += kThreads) {
-            shm_->expert_count[i] = 0;
-        }
-        __syncthreads();
+        Common::ClearExpertCounts(shm_->expert_count, tid);
 
         // Count experts' tokens
         ForeachLocalTokenTopK(
@@ -332,13 +290,6 @@ template <class Config> struct TokenShuffle {
                     dst_offset, 0, token_topk_idx);
             });
         __syncthreads();
-
-        // Grid sync to ensure the local send counters have been populated.
-        // CTA 0 reads those rows coherently below, so this only needs to
-        // distribute control completion.
-        grid_sync<kNumSMs, kDispatchGridSyncIndex,
-                  /* kAcquirePayload */ false>(
-            *ws_, sm_id, tid, []() { __syncthreads(); });
     }
 
     TAL_DEVICE void PopulateRemoveRecvCounter(unsigned sm_id, unsigned tid,
@@ -359,9 +310,7 @@ template <class Config> struct TokenShuffle {
                                            BufferResource::kSC1Bit>(
                     i * sizeof(unsigned long),
                     ws_->SendCounterOffset(ws_->Rank(), 0)));
-            ws_->br_.template StoreU32<BufferResource::kAtomicScopeSystem>(
-                ws_->RecvCounterOffset(dst_rank, ws_->Rank(), dst_expert), 0,
-                (unsigned)expert_status);
+            Common::PublishRecvCounter(*ws_, i, (unsigned)expert_status);
             // Why system scope?
             // The high 32 bit is supposeed to be kNumSM * kNumRanks
             ws_->br_.template AtomicAddU64<BufferResource::kAtomicScopeSystem>(

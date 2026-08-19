@@ -82,6 +82,35 @@ typedef float v16f __attribute__((ext_vector_type(16)));
 
 static constexpr unsigned kWarpSize = 64;
 
+// Return the sum of values from lane 0 through the calling lane. This is a
+// scan, rather than a wave reduction: every lane receives a different prefix.
+__device__ inline unsigned amdgcn_wave_inclusive_add(unsigned value,
+                                                      unsigned lane) {
+    unsigned remote =
+        __builtin_amdgcn_mov_dpp(value, 0x111, 0xf, 0xf, true);
+    if (lane >= 1)
+        value += remote;
+    remote = __builtin_amdgcn_mov_dpp(value, 0x112, 0xf, 0xf, true);
+    if (lane >= 2)
+        value += remote;
+    remote = __builtin_amdgcn_mov_dpp(value, 0x114, 0xf, 0xf, true);
+    if (lane >= 4)
+        value += remote;
+    remote = __builtin_amdgcn_mov_dpp(value, 0x118, 0xf, 0xf, true);
+    if (lane >= 8)
+        value += remote;
+
+    const unsigned source16 = (lane & 0x30u) - 1u;
+    remote = __builtin_amdgcn_ds_bpermute(source16 * sizeof(unsigned), value);
+    if (lane >= 16)
+        value += remote;
+    const unsigned source32 = (lane & 0x30u) - 17u;
+    remote = __builtin_amdgcn_ds_bpermute(source32 * sizeof(unsigned), value);
+    if (lane >= 32)
+        value += remote;
+    return value;
+}
+
 // Direct loads from global memory to LDS.
 // This maps to MUBUF buffer_load_* with `lds` and is the most robust way to
 // express "async global->LDS" across ROCm toolchains (avoids inline-asm syntax
