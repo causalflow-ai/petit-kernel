@@ -5,10 +5,13 @@
 #include "moe/rocm/mega_moe/workspace.cuh"
 #include "moe/rocm/ops/mega_moe/route_output.cuh"
 #include "moe/rocm/ops/mega_moe/token_shuffle.cuh"
+#include "moe/rocm/ops/mega_moe/token_shuffle_direct_push.cuh"
 #include "moe/rocm/ops/mxfp4_activation.cuh"
 #include "moe/rocm/ops/op_stages.cuh"
 
 #include <hip/hip_runtime.h>
+
+#include <type_traits>
 
 namespace causalflow::petit::rocm::moe {
 
@@ -27,7 +30,12 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
     using Stage2Input = MxFp4Stage2Input<
         Config, typename Stage2Tiles::InputRegs>;
     using Workspace = MegaMoEWorkspace<Config>;
-    using TokenDispatch = TokenShuffle<Config>;
+    // A single-rank invocation needs no remote push protocol. Keep the pull
+    // implementation there and use fixed-role direct push for every
+    // registered multi-rank configuration.
+    using TokenDispatch = std::conditional_t<
+        Config::kNumRanks == 1, TokenShuffle<Config>,
+        DirectPushTokenShuffle<Config>>;
     using XGpuSync = typename Config::XGpuSync;
     using Scheduler = MegaMoETwoStageScheduler<Config>;
 
@@ -77,10 +85,16 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
     };
 
     TAL_DEVICE void RunStage1(Workspace &workspace, ShmBuf &shm,
+                              TokenDispatch &dispatch,
+                              unsigned dispatch_epoch,
                               const uint4 *w13, const unsigned *scales_w13,
                               const void *w13_bias,
                               const typename Scheduler::Work &work,
                               unsigned tid, unsigned wid, unsigned wtid) {
+        if constexpr (Config::kNumRanks > 1) {
+            dispatch.WaitForExpertPayload(work.expert_idx, dispatch_epoch,
+                                          tid);
+        }
         const unsigned pool_base = work.pool_block * kRoutesPerBlock;
         input_.Initialize(workspace, work.pool_block, work.work_m);
         input_.PrepareScales(shm.compute.stage1.x, wid, wtid);
@@ -168,7 +182,7 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
 
     TAL_DEVICE void RunStage2(Workspace &workspace, ShmBuf &shm,
                               const uint4 *w2, const unsigned *scales_w2,
-                              const void *w2_bias,
+                              const void *w2_bias, unsigned dispatch_epoch,
                               const typename Scheduler::Work &work,
                               unsigned tid, unsigned wid, unsigned wtid) {
         const unsigned pool_base = work.pool_block * kRoutesPerBlock;
@@ -228,11 +242,43 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
         __syncthreads();
         Stage2Epilogue::WriteBack(output_context, shm.compute.stage2, tile_col,
                                   wid, wtid);
+        amdgcn_s_waitcnt<0, -1, 0>();
+        if constexpr (Config::kNumRanks > 1)
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
         __syncthreads();
+
+        if constexpr (Config::kNumRanks > 1) {
+            // One lane publishes each route after every lane has drained this
+            // output tile. The source reducer waits on the token's complete
+            // top-k x output-tile dependency count.
+            if (wtid == 0) {
+#pragma unroll
+                for (unsigned row_group = 0;
+                     row_group < kRoutesPerBlock / kNumWarps; ++row_group) {
+                    const unsigned row = wid + row_group * kNumWarps;
+                    if (row < work.work_m) {
+                        const TokenMetadata metadata = __builtin_bit_cast(
+                            TokenMetadata,
+                            workspace.br_.template LoadU64<
+                                BufferResource::kNone>(
+                                0, workspace.TokenMetadataOffset(
+                                       workspace.Rank(), pool_base + row)));
+                        workspace.br_.template AtomicAddI32<
+                            BufferResource::kAtomicScopeSystem>(
+                            workspace.RouteOutputReadyOffset(
+                                metadata.src_rank, dispatch_epoch & 1,
+                                metadata.token_topk_idx / Config::kTopK),
+                            0, 1);
+                    }
+                }
+            }
+        }
     }
 
     TAL_DEVICE void Compute(Workspace &workspace, Scheduler &scheduler,
-                            ShmBuf &shm, const uint4 *w13, const uint4 *w2,
+                            ShmBuf &shm, TokenDispatch &dispatch,
+                            unsigned dispatch_epoch, const uint4 *w13,
+                            const uint4 *w2,
                             const unsigned *scales_w13,
                             const unsigned *scales_w2, const void *w13_bias,
                             const void *w2_bias, unsigned sm_id, unsigned tid,
@@ -255,8 +301,8 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
             work.pool_block = __builtin_amdgcn_readfirstlane(work.pool_block);
             work.work_m = __builtin_amdgcn_readfirstlane(work.work_m);
             work.tile = __builtin_amdgcn_readfirstlane(work.tile);
-            RunStage1(workspace, shm, w13, scales_w13, w13_bias, work, tid,
-                      wid, wtid);
+            RunStage1(workspace, shm, dispatch, dispatch_epoch, w13,
+                      scales_w13, w13_bias, work, tid, wid, wtid);
             logical_id += kNumSMs;
         }
 
@@ -265,8 +311,8 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
             work.pool_block = __builtin_amdgcn_readfirstlane(work.pool_block);
             work.work_m = __builtin_amdgcn_readfirstlane(work.work_m);
             work.tile = __builtin_amdgcn_readfirstlane(work.tile);
-            RunStage2(workspace, shm, w2, scales_w2, w2_bias, work, tid, wid,
-                      wtid);
+            RunStage2(workspace, shm, w2, scales_w2, w2_bias,
+                      dispatch_epoch, work, tid, wid, wtid);
             logical_id += kNumSMs;
             if (!scheduler.GetWork(wtid, logical_id, &work))
                 break;
@@ -285,46 +331,57 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
         Workspace workspace(base, rank);
 
         TokenDispatch dispatch(num_tokens, &workspace, &shm.dispatch);
-        dispatch.Run(sm_id, tid, wid, wtid);
-        // Dispatch has already completed its cross-rank barrier. PullTokens
-        // materializes rank-local L1 rows, so only a local grid handoff is
-        // needed before compute starts consuming them.
-        grid_sync<kNumSMs, kCommComputeEntryGridSyncIndex>(
-            workspace, sm_id, tid, [] { __syncthreads(); });
+        unsigned dispatch_epoch = 0;
+        if constexpr (Config::kNumRanks == 1) {
+            dispatch.Run(sm_id, tid, wid, wtid);
+            // Pull dispatch distributes materialization across the grid, so
+            // EP1 retains its local dispatch-to-compute handoff.
+            grid_sync<kNumSMs, kCommComputeEntryGridSyncIndex>(
+                workspace, sm_id, tid, [] { __syncthreads(); });
+        } else {
+            // The planner publishes the local schedule and each producer
+            // publishes one expert payload; compute waits on those
+            // dependencies directly.
+            dispatch_epoch = dispatch.Run(sm_id, tid, wid, wtid);
+            // Every CTA must observe the destination-owned schedule before it
+            // reads scheduler metadata. This is a local plan-ready dependency,
+            // not a dispatch-wide barrier.
+            dispatch.WaitForLocalPlan(dispatch_epoch, tid);
+        }
 
         Scheduler scheduler(&workspace);
         scheduler.FetchRecvSumPerExpert(wtid);
-        Compute(workspace, scheduler, shm, w13, w2, scales_w13, scales_w2,
-                w13_bias, w2_bias, sm_id, tid, wid, wtid);
-
-        // Drain every producer lane. grid_sync joins the CTA before its
-        // leader performs the release that publishes completion to peers.
-        amdgcn_s_waitcnt<0, -1, 0>();
-        // Cleanup only writes reset state after compute has quiesced; it does
-        // not consume payload published by another CTA.
-        grid_sync<kNumSMs, kComputeCompleteGridSyncIndex,
-                  /* kAcquirePayload */ false>(
-            workspace, sm_id, tid, [] { __syncthreads(); });
-
-        for (unsigned block = sm_id * kThreads + tid;
-             block < Workspace::kMaxPoolBlocks; block += kNumSMs * kThreads) {
-            workspace.br_.template StoreU32<BufferResource::kNone>(
-                workspace.L2ArrivalMaskOffset(block), 0, 0);
-        }
-
-        dispatch.ResetRoutingCounters(sm_id, tid);
-        // Stage 2 has already written every unique route directly into its
-        // source rank's (token, top-k, column) slot. The xGPU handoff publishes
-        // those stores before signaling peers.
-        const auto output_sync_ticket =
-            XGpuSync::template Begin<kOutputHandoffGridSyncIndex>(
-                workspace, sm_id, tid, [] { __syncthreads(); });
-        XGpuSync::template Finish<kOutputHandoffGridSyncIndex>(
-            workspace, sm_id, tid, output_sync_ticket,
-            [] { __syncthreads(); });
+        Compute(workspace, scheduler, shm, dispatch, dispatch_epoch, w13, w2,
+                scales_w13, scales_w2, w13_bias, w2_bias, sm_id, tid, wid,
+                wtid);
 
         SourceRouteReducer<Config> reducer(&workspace);
-        reducer.Run(out, num_tokens, output_row_stride, sm_id, wid, wtid);
+        if constexpr (Config::kNumRanks == 1) {
+            // EP1 retains the pull path's post-compute cleanup and collective
+            // handoff. Multi-rank direct push publishes route dependencies
+            // from stage 2 and reclaims L2 state at next-epoch admission.
+            amdgcn_s_waitcnt<0, -1, 0>();
+            grid_sync<kNumSMs, kComputeCompleteGridSyncIndex,
+                      /* kAcquirePayload */ false>(
+                workspace, sm_id, tid, [] { __syncthreads(); });
+            for (unsigned block = sm_id * kThreads + tid;
+                 block < Workspace::kMaxPoolBlocks;
+                 block += kNumSMs * kThreads) {
+                workspace.br_.template StoreU32<BufferResource::kNone>(
+                    workspace.L2ArrivalMaskOffset(block), 0, 0);
+            }
+            dispatch.ResetRoutingCounters(sm_id, tid);
+            const auto output_sync_ticket =
+                XGpuSync::template Begin<kOutputHandoffGridSyncIndex>(
+                    workspace, sm_id, tid, [] { __syncthreads(); });
+            XGpuSync::template Finish<kOutputHandoffGridSyncIndex>(
+                workspace, sm_id, tid, output_sync_ticket,
+                [] { __syncthreads(); });
+            reducer.Run(out, num_tokens, output_row_stride, sm_id, wid, wtid);
+        } else {
+            reducer.Run(out, num_tokens, output_row_stride, sm_id, wid, wtid,
+                        dispatch_epoch);
+        }
     }
     Input input_;
     W13Weights w13_weights_;

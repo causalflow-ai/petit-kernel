@@ -59,6 +59,12 @@ template <class Config> struct MxFp4InputPacked {
         kScaleVectors / kScaleStages;
     static constexpr unsigned kWarpsPerScaleStage =
         kNumWarps / kScaleStages;
+    // Direct-push rows are written by peer GPUs into this GPU's heap slice.
+    // Apply device scope to the protected data loads instead of invalidating
+    // the whole vector cache before every stage-1 work item.
+    static constexpr unsigned kPayloadLoadAux =
+        Config::kNumRanks > 1 ? BufferResource::kSC1Bit
+                              : BufferResource::kNone;
 
     struct Shm {
         uint4 act[kGroupM * kRowVecsPerTile];
@@ -82,7 +88,8 @@ template <class Config> struct MxFp4InputPacked {
     TAL_DEVICE void Initialize(Workspace &workspace, unsigned pool_row,
                                unsigned m) {
         workspace_ = workspace.br_;
-        activation_offset_ = workspace.L1TokenBufferOffset(pool_row);
+        activation_offset_ = workspace.L1TokenBufferOffset(
+            workspace.Rank(), pool_row);
         m_ = m;
         values_offset_vec_ = 0;
         scale_tile_ = 0;
@@ -117,7 +124,7 @@ template <class Config> struct MxFp4InputPacked {
             const unsigned offset =
                 row < m_ && first_element < kHiddenSize ? actual : ~0u;
             workspace_
-                .template LoadLds<BufferResource::kNone, sizeof(uint4), 0>(
+                .template LoadLds<kPayloadLoadAux, sizeof(uint4), 0>(
                     lds, offset, 0);
         }
         values_offset_vec_ += kGroupDim / kScaleBlockSize;
@@ -209,7 +216,7 @@ template <class Config> struct MxFp4InputPacked {
                     ? activation_offset_ + kValueBytes + row * kRowStride +
                           row_vector * sizeof(uint4)
                     : ~0u;
-            scales.template LoadLds<BufferResource::kNone, sizeof(uint4), 0>(
+            scales.template LoadLds<kPayloadLoadAux, sizeof(uint4), 0>(
                 lds, src, 0);
         }
     }

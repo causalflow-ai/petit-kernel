@@ -203,7 +203,7 @@ template <class Config> struct TokenShuffle {
                 d.token_topk_idx = token_topk_idx;
                 d.src_rank = src_rank;
                 ws_->br_.template StoreU64<BufferResource::kNone>(
-                    ws_->TokenMetadataOffset(pool_token_idx), 0,
+                    ws_->TokenMetadataOffset(ws_->Rank(), pool_token_idx), 0,
                     __builtin_bit_cast(uint2, d));
             }
             TransferTokenToLocalAsync(wid, wtid, src_rank, token_topk_idx,
@@ -218,7 +218,8 @@ template <class Config> struct TokenShuffle {
         unsigned src_token = token_topk_idx / kNumTopK;
         unsigned src_offset = ws_->InputTokensOffset(src_rank) +
                               src_token * InputTransport::kInputTokenBytes;
-        unsigned dst_offset = ws_->L1TokenBufferOffset(pool_token_idx);
+        unsigned dst_offset =
+            ws_->L1TokenBufferOffset(ws_->Rank(), pool_token_idx);
         if (wid % kWarpsPerPullToken == 0 && wtid == 0) {
             const unsigned weight =
                 ws_->br_.template LoadU32<BufferResource::kSC1Bit>(
@@ -227,7 +228,8 @@ template <class Config> struct TokenShuffle {
                     0);
             // TODO: Try coalesing with TokenMetadata
             ws_->br_.template StoreU32<BufferResource::kNone>(
-                ws_->L1TokenWeightsOffset(pool_token_idx), 0, weight);
+                ws_->L1TokenWeightsOffset(ws_->Rank(), pool_token_idx), 0,
+                weight);
         }
         using LdsInputShm =
             __attribute__((address_space(3))) typename InputTransport::Shm;

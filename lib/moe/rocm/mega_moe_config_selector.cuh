@@ -28,8 +28,10 @@ template <FusedMoESolutionId Solution> struct MegaMoEConfigSelector {
     static constexpr unsigned kStage1WarpsN = kNumWarps;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kNumSMs = 256;
-    // Token dispatch owns 0/1. The fused MegaMoE kernel uses 2 for dispatch
-    // to compute, 3 for compute completion, and 4 for the xGPU output handoff.
+    // Pull dispatch (used by EP1) owns 0/1 and uses 2 for its local handoff.
+    // The fused kernel uses 3 for compute completion and 4 for the xGPU output
+    // handoff. Multi-rank direct push uses per-expert epochs instead of an
+    // entry grid barrier.
     static constexpr unsigned kGridSyncSlots = 5;
     static constexpr unsigned kStage2GroupInterDim = kGroupDim;
     static constexpr unsigned kNumRanks = 1u << Solution.NumRanksLog2();

@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--print-summary", action="store_true", default=True)
     parser.add_argument(
+        "--stage-breakdown",
+        action="store_true",
+        help="Also time top-k, input preparation, and MoE/combine separately.",
+    )
+    parser.add_argument(
         "--profile-ranges",
         action="store_true",
         help="Emit NVTX/ROCTx ranges around benchmark stages. Off by default because it can perturb ROCm timings.",
@@ -895,6 +900,24 @@ def run_one(
         graph_iters=args.graph_iters,
     )
 
+    stage_times: dict[str, float] = {}
+    if args.stage_breakdown:
+        for stage_name, stage_fn in (
+            ("topk", topk_fn),
+            ("prepare", prepare_fn),
+            ("moe_compute_combine", compute_fn),
+        ):
+            dist.barrier()
+            local_ms, _, _ = benchmark_with_graph(
+                stage_fn,
+                warmup=args.warmup,
+                repeat=args.repeat,
+                graph_iters=args.graph_iters,
+            )
+            stage_times[f"{stage_name}_ms"] = distributed_stats(
+                local_ms, device
+            )[0]
+
     output = total_fn()
     # MegaMoE only defines the logical GPT-OSS hidden columns; the 192 padding
     # columns are transport/compute padding and are intentionally unspecified.
@@ -965,6 +988,7 @@ def run_one(
         "total_p99_ms": total_p99,
         "route_histogram": json.dumps(hist),
     }
+    row.update(stage_times)
     return row
 
 

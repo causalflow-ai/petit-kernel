@@ -168,7 +168,6 @@ template <class TileSchedule> struct OnestageFusedMoEStage1DoubleBufferOp {
 
 #pragma unroll
         for (unsigned d = 0; d < Config::kDim; d += 2 * kGroupDim) {
-            __syncthreads();
 #pragma unroll
             for (unsigned curr = 0, next = 1; curr < 2;
                  curr++, next = 1 - curr) {

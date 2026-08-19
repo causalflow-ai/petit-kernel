@@ -31,22 +31,24 @@ struct GridSyncSlotCount<Layout,
 //     to each expert
 //     - RecvCounter: (kRank, kNumExpertsPerRank,), i64, how many tokens will be
 //     received from each local expert of a source rank
-//     - RecvSumCounter: (kNumExpertsPerRank,), i32, total tokens will be
+//     - RecvSumCounter: (kNumExpertsPerRank,), i64, total tokens will be
 //     received from each local expert
 //     - RecvToken: (kNumRanks, kNumExpertsPerRank, max_tokens_per_rank), i32
 //     received [src_rank][local_experts][slots] = src_token_topk_idx
 //     - Input TokenTopK Expert Weight: (max_tokens_per_rank, kTopK), f32
 //     - Input Tokens: max_tokens_per_rank tokens (in input format)
 //     - Route output: source-owned (token, top-k) BF16 rows
+//     - Route output ready: (2, max_tokens_per_rank), i32 parity-buffered
+//       cumulative stage-2 contribution readiness
+//     - Token metadata: worst-case routed tokens, u64
+//     - L1 token buffer: worst-case routed tokens * Layout::kInputTokenBytes
+//     - L1 token weights: worst-case routed tokens * f32
 //     - Aligned to 4KB page boundary (slot_stride_)
 // Aligned to 2MB page boundary
 //
 // Local data: (only visible to the local rank)
 // - Grid sync barrier (aligned to 64-byte cache line size)
 // - Input TokenTopK Expert ID: (max_tokens_per_rank, kTopK), i32
-// - Token metadata: worst-case routed tokens, u64
-// - L1 token buffer: worst-case routed tokens * Layout::kInputTokenBytes
-// - L1 token weights: worst-case routed tokens * f32
 // - L2 arrival masks: one u32 bit mask per M32 routed-token block
 // - L2 token buffer: stage-2 MXFP4 activation values for all routed tokens
 // - L2 scale buffer: padded E8M0 scales for the L2 token buffer
@@ -54,15 +56,30 @@ struct GridSyncSlotCount<Layout,
 // We require the total VMA address space to be within 4GB so that we can use
 // buffer_load instructions for efficient memory access.
 //
-// Epoch synchronization uses additional non-overlapping fields in the unused
-// portion of each rank's cross-GPU barrier page:
+// Epoch synchronization and direct push use additional non-overlapping fields
+// in the unused portion of each rank's cross-GPU barrier page:
 //     - EpochCounter: i32, the locally owned publication generation
 //     - EpochSignal: (kNumRanks,), i32, one publication per source rank
+//     - EntryCount: (kNumSMs,), i32, monotonic invocation epoch owned by each
+//     fixed-role CTA
+//     - PlanBase: (2, kNumRanks, kNumExpertsPerRank), i32, parity-buffered
+//     destination-owned row bases pushed back to each source
+//     - CountDone: (2, kNumRanks,), i32, parity-buffered count readiness by
+//     source, stored on the destination rank
+//     - PlanReady: (2, kNumRanks,), i32, parity-buffered destination-plan
+//     readiness stored on the source rank
+//     - PayloadReady: (2, kNumExpertsPerRank,), i32, cumulative completed
+//     source payloads for each destination-local expert
+//     - EpochGate: i32, rank-local owner-to-producer admission gate
+//     - LaunchReady: (kNumRanks,), i32, peer launch-admission epochs
+// Direct push and pull shuffle are mutually exclusive within an invocation and
+// use the same SendCounter, RecvCounter, RecvSumCounter, RecvToken, token
+// metadata, L1 token buffer, and L1 token weights.
 template <class Layout> class MegaMoEWorkspace {
     using ActivationLayout = MxFp4ActivationLayout;
     static constexpr unsigned kXGpuBarrierCounterOffset = 0;
 
-    static constexpr unsigned kCacheLineBytes = 64;
+    static constexpr unsigned kCacheLineBytes = 128;
     static constexpr unsigned kPageBytes = 4096;
     static constexpr unsigned kLargePageBytes = 2 * 1024 * 1024;
     static constexpr unsigned kXGpuEpochCounterOffset = kCacheLineBytes;
@@ -72,8 +89,11 @@ template <class Layout> class MegaMoEWorkspace {
     // on an independently owned page, matching the legacy symmetric-buffer
     // layout.  Packing records 64 bytes apart puts every rank's system-scope
     // atomic traffic on one GPU-owned backing page at world size eight.
-    // Larger expert configurations need a second page for direct-push
-    // controls. Preserve the compact record for GPT-OSS shapes.
+    // DeepSeek EP8 has up to 48 local experts, so its direct-push plan no
+    // longer fits in the otherwise-unused tail of a single 4 KiB VMM page.
+    // VMM mappings are page-granular and the public workspace description
+    // already carries this stride, so reserve a second page for the larger
+    // expert configurations while preserving the GPT-OSS layout.
     static constexpr unsigned kXGpuBarrierRecordBytes =
         Layout::kNumExperts > 128 ? 2 * kPageBytes : kPageBytes;
     static constexpr unsigned kMaxGridSyncSlots =
@@ -92,9 +112,9 @@ template <class Layout> class MegaMoEWorkspace {
     static constexpr unsigned kSortedTokenBlock = 32;
     static constexpr unsigned kMaxExpertsPerToken =
         kTopK < kNumExpertsPerRank ? kTopK : kNumExpertsPerRank;
-    // PullTokens lays out routed entries per local expert and pads every
-    // expert's run to kSortedTokenBlock.  Account for the worst-case top-k
-    // fanout plus all per-expert tails, as the legacy dispatcher does.
+    // Both shuffles lay out routed entries per local expert and pad every
+    // expert's run to kSortedTokenBlock. Account for the worst-case top-k
+    // fanout plus every per-expert tail.
     static constexpr unsigned kMaxPoolTokens = tal::AlignUp<unsigned>(
         kNumRanks * kMaxTokensPerRank * kMaxExpertsPerToken +
             kNumExpertsPerRank * (kSortedTokenBlock - 1),
@@ -119,16 +139,52 @@ template <class Layout> class MegaMoEWorkspace {
                           kNumRanks * sizeof(unsigned) <=
                       3 * kCacheLineBytes,
                   "xGPU epoch slots exceed their reserved cache line");
-    static constexpr unsigned kSlotStride = tal::AlignUp<unsigned>(
+    static constexpr unsigned kDirectControlOffset = 3 * kCacheLineBytes;
+    static constexpr unsigned kDirectEntryCountBytes =
+        Layout::kNumSMs * sizeof(unsigned);
+    static constexpr unsigned kDirectPlanBaseBytes =
+        kNumExperts * sizeof(unsigned long);
+    static constexpr unsigned kDirectCountDoneBytes =
+        2 * kNumRanks * sizeof(unsigned);
+    static constexpr unsigned kDirectPlanReadyBytes =
+        2 * kNumRanks * sizeof(unsigned);
+    static constexpr unsigned kDirectPayloadReadyBytes =
+        2 * kNumExpertsPerRank * sizeof(unsigned);
+    static constexpr unsigned kDirectEpochGateBytes = sizeof(unsigned);
+    static constexpr unsigned kDirectLaunchReadyBytes =
+        kNumRanks * sizeof(unsigned);
+    static constexpr unsigned kDirectControlBytes =
+        kDirectEntryCountBytes + kDirectPlanBaseBytes + kDirectCountDoneBytes +
+        kDirectPlanReadyBytes + kDirectPayloadReadyBytes +
+        kDirectEpochGateBytes + kDirectLaunchReadyBytes;
+    static_assert(kDirectControlOffset + kDirectControlBytes <=
+                      kXGpuBarrierRecordBytes,
+                  "Direct-push controls exceed the cross-GPU barrier page");
+    static constexpr unsigned long kTokenMetadataBytes =
+        static_cast<unsigned long>(kMaxPoolTokens) * sizeof(TokenMetadata);
+    static constexpr unsigned long kRouteOutputReadyBytes =
+        2ul * kMaxTokensPerRank * sizeof(unsigned);
+    static constexpr unsigned long kL1TokenBufferBytes =
+        static_cast<unsigned long>(kMaxPoolTokens) * Layout::kInputTokenBytes;
+    static constexpr unsigned long kL1TokenWeightBytes =
+        static_cast<unsigned long>(kMaxPoolTokens) * sizeof(float);
+    static constexpr unsigned long kRankSlotRawBytes =
         kNumExperts * sizeof(unsigned long) +
-            kNumRanks * kNumExpertsPerRank * sizeof(unsigned long) +
-            kNumExpertsPerRank * sizeof(unsigned long) +
-            kNumRanks * kNumExpertsPerRank * kMaxTokensPerRank *
-                sizeof(unsigned) +
-            kMaxTokensPerRank * kTopK * sizeof(float) +
-            kMaxTokensPerRank * Layout::kInputTokenBytes +
-            kMaxTokensPerRank * Layout::kRouteOutputBufferBytes,
-        kRankSymBufferBase);
+        kNumRanks * kNumExpertsPerRank * sizeof(unsigned long) +
+        kNumExpertsPerRank * sizeof(unsigned long) +
+        static_cast<unsigned long>(kNumRanks) * kNumExpertsPerRank *
+            kMaxTokensPerRank * sizeof(unsigned) +
+        static_cast<unsigned long>(kMaxTokensPerRank) * kTopK * sizeof(float) +
+        static_cast<unsigned long>(kMaxTokensPerRank) *
+            Layout::kInputTokenBytes +
+        static_cast<unsigned long>(kMaxTokensPerRank) *
+            Layout::kRouteOutputBufferBytes +
+        kRouteOutputReadyBytes +
+        kTokenMetadataBytes + kL1TokenBufferBytes + kL1TokenWeightBytes;
+    static_assert(kRankSlotRawBytes <= 0xffffffffull,
+                  "MegaMoE rank slot exceeds 32-bit offsets");
+    static constexpr unsigned kSlotStride = tal::AlignUp<unsigned>(
+        static_cast<unsigned>(kRankSlotRawBytes), kRankSymBufferBase);
     static constexpr unsigned kLocalOffsetBase = tal::AlignUp(
         kRankSymBufferBase + kNumRanks * kSlotStride, kLargePageBytes);
 
@@ -143,10 +199,7 @@ template <class Layout> class MegaMoEWorkspace {
         kCacheLineBytes +
         static_cast<unsigned long>(kMaxTokensPerRank) * kTopK *
             sizeof(unsigned) +
-        kMaxPoolTokens * sizeof(TokenMetadata) +
-        static_cast<unsigned long>(kMaxPoolTokens) * Layout::kInputTokenBytes +
-        kMaxPoolTokens * sizeof(float) + kL2ArrivalMaskBytes +
-        kL2TokenBufferBytes + kL2ScaleBufferBytes;
+        kL2ArrivalMaskBytes + kL2TokenBufferBytes + kL2ScaleBufferBytes;
     static constexpr unsigned long kLocalBytes64 = kLocalDataBytes64;
     static_assert(kLocalBytes64 <= (1ull << 32),
                   "MegaMoE local workspace exceeds 32-bit offsets");
@@ -216,8 +269,8 @@ template <class Layout> class MegaMoEWorkspace {
                source_rank * sizeof(unsigned);
     }
 
-    TAL_HOST_DEVICE inline unsigned SendCounterOffset(unsigned rank,
-                                                      unsigned expert_idx) {
+    TAL_HOST_DEVICE inline unsigned
+    SendCounterOffset(unsigned rank, unsigned expert_idx) const {
         [[assume(rank < kNumRanks)]];
         [[assume(expert_idx < kNumExperts)]];
         return RankOffsetBase(rank) + expert_idx * sizeof(unsigned long);
@@ -225,7 +278,7 @@ template <class Layout> class MegaMoEWorkspace {
 
     TAL_HOST_DEVICE inline unsigned
     RecvCounterOffset(unsigned rank, unsigned src_rank,
-                      unsigned local_expert_idx) {
+                      unsigned local_expert_idx) const {
         [[assume(rank < kNumRanks)]];
         [[assume(src_rank < kNumRanks)]];
         [[assume(local_expert_idx < kNumExpertsPerRank)]];
@@ -236,7 +289,7 @@ template <class Layout> class MegaMoEWorkspace {
     }
 
     TAL_HOST_DEVICE inline unsigned
-    RecvSumCounterOffset(unsigned rank, unsigned local_expert_idx) {
+    RecvSumCounterOffset(unsigned rank, unsigned local_expert_idx) const {
         [[assume(rank < kNumRanks)]];
         [[assume(local_expert_idx < kNumExpertsPerRank)]];
         return RecvCounterOffset(rank, kNumRanks - 1, kNumExpertsPerRank - 1) +
@@ -246,7 +299,7 @@ template <class Layout> class MegaMoEWorkspace {
     TAL_HOST_DEVICE inline unsigned RecvTokenOffset(unsigned rank,
                                                     unsigned src_rank,
                                                     unsigned local_expert_idx,
-                                                    unsigned slot) {
+                                                    unsigned slot) const {
         [[assume(rank < kNumRanks)]];
         [[assume(src_rank < kNumRanks)]];
         [[assume(local_expert_idx < kNumExpertsPerRank)]];
@@ -260,27 +313,145 @@ template <class Layout> class MegaMoEWorkspace {
     }
 
     TAL_HOST_DEVICE inline unsigned
-    InputTokenTopKExpertWeightOffset(unsigned rank) {
+    InputTokenTopKExpertWeightOffset(unsigned rank) const {
         [[assume(rank < kNumRanks)]];
         return RecvTokenOffset(rank, kNumRanks - 1, kNumExpertsPerRank - 1,
                                kMaxTokensPerRank - 1) +
                sizeof(unsigned);
     }
 
-    TAL_HOST_DEVICE inline unsigned InputTokensOffset(unsigned rank) {
+    TAL_HOST_DEVICE inline unsigned InputTokensOffset(unsigned rank) const {
         [[assume(rank < kNumRanks)]];
         return InputTokenTopKExpertWeightOffset(rank) +
                kMaxTokensPerRank * kTopK * sizeof(float);
     }
 
-    TAL_HOST_DEVICE inline unsigned RouteOutputBufferOffset(unsigned rank) {
+    TAL_HOST_DEVICE inline unsigned
+    RouteOutputBufferOffset(unsigned rank) const {
         [[assume(rank < kNumRanks)]];
         return InputTokensOffset(rank) +
                kMaxTokensPerRank * Layout::kInputTokenBytes;
     }
 
+    TAL_HOST_DEVICE inline unsigned RouteOutputReadyOffset(
+        unsigned rank, unsigned parity, unsigned token) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(parity < 2)]];
+        [[assume(token < kMaxTokensPerRank)]];
+        return RouteOutputBufferOffset(rank) +
+               kMaxTokensPerRank * Layout::kRouteOutputBufferBytes +
+               (parity * kMaxTokensPerRank + token) * sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    TokenMetadataOffset(unsigned rank, unsigned pool_token_index) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(pool_token_index < kMaxPoolTokens)]];
+        return RouteOutputReadyOffset(rank, 1, kMaxTokensPerRank - 1) +
+               sizeof(unsigned) +
+               pool_token_index * sizeof(TokenMetadata);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    L1TokenBufferOffset(unsigned rank, unsigned pool_token_index) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(pool_token_index < kMaxPoolTokens)]];
+        return TokenMetadataOffset(rank, kMaxPoolTokens - 1) +
+               sizeof(TokenMetadata) +
+               pool_token_index * Layout::kInputTokenBytes;
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    L1TokenWeightsOffset(unsigned rank, unsigned pool_token_index) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(pool_token_index < kMaxPoolTokens)]];
+        return L1TokenBufferOffset(rank, kMaxPoolTokens - 1) +
+               Layout::kInputTokenBytes + pool_token_index * sizeof(float);
+    }
+
+    // Direct-push planning metadata and publication state lives in otherwise
+    // unused space in each rank's cross-GPU barrier page.
+    TAL_HOST_DEVICE inline unsigned
+    DirectPushEntryCountOffset(unsigned rank, unsigned block) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(block < Layout::kNumSMs)]];
+        return XGpuBarrierCounterOffset(rank) + kDirectControlOffset +
+               block * sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned DirectPushPlanBaseOffset(
+        unsigned rank, unsigned source_rank,
+        unsigned local_expert_idx) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(source_rank < kNumRanks)]];
+        [[assume(local_expert_idx < kNumExpertsPerRank)]];
+        return DirectPushEntryCountOffset(rank, Layout::kNumSMs - 1) +
+               sizeof(unsigned) +
+               (source_rank * kNumExpertsPerRank + local_expert_idx) *
+                   sizeof(unsigned long);
+    }
+
+    TAL_HOST_DEVICE inline unsigned DirectPushPlanBaseOffset(
+        unsigned rank, unsigned source_rank, unsigned local_expert_idx,
+        unsigned parity) const {
+        [[assume(parity < 2)]];
+        return DirectPushPlanBaseOffset(rank, source_rank, local_expert_idx) +
+               parity * sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    DirectPushCountDoneOffset(unsigned rank, unsigned parity,
+                              unsigned source_rank) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(parity < 2)]];
+        [[assume(source_rank < kNumRanks)]];
+        return DirectPushPlanBaseOffset(rank, kNumRanks - 1,
+                                        kNumExpertsPerRank - 1) +
+               sizeof(unsigned long) +
+               (parity * kNumRanks + source_rank) * sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    DirectPushPlanReadyOffset(unsigned rank, unsigned parity,
+                              unsigned destination_rank) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(parity < 2)]];
+        [[assume(destination_rank < kNumRanks)]];
+        return DirectPushCountDoneOffset(rank, 1, kNumRanks - 1) +
+               sizeof(unsigned) +
+               (parity * kNumRanks + destination_rank) * sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    DirectPushPayloadReadyOffset(unsigned rank, unsigned parity,
+                                 unsigned local_expert_idx) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(parity < 2)]];
+        [[assume(local_expert_idx < kNumExpertsPerRank)]];
+        return DirectPushPlanReadyOffset(rank, 1, kNumRanks - 1) +
+               sizeof(unsigned) +
+               (parity * kNumExpertsPerRank + local_expert_idx) *
+                   sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    DirectPushEpochGateOffset(unsigned rank) const {
+        [[assume(rank < kNumRanks)]];
+        return DirectPushPayloadReadyOffset(rank, 1,
+                                            kNumExpertsPerRank - 1) +
+               sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
+    DirectPushLaunchReadyOffset(unsigned rank, unsigned source_rank) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(source_rank < kNumRanks)]];
+        return DirectPushEpochGateOffset(rank) + sizeof(unsigned) +
+               source_rank * sizeof(unsigned);
+    }
+
     //
-    // Local data per ranks
+    // Private data mapped only on this rank.
     //
     TAL_HOST_DEVICE inline unsigned GridSyncBarrierOffset() const {
         return kLocalOffsetBase;
@@ -291,50 +462,22 @@ template <class Layout> class MegaMoEWorkspace {
     }
 
     TAL_HOST_DEVICE inline unsigned
-    TokenMetadataOffset(unsigned pool_token_index) const {
-        [[assume(pool_token_index < kMaxPoolTokens)]];
-        return InputTokenTopKExpertIDOffset() +
-               kMaxTokensPerRank * kTopK * sizeof(unsigned) +
-               pool_token_index * sizeof(TokenMetadata);
-    }
-
-    TAL_HOST_DEVICE inline unsigned
-    L1TokenBufferOffset(unsigned pool_token_index) const {
-        [[assume(pool_token_index < kMaxPoolTokens)]];
-        return InputTokenTopKExpertIDOffset() +
-               kMaxTokensPerRank * kTopK * sizeof(unsigned) +
-               kMaxPoolTokens * sizeof(TokenMetadata) +
-               pool_token_index * Layout::kInputTokenBytes;
-    }
-
-    TAL_HOST_DEVICE inline unsigned
-    L1TokenWeightsOffset(unsigned pool_token_index) const {
-        [[assume(pool_token_index < kMaxPoolTokens)]];
-        return InputTokenTopKExpertIDOffset() +
-               kMaxTokensPerRank * kTopK * sizeof(unsigned) +
-               kMaxPoolTokens * sizeof(TokenMetadata) +
-               kMaxPoolTokens * Layout::kInputTokenBytes +
-               pool_token_index * sizeof(float);
-    }
-
-    TAL_HOST_DEVICE inline unsigned
     L2ArrivalMaskOffset(unsigned pool_block_index) const {
         [[assume(pool_block_index < kMaxPoolBlocks)]];
-        return L1TokenWeightsOffset(kMaxPoolTokens - 1) + sizeof(float) +
+        return InputTokenTopKExpertIDOffset() +
+               kMaxTokensPerRank * kTopK * sizeof(unsigned) +
                pool_block_index * sizeof(unsigned);
     }
 
     TAL_HOST_DEVICE inline unsigned
     L2TokenBufferOffset(unsigned pool_token_index) const {
         [[assume(pool_token_index < kMaxPoolTokens)]];
-        return L1TokenWeightsOffset(kMaxPoolTokens - 1) + sizeof(float) +
-               static_cast<unsigned>(kL2ArrivalMaskBytes) +
+        return L2ArrivalMaskOffset(kMaxPoolBlocks - 1) + sizeof(unsigned) +
                pool_token_index * Layout::kInterDim / 2;
     }
 
     TAL_HOST_DEVICE inline unsigned L2ScaleBufferOffset() const {
-        return L1TokenWeightsOffset(kMaxPoolTokens - 1) + sizeof(float) +
-               static_cast<unsigned>(kL2ArrivalMaskBytes + kL2TokenBufferBytes);
+        return L2TokenBufferOffset(kMaxPoolTokens - 1) + Layout::kInterDim / 2;
     }
 
     TAL_HOST_DEVICE inline unsigned Rank() const { return rank_id_; }

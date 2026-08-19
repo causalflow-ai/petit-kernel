@@ -1,5 +1,6 @@
 #pragma once
 
+#include "moe/rocm/comm/barrier.cuh"
 #include "moe/rocm/mega_moe/workspace.cuh"
 #include "moe/rocm/ops/op_stages.cuh"
 
@@ -13,6 +14,9 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
     using Base = TwoStageStage2Epilogue<TileSchedule>;
     using Config = typename TileSchedule::Config;
     using Workspace = MegaMoEWorkspace<Config>;
+    static constexpr unsigned kPayloadLoadAux =
+        Config::kNumRanks > 1 ? BufferResource::kSC1Bit
+                              : BufferResource::kNone;
     using typename Base::BiasPrefetch;
     using typename Base::Shm;
     using Base::Apply;
@@ -27,13 +31,13 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
 
     TAL_DEVICE static float2 LoadRouteWeights(const Context &context,
                                               unsigned wtid) {
-        const unsigned offset =
-            context.workspace->L1TokenWeightsOffset(context.pool_base);
+        const unsigned offset = context.workspace->L1TokenWeightsOffset(
+            context.workspace->Rank(), context.pool_base);
         const unsigned lane = wtid % 16;
         const uint2 packed{
-            context.workspace->br_.template LoadU32<BufferResource::kNone>(
+            context.workspace->br_.template LoadU32<kPayloadLoadAux>(
                 lane * sizeof(unsigned), offset),
-            context.workspace->br_.template LoadU32<BufferResource::kNone>(
+            context.workspace->br_.template LoadU32<kPayloadLoadAux>(
                 (lane + 16) * sizeof(unsigned), offset),
         };
         return __builtin_bit_cast(float2, packed);
@@ -44,9 +48,8 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
                                      unsigned wtid) {
         const auto *output = reinterpret_cast<const unsigned *>(shm.output);
 #pragma unroll
-        for (unsigned row_group = 0; row_group < Base::kTileRows /
-                                                        Base::kNumWarps;
-             ++row_group) {
+        for (unsigned row_group = 0;
+             row_group < Base::kTileRows / Base::kNumWarps; ++row_group) {
             const unsigned row = wid + row_group * Base::kNumWarps;
             const bool valid = row < context.work_m;
             TokenMetadata metadata{};
@@ -54,8 +57,9 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
                 metadata = __builtin_bit_cast(
                     TokenMetadata,
                     context.workspace->br_
-                        .template LoadU64<BufferResource::kNone>(
+                        .template LoadU64<kPayloadLoadAux>(
                             0, context.workspace->TokenMetadataOffset(
+                                   context.workspace->Rank(),
                                    context.pool_base + row)));
             }
             const unsigned src_rank =
@@ -98,6 +102,9 @@ template <class Config> struct SourceRouteReducer {
     static constexpr unsigned kElementsPerVec =
         sizeof(uint4) / sizeof(__hip_bfloat16);
     static constexpr unsigned kVecCols = kHiddenSize / kElementsPerVec;
+    static constexpr unsigned kOutputTiles =
+        kComputeHiddenSize / Config::kGroupN;
+    static constexpr unsigned kContributionsPerToken = kTopK * kOutputTiles;
 
     static_assert(kThreads % kWarpSize == 0);
     static_assert(kHiddenSize % kElementsPerVec == 0);
@@ -108,7 +115,8 @@ template <class Config> struct SourceRouteReducer {
 
     TAL_DEVICE void Run(uint4 *__restrict__ output, unsigned num_tokens,
                         unsigned output_row_stride, unsigned sm_id,
-                        unsigned wid, unsigned wtid) const {
+                        unsigned wid, unsigned wtid,
+                        unsigned epoch = 0) const {
         static constexpr unsigned kWarpsPerBlock = kThreads / kWarpSize;
         static constexpr unsigned kWavesPerToken =
             (kVecCols + kWarpSize - 1) / kWarpSize;
@@ -123,6 +131,21 @@ template <class Config> struct SourceRouteReducer {
              wave_task < total_wave_tasks; wave_task += kTotalWaves) {
             const unsigned token = wave_task / kWavesPerToken;
             const unsigned wave_in_token = wave_task % kWavesPerToken;
+            if constexpr (Config::kNumRanks > 1) {
+                if (wtid == 0) {
+                    const unsigned expected =
+                        ((epoch + 1) / 2) * kContributionsPerToken;
+                    wait_xgpu_signal_relaxed(
+                        *workspace_,
+                        workspace_->RouteOutputReadyOffset(
+                            workspace_->Rank(), epoch & 1, token),
+                        static_cast<std::int32_t>(expected));
+                }
+                wave_barrier();
+                // Every wave consumes a disjoint slice of the token row and
+                // acquires after its lane-0 readiness observation.
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+            }
             for (unsigned vec_col = wave_in_token * kWarpSize + wtid;
                  vec_col < kVecCols;
                  vec_col += kWavesPerToken * kWarpSize) {
