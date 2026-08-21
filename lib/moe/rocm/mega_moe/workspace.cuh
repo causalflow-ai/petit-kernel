@@ -67,12 +67,20 @@ struct UsesDirectRemoteCombine<
 //
 // We require the total VMA address space to be within 4GB so that we can use
 // buffer_load instructions for efficient memory access.
+//
+// Epoch synchronization uses additional non-overlapping fields in the unused
+// portion of each rank's cross-GPU barrier page:
+//     - EpochCounter: i32, the locally owned publication generation
+//     - EpochSignal: (kNumRanks,), i32, one publication per source rank
 template <class Layout> class MegaMoEWorkspace {
     static constexpr unsigned kXGpuBarrierCounterOffset = 0;
 
     static constexpr unsigned kCacheLineBytes = 64;
     static constexpr unsigned kPageBytes = 4096;
     static constexpr unsigned kLargePageBytes = 2 * 1024 * 1024;
+    static constexpr unsigned kXGpuEpochCounterOffset = kCacheLineBytes;
+    static constexpr unsigned kXGpuEpochSignalBaseOffset =
+        2 * kCacheLineBytes;
     // VMM mappings are page-granular.  Keep each rank's xGPU signal record
     // on an independently owned page, matching the legacy symmetric-buffer
     // layout.  Packing records 64 bytes apart puts every rank's system-scope
@@ -135,6 +143,10 @@ template <class Layout> class MegaMoEWorkspace {
         static_cast<unsigned long>(kMaxPoolTokens) * Layout::kInterDim / 2;
     static constexpr unsigned long kL2ScaleBufferBytes =
         static_cast<unsigned long>(kL2ScaleRows) * kL2ScaleCols;
+    static_assert(kXGpuEpochSignalBaseOffset +
+                          kNumRanks * sizeof(unsigned) <=
+                      3 * kCacheLineBytes,
+                  "xGPU epoch slots exceed their reserved cache line");
     static constexpr unsigned kSlotStride = tal::AlignUp<unsigned>(
         kNumExperts * sizeof(unsigned long) +
             kNumRanks * kNumExpertsPerRank * sizeof(unsigned long) +
@@ -229,6 +241,20 @@ template <class Layout> class MegaMoEWorkspace {
         [[assume(phase < 2)]];
         return XGpuBarrierCounterOffset(rank) + sizeof(unsigned) +
                phase * sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE static inline unsigned
+    XGpuEpochCounterOffset(unsigned rank) {
+        [[assume(rank < kNumRanks)]];
+        return rank * kXGpuBarrierRecordBytes + kXGpuEpochCounterOffset;
+    }
+
+    TAL_HOST_DEVICE static inline unsigned
+    XGpuEpochSignalOffset(unsigned rank, unsigned source_rank) {
+        [[assume(rank < kNumRanks)]];
+        [[assume(source_rank < kNumRanks)]];
+        return rank * kXGpuBarrierRecordBytes + kXGpuEpochSignalBaseOffset +
+               source_rank * sizeof(unsigned);
     }
 
     TAL_HOST_DEVICE inline unsigned SendCounterOffset(unsigned rank,

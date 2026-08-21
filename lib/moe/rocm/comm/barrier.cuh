@@ -40,6 +40,29 @@ wait_xgpu_signal(const Workspace &workspace, unsigned signal_offset,
     }
 }
 
+__host__ __device__ constexpr bool xgpu_epoch_reached(unsigned observed,
+                                                       unsigned expected) {
+    return static_cast<std::int32_t>(observed - expected) >= 0;
+}
+
+static_assert(xgpu_epoch_reached(0, 0));
+static_assert(xgpu_epoch_reached(0, 0xffffffffu));
+static_assert(!xgpu_epoch_reached(0xffffffffu, 0));
+
+template <class Workspace>
+__device__ __forceinline__ void
+wait_xgpu_epoch(const Workspace &workspace, unsigned signal_offset,
+                unsigned expected) {
+    while (true) {
+        const unsigned observed = workspace.br_.template LoadU32<
+            BufferResource::kSC0Bit | BufferResource::kSC1Bit>(signal_offset,
+                                                               0);
+        if (xgpu_epoch_reached(observed, expected)) {
+            return;
+        }
+    }
+}
+
 template <unsigned kNumSMs, unsigned kGridSyncIndex = 0,
           bool kAcquirePayload = true,
           typename sync_scope_t, class Workspace>
@@ -180,5 +203,106 @@ xgpu_barrier(const Workspace &workspace, unsigned sm_idx,
         grid_sync<kNumSMs, kGridSyncIndex, kAcquireEpiloguePayload>(
             workspace, sm_idx, thread_idx, sync_scope);
 }
+
+// Two-phase wrappers let callers place rank-local publication work between
+// the local grid arrival and the cross-rank handoff.  Config::XGpuSync selects
+// one of these classes without introducing a runtime branch in device code.
+template <class Config> struct LegacyXGpuSync {
+    struct Ticket {};
+
+    template <unsigned kPrologueGridSyncIndex, typename sync_scope_t,
+              class Workspace>
+    __device__ __forceinline__ static Ticket
+    Begin(const Workspace &workspace, unsigned sm_idx, unsigned thread_idx,
+          const sync_scope_t &sync_scope) {
+        grid_sync<Config::kNumSMs, kPrologueGridSyncIndex,
+                  /* kAcquirePayload */ false>(workspace, sm_idx, thread_idx,
+                                               sync_scope);
+        return {};
+    }
+
+    template <unsigned kEpilogueGridSyncIndex, typename sync_scope_t,
+              class Workspace>
+    __device__ __forceinline__ static void
+    Finish(const Workspace &workspace, unsigned sm_idx, unsigned thread_idx,
+           Ticket, const sync_scope_t &sync_scope) {
+        xgpu_barrier<Config::kNumRanks, Config::kNumSMs, Config::kThreads,
+                     kEpilogueGridSyncIndex,
+                     /* kAcquireProloguePayload */ false,
+                     /* kAcquireEpiloguePayload */ true>(
+            workspace, sm_idx, thread_idx, sync_scope,
+            /* sync_prologue */ false,
+            /* sync_epilogue */ true);
+    }
+};
+
+template <class Config> struct EpochXGpuSync {
+    using Ticket = unsigned;
+
+    template <unsigned kPrologueGridSyncIndex, typename sync_scope_t,
+              class Workspace>
+    __device__ __forceinline__ static Ticket
+    Begin(const Workspace &workspace, unsigned sm_idx, unsigned thread_idx,
+          const sync_scope_t &sync_scope) {
+        unsigned next_epoch = 0;
+        if (thread_idx == 0) {
+            next_epoch = 1 + workspace.br_.template LoadU32<
+                                 BufferResource::kNone>(
+                                 Workspace::XGpuEpochCounterOffset(
+                                     workspace.Rank()),
+                                 0);
+        }
+
+        // The publishing wave must acquire payload released by every local
+        // CTA before its system-release epoch store can publish that payload
+        // transitively to peers.
+        grid_sync<Config::kNumSMs, kPrologueGridSyncIndex,
+                  /* kAcquirePayload */ true>(workspace, sm_idx, thread_idx,
+                                              sync_scope);
+        return next_epoch;
+    }
+
+    template <unsigned, typename sync_scope_t, class Workspace>
+    __device__ __forceinline__ static void
+    Finish(const Workspace &workspace, unsigned sm_idx, unsigned thread_idx,
+           Ticket next_epoch, const sync_scope_t &sync_scope) {
+        static_assert(Config::kNumRanks <=
+                          causalflow::petit::rocm::kWarpSize,
+                      "Epoch waiters must fit in one wave");
+
+        if (thread_idx < causalflow::petit::rocm::kWarpSize) {
+            next_epoch = __shfl(next_epoch, 0);
+
+            if (sm_idx == 0) {
+                if (thread_idx == 0) {
+                    workspace.br_.template StoreU32<BufferResource::kNone>(
+                        Workspace::XGpuEpochCounterOffset(workspace.Rank()),
+                        0, next_epoch);
+                }
+                if (thread_idx < Config::kNumRanks) {
+                    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+                    workspace.br_.template StoreU32<
+                        BufferResource::kSC0Bit | BufferResource::kSC1Bit>(
+                        Workspace::XGpuEpochSignalOffset(thread_idx,
+                                                         workspace.Rank()),
+                        0, next_epoch);
+                }
+                wave_barrier();
+                amdgcn_s_waitcnt<0, -1, 0>();
+            }
+
+            // Every CTA waits directly so no epilogue grid barrier is needed.
+            if (thread_idx < Config::kNumRanks) {
+                wait_xgpu_epoch(
+                    workspace,
+                    Workspace::XGpuEpochSignalOffset(workspace.Rank(),
+                                                     thread_idx),
+                    next_epoch);
+                system_fence_acquire();
+            }
+        }
+        sync_scope();
+    }
+};
 
 } // namespace causalflow::petit::rocm::moe
