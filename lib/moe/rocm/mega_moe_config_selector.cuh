@@ -179,6 +179,14 @@ int MegaMoESolutionAdapter<kRepr>::Invoke(MegaMoEParams params) {
         FusedMoESolutionId::FromRepr(kRepr);
     using Config = MegaMoEConfigSelector<kSolution>;
     using Kernel = MegaMoETwoStageCommComputeKernel<Config>;
+    using ExternalInputKernel =
+        MegaMoETwoStageCommComputeKernel<Config, true>;
+
+    const unsigned external_input_count =
+        static_cast<unsigned>(params.input_tokens != nullptr) +
+        static_cast<unsigned>(params.input_topk_ids != nullptr) +
+        static_cast<unsigned>(params.input_topk_weights != nullptr);
+
     if ((params.num_tokens != 0 && params.out == nullptr) ||
         params.w13 == nullptr || params.w2 == nullptr ||
         params.scales_w13 == nullptr || params.scales_w2 == nullptr ||
@@ -186,19 +194,33 @@ int MegaMoESolutionAdapter<kRepr>::Invoke(MegaMoEParams params) {
         params.hidden_size != Config::kComputeHiddenSize ||
         (params.output_row_stride != Config::kHiddenSize &&
          params.output_row_stride != Config::kComputeHiddenSize) ||
-        params.inter_dim != Config::kInterDim) {
+        params.inter_dim != Config::kInterDim ||
+        (external_input_count != 0 && external_input_count != 3)) {
         return kFusedMoEErrorInvalidArgument;
     }
 
-    hipLaunchKernelGGL((MegaMoETwoStage<Kernel>), dim3(Config::kNumSMs),
-                       dim3(Config::kThreads), 0, params.stream,
-                       reinterpret_cast<uint4 *>(params.out),
-                       reinterpret_cast<const uint4 *>(params.w13),
-                       reinterpret_cast<const uint4 *>(params.w2),
-                       params.scales_w13, params.scales_w2, params.num_tokens,
-                       params.output_row_stride, params.w13_bias,
-                       params.w2_bias, params.workspace, params.rank);
-    return hipGetLastError() == hipSuccess ? 0 : kFusedMoEErrorInvalidArgument;
+    const auto launch = [&]<class SelectedKernel>() {
+        hipLaunchKernelGGL(
+            (MegaMoETwoStage<SelectedKernel>), dim3(Config::kNumSMs),
+            dim3(Config::kThreads), 0, params.stream,
+            reinterpret_cast<uint4 *>(params.out),
+            reinterpret_cast<const uint4 *>(params.w13),
+            reinterpret_cast<const uint4 *>(params.w2), params.scales_w13,
+            params.scales_w2, params.num_tokens, params.output_row_stride,
+            params.w13_bias, params.w2_bias, params.workspace, params.rank,
+            reinterpret_cast<const uint4 *>(params.input_tokens),
+            params.input_topk_ids, params.input_topk_weights);
+        return hipGetLastError() == hipSuccess
+                   ? 0
+                   : kFusedMoEErrorInvalidArgument;
+    };
+    if constexpr (Config::kNumRanks > 1) {
+        if (external_input_count == 3)
+            return launch.template operator()<ExternalInputKernel>();
+    } else if (external_input_count != 0) {
+        return kFusedMoEErrorUnsupported;
+    }
+    return launch.template operator()<Kernel>();
 }
 
 template <unsigned long kRepr>

@@ -68,7 +68,9 @@ template <class Config> struct TokenShuffle {
         typename InputTransport::Shm inputs;
     };
 
-    TAL_DEVICE TokenShuffle(unsigned num_tokens, Workspace *ws, Shm *shm)
+    TAL_DEVICE TokenShuffle(unsigned num_tokens, Workspace *ws, Shm *shm,
+                            const uint4 * = nullptr, const unsigned * = nullptr,
+                            const float * = nullptr)
         : ws_(ws), shm_(shm), num_tokens_(num_tokens) {}
 
     TAL_DEVICE void Run(unsigned sm_id, unsigned tid, unsigned wid, unsigned wtid) {

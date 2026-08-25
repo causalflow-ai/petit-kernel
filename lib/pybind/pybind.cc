@@ -50,13 +50,19 @@ PYBIND11_MODULE(ops, m) {
     m.def("mega_moe_workspace_input_views", &MegaMoeWorkspaceInputViews,
           pybind11::arg("workspace"), pybind11::arg("max_tokens"),
           pybind11::arg("solution_id"));
+    m.def("mega_moe_quantize_mxfp4", &MegaMoeQuantizeMxFp4,
+          pybind11::arg("input"), pybind11::arg("output") = pybind11::none(),
+          pybind11::arg("output_scales") = pybind11::none());
     m.def("mega_moe", &MegaMoe, pybind11::arg("workspace"),
           pybind11::arg("w13"), pybind11::arg("w2"),
           pybind11::arg("fc1_scale"), pybind11::arg("fc2_scale"),
           pybind11::arg("num_tokens"), pybind11::arg("solution_id"),
           pybind11::arg("w13_bias") = pybind11::none(),
           pybind11::arg("w2_bias") = pybind11::none(),
-          pybind11::arg("out") = pybind11::none());
+          pybind11::arg("out") = pybind11::none(),
+          pybind11::arg("input_tokens") = pybind11::none(),
+          pybind11::arg("input_topk_ids") = pybind11::none(),
+          pybind11::arg("input_topk_weights") = pybind11::none());
     m.def("get_nvfp4_solutions", &GetNvFp4Solutions,
           "Get possible fp4 solutions");
     m.def("get_fp4_solutions", &GetNvFp4Solutions,

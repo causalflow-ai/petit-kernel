@@ -492,9 +492,11 @@ def make_petit_backend(
     args: argparse.Namespace,
     m: int,
     device: torch.device,
-) -> tuple[Callable[[], torch.Tensor], Callable[[], None]]:
-    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp  # type: ignore
-
+) -> tuple[
+    Callable[[], torch.Tensor],
+    Callable[[], None],
+    dict[str, Callable[[], None]],
+]:
     w1, w2, fc1_scale, fc2_scale, w1_bias, w2_bias = build_petit_weights(
         local_experts=topo.local_experts,
         hidden_size=args.padded_hidden_size,
@@ -519,17 +521,38 @@ def make_petit_backend(
     if views.scales is None:
         raise RuntimeError("MXFP4 MegaMoE workspace is missing activation scales")
     out = torch.empty((m, args.padded_hidden_size), dtype=torch.bfloat16, device=device)
+    state: dict[str, torch.Tensor] = {}
+
+    def input_views() -> petit_kernel.MegaMoeInputViews:
+        return petit_kernel.MegaMoeInputViews(
+            views.tokens,
+            views.scales,
+            state["topk_ids"],
+            state["topk_weights"],
+        )
+
+    def quantize() -> None:
+        config.quantize(
+            state["reduced_hidden"][:, : args.hidden_size],
+            out=input_views(),
+        )
+
+    def copy_expert_ids() -> None:
+        views.expert_ids.copy_(state["topk_ids"])
+
+    def copy_expert_weights() -> None:
+        views.expert_weights.copy_(state["topk_weights"])
 
     def prepare(
         reduced_hidden: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor
     ) -> None:
-        input_q, input_scale = downcast_to_mxfp(
-            reduced_hidden[:, : args.hidden_size], torch.uint8, axis=-1
-        )
-        views.tokens.copy_(input_q)
-        views.scales.copy_(input_scale)
-        views.expert_ids.copy_(topk_ids)
-        views.expert_weights.copy_(topk_weights)
+        state["reduced_hidden"] = reduced_hidden
+        state["topk_ids"] = topk_ids
+        state["topk_weights"] = topk_weights
+        quantize()
+        if topo.ep_size == 1:
+            copy_expert_ids()
+            copy_expert_weights()
 
     def compute() -> torch.Tensor:
         return config.run(
@@ -542,9 +565,18 @@ def make_petit_backend(
             w13_bias=w1_bias if args.bias else None,
             w2_bias=w2_bias if args.bias else None,
             out=out,
+            inputs=input_views() if topo.ep_size > 1 else None,
         )
 
-    return compute, prepare
+    components = {"prepare_quantize": quantize}
+    if topo.ep_size == 1:
+        components.update(
+            {
+                "prepare_copy_expert_ids": copy_expert_ids,
+                "prepare_copy_expert_weights": copy_expert_weights,
+            }
+        )
+    return compute, prepare, components
 
 
 def make_aiter_backend(
@@ -807,7 +839,7 @@ def run_one(
     dist.barrier()
 
     if args.backend == "petit":
-        petit_compute, petit_prepare = make_petit_backend(
+        petit_compute, petit_prepare, prepare_components = make_petit_backend(
             topo=topo,
             args=args,
             m=m,
@@ -821,6 +853,7 @@ def run_one(
             return petit_compute()
 
     elif args.backend == "aiter":
+        prepare_components = {}
         aiter_prepare, aiter_compute = make_aiter_backend(
             topo=topo,
             args=args,
@@ -835,6 +868,7 @@ def run_one(
             return aiter_compute()
 
     else:
+        prepare_components = {}
         flydsl_prepare, flydsl_compute = make_flydsl_backend(
             topo=topo,
             args=args,
@@ -907,6 +941,17 @@ def run_one(
             ("prepare", prepare_fn),
             ("moe_compute_combine", compute_fn),
         ):
+            dist.barrier()
+            local_ms, _, _ = benchmark_with_graph(
+                stage_fn,
+                warmup=args.warmup,
+                repeat=args.repeat,
+                graph_iters=args.graph_iters,
+            )
+            stage_times[f"{stage_name}_ms"] = distributed_stats(
+                local_ms, device
+            )[0]
+        for stage_name, stage_fn in prepare_components.items():
             dist.barrier()
             local_ms, _, _ = benchmark_with_graph(
                 stage_fn,

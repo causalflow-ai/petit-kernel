@@ -407,6 +407,24 @@ class MegaMoeConfig:
             expert_weights,
         )
 
+    def quantize(
+        self,
+        input: torch.Tensor,
+        *,
+        out: MegaMoeInputViews | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.activation is not MegaMoeActivation.mxfp4:
+            raise ValueError("quantize requires MXFP4 activation")
+        if input.ndim != 2 or input.shape[1] != self.model_dim:
+            raise ValueError("input must have shape [num_tokens, model_dim]")
+        if out is not None and out.scales is None:
+            raise ValueError("MXFP4 output must include scales")
+        return ops.mega_moe_quantize_mxfp4(
+            input,
+            None if out is None else out.tokens,
+            None if out is None else out.scales,
+        )
+
     def run(
         self,
         heap: object,
@@ -419,6 +437,7 @@ class MegaMoeConfig:
         w13_bias: torch.Tensor | None = None,
         w2_bias: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
+        inputs: MegaMoeInputViews | None = None,
     ) -> torch.Tensor:
         num_tokens = int(num_tokens)
         if num_tokens < 0 or num_tokens > self.max_tokens_per_rank:
@@ -432,6 +451,29 @@ class MegaMoeConfig:
                 "out must have shape [num_tokens, model_dim] or "
                 "[num_tokens, compute_model_dim]"
             )
+        input_tokens = None
+        input_topk_ids = None
+        input_topk_weights = None
+        if inputs is not None:
+            if self.activation is not MegaMoeActivation.mxfp4:
+                raise ValueError("external inputs require MXFP4 activation")
+            if inputs.scales is None:
+                raise ValueError("MXFP4 inputs must include scales")
+            if inputs.expert_ids.dtype != torch.int32:
+                raise ValueError("input_topk_ids has invalid dtype")
+            if (
+                (
+                    num_tokens > 0
+                    and inputs.scales.data_ptr()
+                    != inputs.tokens.data_ptr() + self.model_dim // 2
+                )
+                or inputs.scales.stride(0) != inputs.tokens.stride(0)
+                or inputs.scales.stride(1) != 1
+            ):
+                raise ValueError("scales must be a view into the input rows")
+            input_tokens = inputs.tokens
+            input_topk_ids = inputs.expert_ids
+            input_topk_weights = inputs.expert_weights
         return ops.mega_moe(
             heap,
             w13,
@@ -443,6 +485,9 @@ class MegaMoeConfig:
             w13_bias,
             w2_bias,
             out,
+            input_tokens,
+            input_topk_ids,
+            input_topk_weights,
         )
 
 

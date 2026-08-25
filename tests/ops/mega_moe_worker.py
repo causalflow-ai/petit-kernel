@@ -42,6 +42,42 @@ def random_mxfp4(
     return (low | (high << 4)).contiguous()
 
 
+def prepare_mxfp4_rows(
+    values: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    value_bytes = values.size(1)
+    scale_bytes = scales.size(1)
+    scale_row_bytes = (scale_bytes + 15) & ~15
+    storage = torch.zeros(
+        (values.size(0), value_bytes + scale_row_bytes),
+        dtype=torch.uint8,
+        device=values.device,
+    )
+    external_values = storage[:, :value_bytes]
+    external_scales = storage[:, value_bytes : value_bytes + scale_bytes]
+    external_values.copy_(values)
+    external_scales.copy_(scales)
+    return external_values, external_scales
+
+
+def expect_runtime_error(fn, message: str) -> None:
+    try:
+        fn()
+    except RuntimeError as exc:
+        assert message in str(exc), str(exc)
+    else:
+        raise AssertionError(f"expected RuntimeError containing {message!r}")
+
+
+def expect_value_error(fn, message: str) -> None:
+    try:
+        fn()
+    except ValueError as exc:
+        assert message in str(exc), str(exc)
+    else:
+        raise AssertionError(f"expected ValueError containing {message!r}")
+
+
 def dequant_mxfp4(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     table = torch.tensor(_MXFP4, dtype=torch.float32, device=values.device)
     unpacked = torch.empty(
@@ -332,6 +368,13 @@ def main() -> None:
             intermediate=intermediate,
             packed_input=packed_input,
         )
+        external_values = values
+        external_scales = input_scales
+        if packed_input:
+            assert input_scales is not None
+            external_values, external_scales = prepare_mxfp4_rows(
+                values, input_scales
+            )
         heap = petit_kernel.create_vmm_symmetric_heap(world_size)
         views = config.input_views(heap, max_tokens)
         views.tokens[:tokens].copy_(values)
@@ -367,6 +410,24 @@ def main() -> None:
             w2_bias=b2,
             out=caller_out,
         )
+        external = second
+        if world_size > 1 and packed_input:
+            external = config.run(
+                heap,
+                w13,
+                w2,
+                s13,
+                s2,
+                tokens,
+                w13_bias=b13,
+                w2_bias=b2,
+                inputs=petit_kernel.MegaMoeInputViews(
+                    external_values,
+                    external_scales,
+                    topk_ids,
+                    topk_weights,
+                ),
+            )
         torch.cuda.synchronize(device)
         assert first.shape == (tokens, compute_hidden)
         assert first.is_contiguous()
@@ -376,12 +437,84 @@ def main() -> None:
         assert second.shape == (tokens, hidden)
         assert second.is_contiguous()
         check_output(second, expected)
+        check_output(external[:, :hidden], expected)
+
+        if packed_input and tokens > 0:
+
+            def run_external(**kwargs: object) -> torch.Tensor:
+                return config.run(
+                    heap,
+                    w13,
+                    w2,
+                    s13,
+                    s2,
+                    tokens,
+                    w13_bias=b13,
+                    w2_bias=b2,
+                    **kwargs,
+                )
+
+            if world_size == 1:
+                expect_runtime_error(
+                    lambda: run_external(
+                        inputs=petit_kernel.MegaMoeInputViews(
+                            external_values,
+                            external_scales,
+                            topk_ids,
+                            topk_weights,
+                        ),
+                    ),
+                    "unsupported",
+                )
+            else:
+                expect_value_error(
+                    lambda: run_external(
+                        inputs=petit_kernel.MegaMoeInputViews(
+                            external_values, None, topk_ids, topk_weights
+                        )
+                    ),
+                    "include scales",
+                )
+                expect_runtime_error(
+                    lambda: run_external(
+                        inputs=petit_kernel.MegaMoeInputViews(
+                            external_values[:, :-1],
+                            external_scales,
+                            topk_ids,
+                            topk_weights,
+                        )
+                    ),
+                    "input_tokens must be",
+                )
+                expect_value_error(
+                    lambda: run_external(
+                        inputs=petit_kernel.MegaMoeInputViews(
+                            external_values,
+                            external_scales,
+                            topk_ids.long(),
+                            topk_weights,
+                        )
+                    ),
+                    "input_topk_ids has invalid dtype",
+                )
 
         if args.cuda_graph:
             graph_values = values.clone()
             graph_ids = topk_ids.clone()
             graph_weights = topk_weights.clone()
             graph_scales = input_scales.clone() if packed_input else None
+            graph_inputs = None
+            if world_size > 1 and packed_input:
+                assert graph_scales is not None
+                graph_external_values, graph_external_scales = (
+                    prepare_mxfp4_rows(graph_values, graph_scales)
+                )
+                graph_inputs = petit_kernel.MegaMoeInputViews(
+                    graph_external_values,
+                    graph_external_scales,
+                    graph_ids,
+                    graph_weights,
+                )
             graph_out = torch.empty(
                 (tokens, compute_hidden), dtype=torch.bfloat16, device=device
             )
@@ -405,6 +538,7 @@ def main() -> None:
                         w13_bias=b13,
                         w2_bias=b2,
                         out=graph_out,
+                        inputs=graph_inputs,
                     )
             warmup_stream.synchronize()
             dist.barrier()
@@ -426,6 +560,7 @@ def main() -> None:
                     w13_bias=b13,
                     w2_bias=b2,
                     out=graph_out,
+                    inputs=graph_inputs,
                 )
             assert graph_ret.data_ptr() == graph_out.data_ptr()
 

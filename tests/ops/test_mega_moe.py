@@ -151,6 +151,135 @@ def test_mega_moe_config_validates_workspace_and_launch_sizes() -> None:
         )
 
 
+def test_mega_moe_mxfp4_quantizer_matches_native_encoding() -> None:
+    if not has_gfx950(1):
+        pytest.skip("requires one gfx950 GPU")
+    config = petit_kernel.MegaMoeConfig(
+        world_size=8,
+        num_experts=128,
+        topk=4,
+        model_dim=2880,
+        activation="mxfp4",
+        stages=petit_kernel.MegaMoeStages.two_stage,
+    )
+    table = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    # Exercise a row-contiguous view whose physical stride is the padded GPT-OSS
+    # dimension used by the serving benchmark.
+    values = table.repeat(8, 192)[:, : config.model_dim]
+    quantized, scales = config.quantize(values)
+    expected_bytes = torch.tensor(
+        [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE],
+        dtype=torch.uint8,
+        device="cuda",
+    ).repeat(8, config.model_dim // 16)
+
+    assert torch.equal(quantized, expected_bytes)
+    assert torch.equal(scales, torch.full_like(scales, 127))
+    assert scales.shape == (8, config.model_dim // 32)
+    assert quantized.stride() == (1536, 1)
+    assert scales.stride() == (1536, 1)
+    assert scales.data_ptr() == quantized.data_ptr() + config.model_dim // 2
+    physical_scales = scales.as_strided((8, 96), (1536, 1))
+    assert not torch.count_nonzero(physical_scales[:, 90:])
+
+    output_storage = torch.empty(
+        (values.size(0), quantized.stride(0)),
+        dtype=torch.uint8,
+        device=values.device,
+    )
+    output_tokens = output_storage[:, : config.model_dim // 2]
+    output_scales = output_storage[
+        :, config.model_dim // 2 : config.model_dim // 2 + config.model_dim // 32
+    ]
+    output_views = petit_kernel.MegaMoeInputViews(
+        output_tokens,
+        output_scales,
+        torch.empty((8, config.topk), dtype=torch.int32, device=values.device),
+        torch.empty((8, config.topk), dtype=torch.float32, device=values.device),
+    )
+    returned_tokens, returned_scales = config.quantize(values, out=output_views)
+    assert returned_tokens.data_ptr() == output_tokens.data_ptr()
+    assert returned_scales.data_ptr() == output_scales.data_ptr()
+    assert torch.equal(returned_tokens, expected_bytes)
+    assert torch.equal(returned_scales, torch.full_like(returned_scales, 127))
+    assert not torch.count_nonzero(output_storage[:, 1530:])
+
+    empty_tokens, empty_scales = config.quantize(
+        values[:0],
+        out=petit_kernel.MegaMoeInputViews(
+            output_tokens[:0],
+            output_scales[:0],
+            output_views.expert_ids[:0],
+            output_views.expert_weights[:0],
+        ),
+    )
+    assert empty_tokens.shape == (0, config.model_dim // 2)
+    assert empty_scales.shape == (0, config.model_dim // 32)
+
+    zeros, zero_scales = config.quantize(torch.zeros_like(values))
+    assert not torch.count_nonzero(zeros)
+    assert not torch.count_nonzero(zero_scales)
+    assert zeros.stride() == (1536, 1)
+    assert zero_scales.stride() == (1536, 1)
+    assert zero_scales.data_ptr() == zeros.data_ptr() + config.model_dim // 2
+
+    deepseek_config = petit_kernel.MegaMoeConfig(
+        world_size=8,
+        num_experts=256,
+        topk=8,
+        model_dim=7168,
+        activation="mxfp4",
+        activation_function=petit_kernel.MegaMoeActivationFunction.silu,
+        stages=petit_kernel.MegaMoeStages.two_stage,
+        inter_dim=2048,
+        has_bias=False,
+    )
+    deepseek_values = table.repeat(2, deepseek_config.model_dim // table.numel())
+    _, deepseek_scales = deepseek_config.quantize(deepseek_values)
+    assert deepseek_scales.shape == (2, 224)
+    assert deepseek_scales.stride() == (3808, 1)
+    assert torch.equal(deepseek_scales, torch.full_like(deepseek_scales, 127))
+
+    with pytest.raises(ValueError, match="shape"):
+        config.quantize(values[:, :-32])
+    with pytest.raises(RuntimeError, match="dtype"):
+        config.quantize(values.float())
+    with pytest.raises(ValueError, match="include scales"):
+        config.quantize(
+            values,
+            out=petit_kernel.MegaMoeInputViews(
+                output_tokens,
+                None,
+                output_views.expert_ids,
+                output_views.expert_weights,
+            ),
+        )
+    with pytest.raises(RuntimeError, match="view into the output rows"):
+        config.quantize(
+            values,
+            out=petit_kernel.MegaMoeInputViews(
+                output_tokens,
+                output_storage[:, 1441:1531],
+                output_views.expert_ids,
+                output_views.expert_weights,
+            ),
+        )
+    with pytest.raises(RuntimeError, match="output must be"):
+        config.quantize(
+            values,
+            out=petit_kernel.MegaMoeInputViews(
+                output_tokens[:, :-1],
+                output_scales,
+                output_views.expert_ids,
+                output_views.expert_weights,
+            ),
+        )
+
+
 def has_gfx950(count: int) -> bool:
     return (
         torch.cuda.is_available()

@@ -15,7 +15,8 @@
 
 namespace causalflow::petit::rocm::moe {
 
-template <class Config_> struct MegaMoETwoStageCommComputeKernel {
+template <class Config_, bool kExternalInputs = false>
+struct MegaMoETwoStageCommComputeKernel {
     using Config = Config_;
     using Input = typename Config::Input;
     using W13Weights = typename Config::W13Weights;
@@ -35,7 +36,7 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
     // registered multi-rank configuration.
     using TokenDispatch = std::conditional_t<
         Config::kNumRanks == 1, TokenShuffle<Config>,
-        DirectPushTokenShuffle<Config>>;
+        DirectPushTokenShuffle<Config, kExternalInputs>>;
     using XGpuSync = typename Config::XGpuSync;
     using Scheduler = MegaMoETwoStageScheduler<Config>;
 
@@ -322,7 +323,10 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
                         const unsigned *scales_w13, const unsigned *scales_w2,
                         unsigned num_tokens, unsigned output_row_stride,
                         const void *w13_bias,
-                        const void *w2_bias, void *base, unsigned rank) {
+                        const void *w2_bias, void *base, unsigned rank,
+                        const uint4 *input_tokens,
+                        const unsigned *input_topk_ids,
+                        const float *input_topk_weights) {
         __shared__ ShmBuf shm;
         const unsigned sm_id = blockIdx.x;
         const unsigned tid = threadIdx.x;
@@ -330,7 +334,9 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
         const unsigned wtid = tid % kWarpSize;
         Workspace workspace(base, rank);
 
-        TokenDispatch dispatch(num_tokens, &workspace, &shm.dispatch);
+        TokenDispatch dispatch(num_tokens, &workspace, &shm.dispatch,
+                               input_tokens, input_topk_ids,
+                               input_topk_weights);
         unsigned dispatch_epoch = 0;
         if constexpr (Config::kNumRanks == 1) {
             dispatch.Run(sm_id, tid, wid, wtid);
@@ -396,9 +402,12 @@ __global__ static void __launch_bounds__(Kernel::kThreads)
                     const unsigned *scales_w13, const unsigned *scales_w2,
                     unsigned num_tokens, unsigned output_row_stride,
                     const void *w13_bias,
-                    const void *w2_bias, void *base, unsigned rank) {
+                    const void *w2_bias, void *base, unsigned rank,
+                    const uint4 *input_tokens, const unsigned *input_topk_ids,
+                    const float *input_topk_weights) {
     Kernel kernel;
     kernel.Run(out, w13, w2, scales_w13, scales_w2, num_tokens,
-               output_row_stride, w13_bias, w2_bias, base, rank);
+               output_row_stride, w13_bias, w2_bias, base, rank, input_tokens,
+               input_topk_ids, input_topk_weights);
 }
 } // namespace causalflow::petit::rocm::moe

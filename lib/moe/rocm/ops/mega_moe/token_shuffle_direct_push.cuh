@@ -5,6 +5,7 @@
 #include "moe/rocm/comm/barrier.cuh"
 #include "moe/rocm/fused_moe.cuh"
 #include "moe/rocm/mega_moe/workspace.cuh"
+#include "moe/rocm/memory_ops.cuh"
 #include "moe/rocm/ops/mega_moe/token_shuffle_common.cuh"
 
 #include <cstdint>
@@ -15,7 +16,8 @@ namespace causalflow::petit::rocm::moe {
 // per-phase publication protocol. There is no full-grid dispatch-to-compute
 // barrier: the owner publishes the local plan, producers publish each expert's
 // payload epoch, and compute waits only for the expert it is about to consume.
-template <class Config> struct DirectPushTokenShuffle {
+template <class Config, bool kExternalInputs = false>
+struct DirectPushTokenShuffle {
     using Workspace = MegaMoEWorkspace<Config>;
     using Common = TokenShuffleCommon<Config>;
     static constexpr unsigned kNumSMs = Config::kNumSMs;
@@ -51,9 +53,25 @@ template <class Config> struct DirectPushTokenShuffle {
         uint2 payload_plan;
     };
 
-    TAL_DEVICE DirectPushTokenShuffle(unsigned num_tokens, Workspace *workspace,
-                                      Shm *shm)
-        : num_tokens_(num_tokens), workspace_(workspace), shm_(shm) {}
+    TAL_DEVICE DirectPushTokenShuffle(
+        unsigned num_tokens, Workspace *workspace, Shm *shm,
+        const uint4 *input_tokens = nullptr,
+        const unsigned *input_topk_ids = nullptr,
+        const float *input_topk_weights = nullptr)
+        : num_tokens_(num_tokens), workspace_(workspace), shm_(shm) {
+        if constexpr (kExternalInputs) {
+            // External quantization writes into the symmetric heap. Reuse its
+            // descriptor and carry only the view's heap-relative offset.
+            input_tokens_ = workspace_->br_;
+            input_tokens_offset_ = static_cast<unsigned>(
+                reinterpret_cast<uintptr_t>(input_tokens) -
+                input_tokens_.v.ptr);
+            input_topk_ids_ = MakeBufferResource(
+                input_topk_ids, num_tokens * kTopK * sizeof(unsigned));
+            input_topk_weights_ = MakeBufferResource(
+                input_topk_weights, num_tokens * kTopK * sizeof(float));
+        }
+    }
 
     TAL_DEVICE unsigned Run(unsigned block, unsigned tid, unsigned wid,
                             unsigned wtid) {
@@ -210,19 +228,33 @@ template <class Config> struct DirectPushTokenShuffle {
             workspace_->L1TokenBufferOffset(destination, pool_index);
 
         for (unsigned vec = vec_lane; vec < kRowVecs; vec += vec_stride) {
-            const uint4 value =
-                workspace_->br_.template Load<BufferResource::kNone>(
-                    source_row + vec * sizeof(uint4), 0);
+            const unsigned source_offset =
+                source_token * Config::kInputTokenBytes + vec * sizeof(uint4);
+            const uint4 value = [&]() {
+                if constexpr (kExternalInputs) {
+                    return input_tokens_.template Load<BufferResource::kNone>(
+                        input_tokens_offset_ + source_offset, 0);
+                } else {
+                    return workspace_->br_.template Load<BufferResource::kNone>(
+                        source_row + vec * sizeof(uint4), 0);
+                }
+            }();
             workspace_->br_.template Store<BufferResource::kNone>(
                 destination_row + vec * sizeof(uint4), 0, value);
         }
         if (header_owner) {
-            const unsigned weight =
-                workspace_->br_.template LoadU32<BufferResource::kNone>(
+            unsigned weight;
+            if constexpr (kExternalInputs) {
+                weight = input_topk_weights_.template LoadU32<
+                    BufferResource::kNone>(route * sizeof(float), 0);
+            } else {
+                weight = workspace_->br_.template LoadU32<
+                    BufferResource::kNone>(
                     workspace_->InputTokenTopKExpertWeightOffset(
                         workspace_->Rank()) +
                         route * sizeof(float),
                     0);
+            }
             workspace_->br_.template StoreU32<BufferResource::kNone>(
                 workspace_->L1TokenWeightsOffset(destination, pool_index), 0,
                 weight);
@@ -240,11 +272,7 @@ template <class Config> struct DirectPushTokenShuffle {
 
         const unsigned route_count = num_tokens_ * kTopK;
         for (unsigned route = tid; route < route_count; route += kThreads) {
-            const unsigned expert =
-                workspace_->br_.template LoadU32<BufferResource::kNone>(
-                    workspace_->InputTokenTopKExpertIDOffset() +
-                        route * sizeof(unsigned),
-                    0);
+            const unsigned expert = LoadInputExpert(route);
             if (expert < kNumExperts)
                 atomicAdd(shm_->expert_count + expert, 1);
         }
@@ -354,11 +382,7 @@ template <class Config> struct DirectPushTokenShuffle {
             const unsigned route_count = num_tokens_ * kTopK;
             for (unsigned route = group_tid; route < route_count;
                  route += group_threads) {
-                const unsigned expert =
-                    workspace_->br_.template LoadU32<BufferResource::kNone>(
-                        workspace_->InputTokenTopKExpertIDOffset() +
-                            route * sizeof(unsigned),
-                        0);
+                const unsigned expert = LoadInputExpert(route);
                 if (expert < kNumExperts) {
                     const unsigned ordinal =
                         atomicAdd(shm_->expert_count + expert, 1);
@@ -482,6 +506,22 @@ template <class Config> struct DirectPushTokenShuffle {
     Workspace *workspace_;
     Shm *shm_;
     unsigned current_epoch_ = 0;
+    BufferResource input_tokens_{};
+    unsigned input_tokens_offset_ = 0;
+    BufferResource input_topk_ids_{};
+    BufferResource input_topk_weights_{};
+
+    TAL_DEVICE unsigned LoadInputExpert(unsigned route) const {
+        if constexpr (kExternalInputs) {
+            return input_topk_ids_.template LoadU32<BufferResource::kNone>(
+                route * sizeof(unsigned), 0);
+        } else {
+            return workspace_->br_.template LoadU32<BufferResource::kNone>(
+                workspace_->InputTokenTopKExpertIDOffset() +
+                    route * sizeof(unsigned),
+                0);
+        }
+    }
 };
 
 } // namespace causalflow::petit::rocm::moe

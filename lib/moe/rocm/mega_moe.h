@@ -11,6 +11,9 @@ struct MegaMoEParams {
     const unsigned *w2;
     const unsigned *scales_w13;
     const unsigned *scales_w2;
+    const unsigned *input_tokens;
+    const unsigned *input_topk_ids;
+    const float *input_topk_weights;
     unsigned num_tokens;
     unsigned hidden_size;
     unsigned inter_dim;
@@ -41,6 +44,9 @@ struct MegaMoEWorkspaceInfo {
 };
 
 int MegaMoECompute(MegaMoEParams params, unsigned long solution_id);
+int MegaMoEQuantizeMxFp4(const void *input, unsigned char *output,
+                         unsigned rows, unsigned cols,
+                         unsigned input_row_stride, hipStream_t stream);
 int GetMegaMoEWorkspaceInfo(unsigned rank, unsigned long solution_id,
                             MegaMoEWorkspaceInfo *info);
 

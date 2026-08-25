@@ -24,11 +24,17 @@ void CheckKernelStatus(int err, const char *kernel_name) {
     TORCH_CHECK(err == 0, kernel_name, " failed with code ", err);
 }
 
-void CheckTensor(const torch::Tensor &tensor, c10::ScalarType dtype,
-                 int device, const char *name) {
+void CheckTensorDeviceAndType(const torch::Tensor &tensor,
+                              c10::ScalarType dtype, int device,
+                              const char *name) {
     TORCH_CHECK(tensor.is_cuda() && tensor.get_device() == device, name,
                 " must be on the workspace HIP device");
     TORCH_CHECK(tensor.scalar_type() == dtype, name, " has invalid dtype");
+}
+
+void CheckTensor(const torch::Tensor &tensor, c10::ScalarType dtype,
+                 int device, const char *name) {
+    CheckTensorDeviceAndType(tensor, dtype, device, name);
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
@@ -84,7 +90,10 @@ torch::Tensor Launch(VmmSymmetricHeap &heap, int64_t num_tokens,
                      const MegaMoEWorkspaceInfo &info,
                      const std::optional<torch::Tensor> &w13_bias,
                      const std::optional<torch::Tensor> &w2_bias,
-                     const std::optional<torch::Tensor> &output) {
+                     const std::optional<torch::Tensor> &output,
+                     const std::optional<torch::Tensor> &input_tokens,
+                     const std::optional<torch::Tensor> &input_topk_ids,
+                     const std::optional<torch::Tensor> &input_topk_weights) {
     const int device = heap.device_index();
     CheckTensor(w13, torch::kUInt8, device, "w13");
     CheckTensor(w2, torch::kUInt8, device, "w2");
@@ -130,6 +139,32 @@ torch::Tensor Launch(VmmSymmetricHeap &heap, int64_t num_tokens,
     }
     const void *bias13 = w13_bias ? w13_bias->data_ptr() : nullptr;
     const void *bias2 = w2_bias ? w2_bias->data_ptr() : nullptr;
+    const unsigned external_count =
+        static_cast<unsigned>(input_tokens.has_value()) +
+        static_cast<unsigned>(input_topk_ids.has_value()) +
+        static_cast<unsigned>(input_topk_weights.has_value());
+    TORCH_CHECK(external_count == 0 || external_count == 3,
+                "external MegaMoE inputs must be provided together");
+    if (external_count == 3) {
+        CheckTensorDeviceAndType(*input_tokens, torch::kUInt8, device,
+                                 "input_tokens");
+        CheckTensor(*input_topk_ids, torch::kInt32, device, "input_topk_ids");
+        CheckTensor(*input_topk_weights, torch::kFloat32, device,
+                    "input_topk_weights");
+        TORCH_CHECK(input_tokens->dim() == 2 &&
+                        input_tokens->size(0) == num_tokens &&
+                        input_tokens->size(1) == info.hidden_size / 2,
+                    "input_tokens must be [num_tokens, hidden_size / 2]");
+        TORCH_CHECK(input_tokens->stride(1) == 1 &&
+                        input_tokens->stride(0) == info.input_token_bytes,
+                    "input_tokens rows must include aligned scale storage");
+        TORCH_CHECK(input_topk_ids->dim() == 2 &&
+                        input_topk_ids->size(0) == num_tokens &&
+                        input_topk_ids->size(1) == info.topk,
+                    "input_topk_ids must be [num_tokens, topk]");
+        TORCH_CHECK(input_topk_weights->sizes() == input_topk_ids->sizes(),
+                    "input_topk_weights must match input_topk_ids");
+    }
 
     MegaMoEParams params{
         reinterpret_cast<unsigned *>(out.data_ptr()),
@@ -138,6 +173,15 @@ torch::Tensor Launch(VmmSymmetricHeap &heap, int64_t num_tokens,
         reinterpret_cast<const unsigned *>(w2.data_ptr()),
         reinterpret_cast<const unsigned *>(scales_w13.data_ptr()),
         reinterpret_cast<const unsigned *>(scales_w2.data_ptr()),
+        input_tokens
+            ? reinterpret_cast<const unsigned *>(input_tokens->data_ptr())
+            : nullptr,
+        input_topk_ids
+            ? reinterpret_cast<const unsigned *>(input_topk_ids->data_ptr())
+            : nullptr,
+        input_topk_weights
+            ? reinterpret_cast<const float *>(input_topk_weights->data_ptr())
+            : nullptr,
         static_cast<unsigned>(num_tokens),
         info.compute_hidden_size,
         inter_dim,
@@ -172,16 +216,85 @@ pybind11::tuple MegaMoeWorkspaceInputViews(
                               LookupSolution(heap, solution_id));
 }
 
+pybind11::tuple MegaMoeQuantizeMxFp4(
+    const torch::Tensor &input,
+    const std::optional<torch::Tensor> &output_arg,
+    const std::optional<torch::Tensor> &output_scales_arg) {
+    TORCH_CHECK(input.is_cuda(), "input must be on a HIP device");
+    const int device = input.get_device();
+    TORCH_CHECK(input.scalar_type() == torch::kBFloat16,
+                "input has invalid dtype");
+    TORCH_CHECK(input.dim() == 2 && input.size(1) > 0 &&
+                    input.size(1) % 32 == 0,
+                "input must be [num_tokens, hidden_size] with a 32-aligned "
+                "hidden size");
+    TORCH_CHECK(input.stride(1) == 1 && input.stride(0) % 8 == 0,
+                "input rows must be contiguous and 16-byte aligned");
+
+    c10::DeviceGuard guard(c10::Device(
+        c10::DeviceType::CUDA, static_cast<c10::DeviceIndex>(device)));
+    const auto rows = input.size(0);
+    const auto cols = input.size(1);
+    const auto value_row_bytes = cols / 2;
+    const auto scale_cols = cols / 32;
+    const auto scale_row_bytes = (scale_cols + 15) & ~int64_t{15};
+    const auto output_row_bytes = value_row_bytes + scale_row_bytes;
+    TORCH_CHECK(output_arg.has_value() == output_scales_arg.has_value(),
+                "output and output_scales must be provided together");
+
+    torch::Tensor output;
+    torch::Tensor scales;
+    if (output_arg) {
+        output = *output_arg;
+        scales = *output_scales_arg;
+        CheckTensorDeviceAndType(output, torch::kUInt8, device, "output");
+        CheckTensorDeviceAndType(scales, torch::kUInt8, device,
+                                 "output_scales");
+        TORCH_CHECK(output.dim() == 2 && output.size(0) == rows &&
+                        output.size(1) == value_row_bytes,
+                    "output must be [num_tokens, hidden_size / 2]");
+        TORCH_CHECK(scales.dim() == 2 && scales.size(0) == rows &&
+                        scales.size(1) == scale_cols,
+                    "output_scales must be [num_tokens, hidden_size / 32]");
+        TORCH_CHECK(output.stride(1) == 1 && scales.stride(1) == 1 &&
+                        output.stride(0) == output_row_bytes &&
+                        scales.stride(0) == output_row_bytes,
+                    "output rows must include aligned scale storage");
+        TORCH_CHECK(rows == 0 ||
+                        scales.data_ptr() ==
+                            static_cast<unsigned char *>(output.data_ptr()) +
+                                value_row_bytes,
+                    "output_scales must be a view into the output rows");
+    } else {
+        auto storage = torch::empty({rows, output_row_bytes},
+                                    input.options().dtype(torch::kUInt8));
+        output = storage.narrow(1, 0, value_row_bytes);
+        scales = storage.narrow(1, value_row_bytes, scale_cols);
+    }
+    CheckKernelStatus(
+        moe::MegaMoEQuantizeMxFp4(
+            input.data_ptr(), static_cast<unsigned char *>(output.data_ptr()),
+            static_cast<unsigned>(rows), static_cast<unsigned>(cols),
+            static_cast<unsigned>(input.stride(0)),
+            at::hip::getCurrentHIPStream(device)),
+        "MegaMoE MXFP4 quantizer");
+    return pybind11::make_tuple(output, scales);
+}
+
 torch::Tensor MegaMoe(
     VmmSymmetricHeap &heap, const torch::Tensor &w13,
     const torch::Tensor &w2, const torch::Tensor &scales_w13,
     const torch::Tensor &scales_w2, int64_t num_tokens, uint64_t solution_id,
     const std::optional<torch::Tensor> &w13_bias,
     const std::optional<torch::Tensor> &w2_bias,
-    const std::optional<torch::Tensor> &out) {
+    const std::optional<torch::Tensor> &out,
+    const std::optional<torch::Tensor> &input_tokens,
+    const std::optional<torch::Tensor> &input_topk_ids,
+    const std::optional<torch::Tensor> &input_topk_weights) {
     return Launch(heap, num_tokens, w13, w2, scales_w13, scales_w2,
                   solution_id, LookupSolution(heap, solution_id), w13_bias,
-                  w2_bias, out);
+                  w2_bias, out, input_tokens, input_topk_ids,
+                  input_topk_weights);
 }
 
 } // namespace causalflow::petit::pybind
