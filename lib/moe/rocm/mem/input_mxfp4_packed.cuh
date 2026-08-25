@@ -15,6 +15,8 @@ template <class Config> struct MxFp4InputPacked {
     static constexpr unsigned kHiddenSize = Config::kHiddenSize;
     static constexpr unsigned kTokenBatch = Config::kTokenBatch;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
+    static constexpr unsigned kWarpsM = Config::kStage1WarpsM;
+    static constexpr unsigned kWarpsN = Config::kStage1WarpsN;
     static constexpr unsigned kGroupM = kTokenBatch * kNumWarps;
     static constexpr unsigned kGroupDim = Config::kGroupDim;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
@@ -22,7 +24,18 @@ template <class Config> struct MxFp4InputPacked {
     static constexpr unsigned kK128Tiles = kGroupK / 128;
     static constexpr unsigned kK32PerTile = 4;
     static constexpr unsigned kRowVecsPerTile = kK128Tiles * kK32PerTile;
-    static constexpr unsigned kActivationFragments = 2 * kK128Tiles;
+    static constexpr unsigned kAsyncVecsPerWarp =
+        kTokenBatch * kRowVecsPerTile;
+    static constexpr unsigned kLoadIterations =
+        tal::CeilingDiv<unsigned>(kAsyncVecsPerWarp, kWarpSize);
+    static constexpr bool kWaveM64 = [] {
+        if constexpr (requires { Config::kStage1WaveM64; })
+            return Config::kStage1WaveM64;
+        return false;
+    }();
+    static constexpr unsigned kMRepeats = kWaveM64 ? 4 : 2;
+    static constexpr unsigned kActivationFragments =
+        kMRepeats * kK128Tiles;
     static constexpr unsigned kScaleBlockSize = 32;
     static constexpr unsigned kValueBytes = kHiddenSize / 2;
     static constexpr unsigned kScaleBytes = kHiddenSize / kScaleBlockSize;
@@ -35,7 +48,8 @@ template <class Config> struct MxFp4InputPacked {
         kPaddedScaleBytes / sizeof(unsigned);
     static constexpr unsigned kScaleTiles = Config::kComputeHiddenSize /
                                              kGroupDim;
-    static constexpr unsigned kScaleWords = kScaleTiles * kWarpSize;
+    static constexpr unsigned kScaleWords =
+        kScaleTiles * kWarpSize * kWarpsM;
     static constexpr unsigned kScaleStages = 2;
     static constexpr unsigned kScaleWordsPerStage =
         kScaleWords / kScaleStages;
@@ -47,27 +61,28 @@ template <class Config> struct MxFp4InputPacked {
         kNumWarps / kScaleStages;
 
     struct Shm {
-        uint4 act[kThreads];
+        uint4 act[kGroupM * kRowVecsPerTile];
         unsigned scale[kScaleWordsPerStage];
     };
 
-    static_assert(kNumWarps == 4 && kTokenBatch == 8);
+    static_assert((kNumWarps == 4 || (kNumWarps == 8 && kWaveM64)) &&
+                  (kTokenBatch == 8 || kTokenBatch == 16));
     static_assert(kGroupDim == 256);
-    static_assert(kRowVecsPerTile * kTokenBatch == kWarpSize);
+    static_assert(kLoadIterations == 1 || kLoadIterations == 2);
+    static_assert(kWaveM64 || kWarpsM * kWarpsN == kNumWarps);
+    static_assert(kGroupM == 32 * kWarpsM);
     static_assert(Config::kComputeHiddenSize % kGroupDim == 0);
     static_assert(kScaleTiles % kScaleStages == 0);
     static_assert(kNumWarps % kScaleStages == 0);
     static_assert(kGroupM * kPaddedScaleBytes ==
                   kScaleWords * sizeof(unsigned));
     static_assert(kPaddedScaleBytes == kScaleTiles * 8);
-    static_assert(kScaleVectors <= kNumWarps * kWarpSize);
 
     template <class Workspace>
-    TAL_DEVICE void Initialize(Workspace &workspace, unsigned work_id,
+    TAL_DEVICE void Initialize(Workspace &workspace, unsigned pool_row,
                                unsigned m) {
         workspace_ = workspace.br_;
-        activation_offset_ =
-            workspace.L1TokenBufferOffset(work_id * kTokenBatch * kNumWarps);
+        activation_offset_ = workspace.L1TokenBufferOffset(pool_row);
         m_ = m;
         values_offset_vec_ = 0;
         scale_tile_ = 0;
@@ -75,25 +90,36 @@ template <class Config> struct MxFp4InputPacked {
 
     TAL_DEVICE void FetchAsync(uint4 *shm_x, unsigned wid, unsigned wtid,
                                const unsigned tokens[kTokenBatch]) {
-        const unsigned token_idx = wtid / kRowVecsPerTile;
-        const unsigned row_vec =
-            wtid - token_idx * kRowVecsPerTile;
-        const unsigned source_row_vec =
-            row_vec ^ (token_idx & (kRowVecsPerTile - 1));
-        const unsigned dst_idx = wid * kWarpSize;
-        auto *lds = (__attribute__((address_space(3))) unsigned *)(
-            shm_x + dst_idx);
-        const unsigned row = tokens[token_idx];
-        const unsigned first_element =
-            values_offset_vec_ * kScaleBlockSize +
-            source_row_vec * kScaleBlockSize;
-        const unsigned actual =
-            activation_offset_ + row * kRowStride +
-            (values_offset_vec_ + source_row_vec) * sizeof(uint4);
-        const unsigned offset =
-            row < m_ && first_element < kHiddenSize ? actual : ~0u;
-        workspace_.template LoadLds<BufferResource::kNone, sizeof(uint4), 0>(
-            lds, offset, 0);
+        // Keep this lane-linear schedule.  A token-major unrolled loop makes
+        // token_idx constant, but Clang keeps every token load live together
+        // and spills the resulting buffer state in the stage-1 kernels.
+#pragma unroll
+        for (unsigned load = 0; load < kLoadIterations; ++load) {
+            const unsigned linear = load * kWarpSize + wtid;
+            if (linear >= kAsyncVecsPerWarp)
+                continue;
+            const unsigned token_idx = linear / kRowVecsPerTile;
+            const unsigned row_vec =
+                linear - token_idx * kRowVecsPerTile;
+            const unsigned source_row_vec =
+                row_vec ^ (token_idx & (kRowVecsPerTile - 1));
+            const unsigned dst_idx =
+                wid * kAsyncVecsPerWarp + load * kWarpSize;
+            auto *lds = (__attribute__((address_space(3))) unsigned *)(
+                shm_x + dst_idx);
+            const unsigned row = tokens[token_idx];
+            const unsigned first_element =
+                values_offset_vec_ * kScaleBlockSize +
+                source_row_vec * kScaleBlockSize;
+            const unsigned actual =
+                activation_offset_ + row * kRowStride +
+                (values_offset_vec_ + source_row_vec) * sizeof(uint4);
+            const unsigned offset =
+                row < m_ && first_element < kHiddenSize ? actual : ~0u;
+            workspace_
+                .template LoadLds<BufferResource::kNone, sizeof(uint4), 0>(
+                    lds, offset, 0);
+        }
         values_offset_vec_ += kGroupDim / kScaleBlockSize;
     }
 
@@ -113,25 +139,39 @@ template <class Config> struct MxFp4InputPacked {
 
     TAL_DEVICE void FetchToRegs(uint4 regs[kActivationFragments],
                                 const uint4 *shm_x, unsigned wtid) const {
+        const unsigned wid = threadIdx.x / kWarpSize;
         const unsigned row = wtid & 15u;
         const unsigned vector = wtid / 16;
-        const unsigned row_base = row * kRowVecsPerTile;
+        const unsigned wave_m = kWaveM64 ? 0 : wid / kWarpsN;
+        const unsigned row_base = (wave_m * 32 + row) * kRowVecsPerTile;
         const auto swizzle = [=](unsigned value) {
             return value ^ (row & (kRowVecsPerTile - 1));
         };
-        const uint4 *k0 = shm_x + row_base + swizzle(vector);
-        const uint4 *k1 =
-            shm_x + row_base + swizzle(vector + kK32PerTile);
         static constexpr unsigned kNextRow = 16 * kRowVecsPerTile;
-        regs[0] = k0[0];
-        regs[1] = k1[0];
-        regs[2] = k0[kNextRow];
-        regs[3] = k1[kNextRow];
+#pragma unroll
+        for (unsigned m16 = 0; m16 < kMRepeats; ++m16) {
+            const uint4 *row16 = shm_x + row_base + m16 * kNextRow;
+            regs[m16 * 2] = row16[swizzle(vector)];
+            regs[m16 * 2 + 1] =
+                row16[swizzle(vector + kK32PerTile)];
+        }
     }
 
     TAL_DEVICE unsigned FetchScaleToReg(const unsigned *shm_scale,
                                         unsigned wtid) const {
-        return shm_scale[scale_tile_ / kScaleStages * kWarpSize + wtid];
+        const unsigned wid = threadIdx.x / kWarpSize;
+        const unsigned wave_m = wid / kWarpsN;
+        return shm_scale[(scale_tile_ / kScaleStages * kWarpsM + wave_m) *
+                             kWarpSize +
+                         wtid];
+    }
+
+    TAL_DEVICE unsigned FetchScaleToReg(const unsigned *shm_scale,
+                                        unsigned wtid,
+                                        unsigned wave_m) const {
+        return shm_scale[(scale_tile_ / kScaleStages * kWarpsM + wave_m) *
+                             kWarpSize +
+                         wtid];
     }
 
     TAL_DEVICE void AdvanceScaleStep() {
@@ -143,27 +183,35 @@ template <class Config> struct MxFp4InputPacked {
                                     unsigned wtid) {
         const unsigned stage = wid / kWarpsPerScaleStage;
         const unsigned wave_in_stage = wid % kWarpsPerScaleStage;
-        const unsigned local_vector = wave_in_stage * kWarpSize + wtid;
-        const unsigned vector =
-            stage * kScaleVectorsPerStage + local_vector;
-        const unsigned stage_word =
-            wave_in_stage * kWarpSize < kScaleVectorsPerStage
-                ? wave_in_stage * kWarpSize *
-                      (sizeof(uint4) / sizeof(unsigned))
-                : 0;
-        auto *lds = (__attribute__((address_space(3))) unsigned *)(
-            shm[stage].scale + stage_word);
-        const unsigned row = vector / kScaleVectorsPerRow;
-        const unsigned row_vector = vector - row * kScaleVectorsPerRow;
+        static constexpr unsigned kVectorsPerIteration =
+            kWarpsPerScaleStage * kWarpSize;
+        static constexpr unsigned kLoadIterations =
+            tal::CeilingDiv<unsigned>(kScaleVectorsPerStage,
+                                      kVectorsPerIteration);
         BufferResource scales = workspace_;
         scales.v.range = activation_offset_ + kGroupM * kRowStride;
-        const unsigned src =
-            local_vector < kScaleVectorsPerStage
-                ? activation_offset_ + kValueBytes + row * kRowStride +
-                      row_vector * sizeof(uint4)
-                : ~0u;
-        scales.template LoadLds<BufferResource::kNone, sizeof(uint4), 0>(
-            lds, src, 0);
+#pragma unroll
+        for (unsigned load = 0; load < kLoadIterations; ++load) {
+            const unsigned local_vector = wave_in_stage * kWarpSize + wtid +
+                                          load * kVectorsPerIteration;
+            const unsigned stage_word =
+                local_vector < kScaleVectorsPerStage
+                    ? local_vector * (sizeof(uint4) / sizeof(unsigned))
+                    : 0;
+            auto *lds = (__attribute__((address_space(3))) unsigned *)(
+                shm[stage].scale + stage_word);
+            const unsigned vector =
+                stage * kScaleVectorsPerStage + local_vector;
+            const unsigned row = vector / kScaleVectorsPerRow;
+            const unsigned row_vector = vector - row * kScaleVectorsPerRow;
+            const unsigned src =
+                local_vector < kScaleVectorsPerStage
+                    ? activation_offset_ + kValueBytes + row * kRowStride +
+                          row_vector * sizeof(uint4)
+                    : ~0u;
+            scales.template LoadLds<BufferResource::kNone, sizeof(uint4), 0>(
+                lds, src, 0);
+        }
     }
 
     TAL_DEVICE void RepackScales(Shm (&shm)[kScaleStages], unsigned tid) {
@@ -177,9 +225,12 @@ template <class Config> struct MxFp4InputPacked {
 #pragma unroll
         for (unsigned i = 0; i < kTasksPerThread; ++i) {
             const unsigned task = (quad + i * kNumQuads) % kScaleTasks;
-            const unsigned tile = task / 16;
+            const unsigned block = task / 16;
+            const unsigned tile = block / kWarpsM;
+            const unsigned wave_m = block % kWarpsM;
             const unsigned row16 = task % 16;
-            const unsigned row = row16 + 16 * (quad_lane & 1);
+            const unsigned row =
+                wave_m * 32 + row16 + 16 * (quad_lane & 1);
             const unsigned half = quad_lane >> 1;
             const unsigned raw_word =
                 row * kScaleWordsPerRow + tile * 2 + half;
@@ -208,10 +259,13 @@ template <class Config> struct MxFp4InputPacked {
 #pragma unroll
         for (unsigned i = 0; i < kTasksPerThread; ++i) {
             const unsigned task = (quad + i * kNumQuads) % kScaleTasks;
-            const unsigned tile = task / 16;
+            const unsigned block = task / 16;
+            const unsigned tile = block / kWarpsM;
+            const unsigned wave_m = block % kWarpsM;
             const unsigned row16 = task % 16;
             const unsigned stage = tile % kScaleStages;
-            const unsigned stage_tile = tile / kScaleStages;
+            const unsigned stage_tile =
+                tile / kScaleStages * kWarpsM + wave_m;
             shm[stage].scale[stage_tile * kWarpSize + quad_lane * 16 +
                              row16] = packed[i];
         }

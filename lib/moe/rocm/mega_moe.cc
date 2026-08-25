@@ -51,6 +51,10 @@ const std::unordered_map<unsigned long, MegaMoESolutionOperations>
                           3072, MEGA_MOE_P64, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 8, 128, 4, 2880,
                           3072, MEGA_MOE_P128, MEGA_MOE_N256),
+        MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 256, 8,
+                          7168, 2048, MEGA_MOE_P64, MEGA_MOE_N256),
+        MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 256, 8,
+                          7168, 2048, MEGA_MOE_P128, MEGA_MOE_N256),
 };
 
 #undef MEGA_MOE_N256

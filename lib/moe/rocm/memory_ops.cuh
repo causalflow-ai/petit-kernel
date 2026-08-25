@@ -238,6 +238,10 @@ enum class MxFp4TileShape : unsigned {
     // Four-wave M64 x N256 (per projection): two M waves by two N waves.
     // W13 therefore covers N512 when gate and up are counted together.
     kM64N256,
+    // Eight-wave M64 x N256 (per projection): every wave spans M64 and owns
+    // one N32 slice. Gate and up together are M64 x N64 per wave, matching
+    // FlyDSL's bounded-M stage-1 ownership.
+    kM64N256W8,
 };
 
 template <MxFp4TileShape kLayout, unsigned kNumWarps>
@@ -246,6 +250,7 @@ struct MxFp4WeightLayoutSelector;
 template <unsigned kNumWarps>
 struct MxFp4WeightLayoutSelector<MxFp4TileShape::kN256, kNumWarps> {
     static constexpr unsigned kTileM = 32;
+    static constexpr unsigned kWaveTileM = 32;
     static constexpr unsigned kGroupN = 256;
     static constexpr unsigned kTileK = 256;
     static constexpr unsigned kLoadGlobal = 4;
@@ -269,6 +274,7 @@ struct MxFp4WeightLayoutSelector<MxFp4TileShape::kN256, kNumWarps> {
 template <unsigned kNumWarps>
 struct MxFp4WeightLayoutSelector<MxFp4TileShape::kN128, kNumWarps> {
     static constexpr unsigned kTileM = 32;
+    static constexpr unsigned kWaveTileM = 32;
     static constexpr unsigned kGroupN = 128;
     static constexpr unsigned kTileK = 256;
     static constexpr unsigned kLoadGlobal = 2;
@@ -287,6 +293,7 @@ struct MxFp4WeightLayoutSelector<MxFp4TileShape::kN128, kNumWarps> {
 template <unsigned kNumWarps>
 struct MxFp4WeightLayoutSelector<MxFp4TileShape::kM64N256, kNumWarps> {
     static constexpr unsigned kTileM = 64;
+    static constexpr unsigned kWaveTileM = 32;
     static constexpr unsigned kGroupN = 256;
     static constexpr unsigned kTileK = 256;
     static constexpr unsigned kLoadGlobal = 8;
@@ -311,11 +318,39 @@ struct MxFp4WeightLayoutSelector<MxFp4TileShape::kM64N256, kNumWarps> {
     }
 };
 
+template <unsigned kNumWarps>
+struct MxFp4WeightLayoutSelector<MxFp4TileShape::kM64N256W8, kNumWarps> {
+    static constexpr unsigned kTileM = 64;
+    static constexpr unsigned kWaveTileM = 64;
+    static constexpr unsigned kGroupN = 256;
+    static constexpr unsigned kTileK = 256;
+    static constexpr unsigned kLoadGlobal = 2;
+    static constexpr unsigned kWaveTileN = 32;
+    static_assert(kNumWarps == 8);
+
+    __host__ __device__ static constexpr unsigned
+    ValueOffsetBytes(unsigned wid, unsigned fragment, unsigned stride_n) {
+        return (wid * kWaveTileN + fragment * 16) * stride_n / 2;
+    }
+
+    __host__ __device__ static constexpr unsigned
+    K128OffsetBytes(unsigned stage) {
+        return stage * kWarpSize * sizeof(uint4);
+    }
+
+    __host__ __device__ static constexpr unsigned
+    N32Offset(unsigned wid, unsigned) {
+        return wid;
+    }
+};
+
 template <unsigned kNumWarps_, MxFp4TileShape kLayout_>
 struct MxFp4WeightLayout {
     using LayoutSelector = MxFp4WeightLayoutSelector<kLayout_, kNumWarps_>;
     static constexpr unsigned kGroupM = 128;
     static constexpr unsigned kGroupN = LayoutSelector::kGroupN;
+    static constexpr unsigned kTileM = LayoutSelector::kTileM;
+    static constexpr unsigned kWaveTileM = LayoutSelector::kWaveTileM;
     static constexpr unsigned kWaveTileN = LayoutSelector::kWaveTileN;
     static constexpr unsigned kNumWarps = kNumWarps_;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;

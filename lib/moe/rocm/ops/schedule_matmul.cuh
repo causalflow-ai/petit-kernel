@@ -239,13 +239,17 @@ struct Bf16MxFp4Matmul : detail::MatmulTile<64, 16, 4> {
 
 };
 
-template <unsigned kTileN_>
-struct NativeMxFp4Matmul : detail::MatmulTile<kTileN_, 4, 4> {
-    using Base = detail::MatmulTile<kTileN_, 4, 4>;
-    static constexpr unsigned kActivationFragments =
-        Base::kActivationFragments;
-    static constexpr unsigned kAccumFragments = Base::kAccumFragments;
-    static constexpr unsigned kWeightFragments = Base::kWeightFragments;
+template <unsigned kTileM_, unsigned kTileN_> struct NativeMxFp4Matmul {
+    static constexpr unsigned kMRepeats = kTileM_ / 16;
+    static constexpr unsigned kNRepeats = kTileN_ / 16;
+    static constexpr unsigned kKStages = 2;
+    static constexpr unsigned kActivationFragments = kMRepeats * kKStages;
+    static constexpr unsigned kAccumFragments = kMRepeats * kNRepeats;
+    static constexpr unsigned kWeightFragments = kNRepeats;
+    static constexpr unsigned kScaleFragments = kMRepeats / 2;
+
+    static_assert(kTileM_ == 32 || kTileM_ == 64);
+    static_assert(kTileN_ % 32 == 0);
 
     // With weight as operand A, lane 16*q+r owns
     // C[16*m16+r, 16*n_fragment+4*q+component]. Accumulators therefore use
@@ -253,7 +257,8 @@ struct NativeMxFp4Matmul : detail::MatmulTile<kTileN_, 4, 4> {
     __device__ static void
     Matmul(float4 t[kAccumFragments],
            const uint4 w[2][kWeightFragments],
-           const uint4 x[kActivationFragments], unsigned scale_x,
+           const uint4 x[kActivationFragments],
+           const unsigned scale_x[kScaleFragments],
            const unsigned scale_w[kWeightFragments / 2]) {
 #pragma unroll
         for (unsigned k128 = 0; k128 < 2; ++k128) {
@@ -261,12 +266,14 @@ struct NativeMxFp4Matmul : detail::MatmulTile<kTileN_, 4, 4> {
             for (unsigned n_fragment = 0; n_fragment < kWeightFragments;
                  ++n_fragment) {
 #pragma unroll
-                for (unsigned m16 = 0; m16 < 2; ++m16) {
-                    const unsigned t_idx = n_fragment * 2 + m16;
+                for (unsigned m16 = 0; m16 < kMRepeats; ++m16) {
+                    const unsigned t_idx =
+                        n_fragment * kMRepeats + m16;
                     t[t_idx] = detail::ScaledMxFp4Mfma(
-                        2 * k128 + (n_fragment & 1), 2 * k128 + m16,
+                        2 * k128 + (n_fragment & 1),
+                        2 * k128 + (m16 & 1),
                         w[k128][n_fragment], scale_w[n_fragment / 2],
-                        x[m16 * 2 + k128], scale_x, t[t_idx]);
+                        x[m16 * 2 + k128], scale_x[m16 / 2], t[t_idx]);
                 }
             }
         }

@@ -44,6 +44,11 @@ template <class Config> struct MxFp4ActivationQuantizer {
         (kRowsPerTile * kTileCols) /
         (Config::kNumWarps * kWarpSize) / 4;
     using QuantizeShm = float[kRowsPerTile * kTileCols];
+    static constexpr bool kWaveM64 = [] {
+        if constexpr (requires { Config::kStage1WaveM64; })
+            return Config::kStage1WaveM64;
+        return false;
+    }();
 
     struct Quantized {
         unsigned short value;
@@ -54,9 +59,14 @@ template <class Config> struct MxFp4ActivationQuantizer {
     StoreAccumulator(QuantizeShm &shm,
                      const float4 h[kInputFragments], unsigned wid,
                      unsigned wtid) {
-        StoreStage1AccumulatorLds2D<
-            kRowsPerTile, kTileCols, Config::kStage1WarpsM,
-            Config::kStage1WarpsN>(shm, h, wid, wtid);
+        if constexpr (kWaveM64) {
+            StoreStage1AccumulatorLdsM64<kTileCols, Config::kNumWarps>(
+                shm, h, wid, wtid);
+        } else {
+            StoreStage1AccumulatorLds2D<
+                kRowsPerTile, kTileCols, Config::kStage1WarpsM,
+                Config::kStage1WarpsN>(shm, h, wid, wtid);
+        }
     }
 
     TAL_DEVICE static Quantized Quantize(const QuantizeShm &shm,

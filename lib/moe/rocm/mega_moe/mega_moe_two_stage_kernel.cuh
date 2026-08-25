@@ -40,18 +40,21 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
     static constexpr unsigned kInterDim = Config::kInterDim;
     static constexpr unsigned kComputeHiddenSize = Config::kComputeHiddenSize;
     static constexpr unsigned kK256Tiles = kInterDim / kGroupDim;
+    static constexpr unsigned kStage1TileCount =
+        kInterDim / Config::kStage1GroupN;
     static constexpr unsigned kCommComputeEntryGridSyncIndex = 2;
     static constexpr unsigned kComputeCompleteGridSyncIndex = 3;
     static constexpr unsigned kOutputHandoffGridSyncIndex = 4;
 
     static_assert(Config::kSolution.stages == FusedMoEStages::kTwoStage);
     static_assert(Config::kActDType == FusedMoEDataType::kMxFp4);
-    static_assert(Config::kStage1GroupN == 128);
+    static_assert(Config::kStage1GroupN == 128 ||
+                  Config::kStage1GroupN == 256);
     static_assert(Config::kGroupN == 256);
-    static_assert(kRoutesPerBlock == Config::kSortedTokenBlock);
+    static_assert(kRoutesPerBlock == Config::kGroupM);
     static_assert(kInterDim % 512 == 0 && kK256Tiles >= 2);
-    static_assert(Stage1Tiles::kAccumFragments == 4);
-    static_assert(Stage2Tiles::kActivationFragments == 4);
+    static_assert(Stage1Tiles::kAccumFragments ==
+                  ActivationQuantizer::kInputFragments);
     static_assert(kComputeHiddenSize >= Config::kHiddenSize);
 
     struct Stage1Context {};
@@ -97,21 +100,28 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
         ActivationQuantizer::StoreAccumulator(shm.compute.quantize, hidden,
                                               wid, wtid);
         __syncthreads();
-
         const unsigned route_in_slice = tid / 32;
         const unsigned col_lane = tid % 32;
 #pragma unroll
-        for (unsigned route_slice = 0; route_slice < 4; ++route_slice) {
+        for (unsigned route_slice = 0;
+             route_slice < Config::kGroupM / 8; ++route_slice) {
             const unsigned route = route_slice * 8 + route_in_slice;
             if (route < work.work_m) {
-                const auto quantized = ActivationQuantizer::Quantize(
-                    shm.compute.quantize, route, col_lane);
-                ActivationQuantizer::template Store<
-                    BufferResource::kSC1Bit>(
-                    workspace.br_, workspace.L2TokenBufferOffset(0),
-                    workspace.L2ScaleBufferOffset(),
-                    pool_base + route, pool_base + route, work.tile, col_lane,
-                    kInterDim, Workspace::kL2ScaleCols, quantized);
+#pragma unroll
+                for (unsigned col_segment = 0;
+                     col_segment < Config::kStage1GroupN / 128;
+                     ++col_segment) {
+                    const unsigned quant_col =
+                        col_segment * 32 + col_lane;
+                    const auto quantized = ActivationQuantizer::Quantize(
+                        shm.compute.quantize, route, quant_col);
+                    ActivationQuantizer::template Store<
+                        BufferResource::kSC1Bit>(
+                        workspace.br_, workspace.L2TokenBufferOffset(0),
+                        workspace.L2ScaleBufferOffset(), pool_base + route,
+                        pool_base + route, work.tile, quant_col, kInterDim,
+                        Workspace::kL2ScaleCols, quantized);
+                }
             }
         }
 
@@ -121,17 +131,22 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
         complete_scoped_vmem();
         __syncthreads();
         if (tid == 0) {
-            workspace.br_
-                .template AtomicOrU32<BufferResource::kAtomicScopeAgent>(
-                    workspace.L2ArrivalMaskOffset(work.pool_block), 0,
-                    1u << work.tile);
+            for (unsigned subblock = 0;
+                 subblock < tal::CeilingDiv(work.work_m, 32u); ++subblock) {
+                workspace.br_
+                    .template AtomicOrU32<BufferResource::kAtomicScopeAgent>(
+                        workspace.L2ArrivalMaskOffset(work.pool_block +
+                                                      subblock),
+                        0, 1u << work.tile);
+            }
         }
         __syncthreads();
     }
 
     TAL_DEVICE void WaitL2Block(Workspace &workspace, unsigned pool_block,
                                 unsigned tid) const {
-        static constexpr unsigned kReadyMask = (1u << (kK256Tiles * 2)) - 1;
+        static constexpr unsigned kReadyMask =
+            (1u << kStage1TileCount) - 1;
         if (tid == 0) {
             unsigned observed;
             do {
@@ -189,11 +204,10 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
 #pragma unroll
         for (unsigned tile_k = 0; tile_k < kK256Tiles; ++tile_k) {
             const unsigned stage = tile_k & 1u;
-            // Stage 1 stores and consumes the rank-local intermediate at
-            // device scope. The producer completes those stores before its
-            // arrival atomic, so these loads need no cache-wide acquire.
+            // Apply coherence only to the payload and scale lines protected by
+            // the arrival mask instead of invalidating the entire cache.
             const auto prefetched = Stage2Input::template LoadTile<
-                BufferResource::kSC1Bit>(
+                BufferResource::kSC0Bit | BufferResource::kSC1Bit>(
                 workspace.br_, value_voffset, value_soffset, scale_voffset,
                 scale_soffset, tile_k, true, wtid);
             Stage2Input::StoreLds(shm.compute.input, prefetched.value, stage,
@@ -226,7 +240,7 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
         unsigned logical_id = sm_id;
         typename Scheduler::Work work;
 
-        // Work IDs are ordered by phase.  Separate loops keep each GEMM's
+        // Work IDs are ordered by phase. Separate loops keep each GEMM's
         // descriptors and unrolled pipeline state out of the other phase's
         // register-pressure region.
         for (;;) {
@@ -258,7 +272,6 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
                 break;
         }
     }
-
     TAL_DEVICE void Run(uint4 *out, const uint4 *w13, const uint4 *w2,
                         const unsigned *scales_w13, const unsigned *scales_w2,
                         unsigned num_tokens, unsigned output_row_stride,
@@ -313,7 +326,6 @@ template <class Config_> struct MegaMoETwoStageCommComputeKernel {
         SourceRouteReducer<Config> reducer(&workspace);
         reducer.Run(out, num_tokens, output_row_stride, sm_id, wid, wtid);
     }
-
     Input input_;
     W13Weights w13_weights_;
     Bias w13_bias_;
@@ -332,5 +344,4 @@ __global__ static void __launch_bounds__(Kernel::kThreads)
     kernel.Run(out, w13, w2, scales_w13, scales_w2, num_tokens,
                output_row_stride, w13_bias, w2_bias, base, rank);
 }
-
 } // namespace causalflow::petit::rocm::moe

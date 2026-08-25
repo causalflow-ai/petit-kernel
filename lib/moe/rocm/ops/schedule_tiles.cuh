@@ -240,14 +240,17 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
     using Weight = Weight_;
     using Input = typename Config::Input;
     static constexpr unsigned kWaveTileN = Weight::kWaveTileN;
-    using MatmulOp = NativeMxFp4Matmul<kWaveTileN>;
+    using MatmulOp = NativeMxFp4Matmul<Weight::kWaveTileM, kWaveTileN>;
     using CShuffle = BlockedVectorRowMajorCShuffle;
 
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kKStages = Config::kGroupDim / 128;
-    static constexpr unsigned kActivationFragments = 2 * kKStages;
-    static constexpr unsigned kScaleFragments = kKStages / 2;
-    static constexpr unsigned kAccumFragments = 2 * Weight::kLoadGlobal;
+    static constexpr unsigned kActivationFragments =
+        MatmulOp::kActivationFragments;
+    static constexpr unsigned kScaleFragments =
+        MatmulOp::kScaleFragments;
+    static constexpr unsigned kAccumFragments =
+        MatmulOp::kAccumFragments;
     static constexpr unsigned kOutputPacksPerToken = Config::kGroupN / 128;
     static constexpr bool kStage2BiasUsesTileK = false;
     static constexpr int kWeightLoadAux = [] {
@@ -283,7 +286,14 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
     __device__ static void ReadInput(Input &input, InputRegs &regs,
                                      const Shm *shm, unsigned wtid) {
         input.FetchToRegs(regs.x, shm->act, wtid);
-        regs.scale[0] = input.FetchScaleToReg(shm->scale, wtid);
+        if constexpr (Weight::kWaveTileM == 64) {
+#pragma unroll
+            for (unsigned m32 = 0; m32 < kScaleFragments; ++m32)
+                regs.scale[m32] =
+                    input.FetchScaleToReg(shm->scale, wtid, m32);
+        } else {
+            regs.scale[0] = input.FetchScaleToReg(shm->scale, wtid);
+        }
         input.AdvanceScaleStep();
     }
 
@@ -315,7 +325,7 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
 
     __device__ static void Matmul(float4 t[kAccumFragments], const Tile &tile,
                                   const InputRegs &input, unsigned) {
-        MatmulOp::Matmul(t, tile.value, input.x, input.scale[0], tile.scale);
+        MatmulOp::Matmul(t, tile.value, input.x, input.scale, tile.scale);
     }
 
 };

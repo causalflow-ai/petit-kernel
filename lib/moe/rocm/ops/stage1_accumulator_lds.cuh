@@ -48,4 +48,25 @@ __device__ void StoreStage1AccumulatorLds2D(
     }
 }
 
+template <unsigned kGroupN, unsigned kNumWarps>
+__device__ void StoreStage1AccumulatorLdsM64(
+    float (&shm)[64 * kGroupN], const float4 *h, unsigned wid,
+    unsigned wtid) {
+    static_assert(kGroupN == 32 * kNumWarps,
+                  "each wave owns one N32 slice");
+    const unsigned row_lane = wtid % 16;
+    const unsigned col_quadrant = wtid / 16;
+#pragma unroll
+    for (unsigned n16 = 0; n16 < 2; ++n16) {
+#pragma unroll
+        for (unsigned m16 = 0; m16 < 4; ++m16) {
+            const unsigned row = m16 * 16 + row_lane;
+            const unsigned col =
+                wid * 32 + n16 * 16 + col_quadrant * 4;
+            *reinterpret_cast<float4 *>(&shm[row * kGroupN + col]) =
+                h[n16 * 4 + m16];
+        }
+    }
+}
+
 } // namespace causalflow::petit::rocm::moe
