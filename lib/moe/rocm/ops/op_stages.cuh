@@ -174,10 +174,13 @@ template <class TileSchedule> struct OnestageFusedMoEStage1DoubleBufferOp {
                 // The up/gate projection loop is dominated by W13/input global
                 // loads and 128 MFMA instructions.
                 HotLoopScheduler<128, 6, 0, 0, 2>();
-                tiles.PrefetchInput(&shm.x[next], wid, wtid, tokens, m);
+                const bool has_next =
+                    d + (curr + 1) * kGroupDim < Config::kDim;
+                if (has_next)
+                    tiles.PrefetchInput(&shm.x[next], wid, wtid, tokens, m);
                 tiles.Matmul(t_gate, t_up, x[curr], tid, wid, wtid);
 
-                if (d + kGroupDim >= Config::kDim) {
+                if (!has_next) {
                     break;
                 }
 

@@ -51,9 +51,17 @@ struct MegaMoETwoStageCommComputeKernel {
     static constexpr unsigned kK256Tiles = kInterDim / kGroupDim;
     static constexpr unsigned kStage1TileCount =
         kInterDim / Config::kStage1GroupN;
+    static constexpr unsigned kStage2GridBlocks =
+        kNumSMs * Scheduler::kLinear2Tiles;
+    static constexpr unsigned kWorkShards = 8;
     static constexpr unsigned kCommComputeEntryGridSyncIndex = 2;
     static constexpr unsigned kComputeCompleteGridSyncIndex = 3;
     static constexpr unsigned kOutputHandoffGridSyncIndex = 4;
+    static constexpr bool kOverlapStage1WorkId = [] {
+        if constexpr (requires { Config::kOverlapStage1WorkId; })
+            return Config::kOverlapStage1WorkId;
+        return false;
+    }();
 
     static_assert(Config::kSolution.stages == FusedMoEStages::kTwoStage);
     static_assert(Config::kActDType == FusedMoEDataType::kMxFp4);
@@ -62,6 +70,7 @@ struct MegaMoETwoStageCommComputeKernel {
     static_assert(Config::kGroupN == 256);
     static_assert(kRoutesPerBlock == Config::kGroupM);
     static_assert(kInterDim % 512 == 0 && kK256Tiles >= 2);
+    static_assert(kNumSMs % kWorkShards == 0);
     static_assert(Stage1Tiles::kAccumFragments ==
                   ActivationQuantizer::kInputFragments);
     static_assert(kComputeHiddenSize >= Config::kHiddenSize);
@@ -73,6 +82,10 @@ struct MegaMoETwoStageCommComputeKernel {
         typename Stage2Epilogue::BiasPrefetch bias;
     };
 
+    struct EmptyWorkId {};
+    using SeparateWorkId =
+        std::conditional_t<kOverlapStage1WorkId, EmptyWorkId, unsigned>;
+
     struct ShmBuf {
         union {
             union {
@@ -82,8 +95,29 @@ struct MegaMoETwoStageCommComputeKernel {
                 typename Stage2Input::InputShm input;
             } compute;
             typename TokenDispatch::Shm dispatch;
+            unsigned overlapped_work_id;
         };
+        unsigned work_id;
     };
+
+    TAL_DEVICE unsigned NextDynamicWork(Workspace &workspace, ShmBuf &shm,
+                                        unsigned sm_id, unsigned tid,
+                                        unsigned logical_id) const {
+        if constexpr (Config::kNumRanks == 1) {
+            return logical_id + kNumSMs;
+        } else {
+            const unsigned shard = sm_id & (kWorkShards - 1);
+            if (tid == 0) {
+                const unsigned local_work = static_cast<unsigned>(
+                    workspace.br_.template AtomicAddI32<
+                        BufferResource::kAtomicScopeAgent>(
+                        workspace.DirectPushWorkHeadOffset(shard), 0, 1));
+                shm.work_id = shard + local_work * kWorkShards;
+            }
+            __syncthreads();
+            return shm.work_id;
+        }
+    }
 
     TAL_DEVICE void RunStage1(Workspace &workspace, ShmBuf &shm,
                               TokenDispatch &dispatch,
@@ -232,8 +266,9 @@ struct MegaMoETwoStageCommComputeKernel {
             const auto input = Stage2Input::ReadLds(
                 shm.compute.input, stage, prefetched.scale, wtid);
             tiles.Matmul(accum, input, stage, wtid);
-            if (tile_k + 1 < kK256Tiles)
-                __syncthreads();
+            // The next iteration writes the opposite LDS stage. Its pre-read
+            // barrier also proves that all waves have finished consuming this
+            // stage before it is reused two iterations later.
         }
 
         __syncthreads();
@@ -291,6 +326,9 @@ struct MegaMoETwoStageCommComputeKernel {
         // descriptors and unrolled pipeline state out of the other phase's
         // register-pressure region.
         for (;;) {
+            if constexpr (Config::kNumRanks > 1)
+                logical_id =
+                    NextDynamicWork(workspace, shm, sm_id, tid, logical_id);
             if (!scheduler.GetWork(wtid, logical_id, &work))
                 return;
             work.phase =
@@ -300,24 +338,119 @@ struct MegaMoETwoStageCommComputeKernel {
                 break;
             work.expert_idx = __builtin_amdgcn_readfirstlane(work.expert_idx);
             work.pool_block = __builtin_amdgcn_readfirstlane(work.pool_block);
+            work.pool_row = __builtin_amdgcn_readfirstlane(work.pool_row);
             work.work_m = __builtin_amdgcn_readfirstlane(work.work_m);
             work.tile = __builtin_amdgcn_readfirstlane(work.tile);
             RunStage1(workspace, shm, dispatch, dispatch_epoch, w13,
                       scales_w13, w13_bias, work, tid, wid, wtid);
-            logical_id += kNumSMs;
+            if constexpr (Config::kNumRanks == 1)
+                logical_id =
+                    NextDynamicWork(workspace, shm, sm_id, tid, logical_id);
         }
 
         for (;;) {
             work.expert_idx = __builtin_amdgcn_readfirstlane(work.expert_idx);
             work.pool_block = __builtin_amdgcn_readfirstlane(work.pool_block);
+            work.pool_row = __builtin_amdgcn_readfirstlane(work.pool_row);
             work.work_m = __builtin_amdgcn_readfirstlane(work.work_m);
             work.tile = __builtin_amdgcn_readfirstlane(work.tile);
             RunStage2(workspace, shm, w2, scales_w2, w2_bias,
                       dispatch_epoch, work, tid, wid, wtid);
-            logical_id += kNumSMs;
+            logical_id =
+                NextDynamicWork(workspace, shm, sm_id, tid, logical_id);
             if (!scheduler.GetWork(wtid, logical_id, &work))
                 break;
         }
+    }
+    TAL_DEVICE void ComputeStage1Only(
+        Workspace &workspace, Scheduler &scheduler, ShmBuf &shm,
+        TokenDispatch &dispatch, unsigned dispatch_epoch, const uint4 *w13,
+        const unsigned *scales_w13, const void *w13_bias, unsigned sm_id,
+        unsigned tid, unsigned wid, unsigned wtid) {
+        typename Scheduler::Work work;
+
+        for (;;) {
+            const unsigned logical_id =
+                NextDynamicWork(workspace, shm, sm_id, tid, 0);
+            if (!scheduler.GetStage1Work(wtid, logical_id, &work))
+                break;
+            work.phase =
+                static_cast<MegaMoEBlockPhase>(__builtin_amdgcn_readfirstlane(
+                    static_cast<unsigned>(work.phase)));
+            if (work.phase != MegaMoEBlockPhase::kLinear1)
+                break;
+            work.expert_idx = __builtin_amdgcn_readfirstlane(work.expert_idx);
+            work.pool_block = __builtin_amdgcn_readfirstlane(work.pool_block);
+            work.pool_row = __builtin_amdgcn_readfirstlane(work.pool_row);
+            work.work_m = __builtin_amdgcn_readfirstlane(work.work_m);
+            work.tile = __builtin_amdgcn_readfirstlane(work.tile);
+            RunStage1(workspace, shm, dispatch, dispatch_epoch, w13,
+                      scales_w13, w13_bias, work, tid, wid, wtid);
+        }
+    }
+
+    TAL_DEVICE void ComputeStage2Only(
+        Workspace &workspace, Scheduler &scheduler, ShmBuf &shm,
+        const uint4 *w2, const unsigned *scales_w2, const void *w2_bias,
+        unsigned sm_id, unsigned tid, unsigned wid, unsigned wtid) {
+        typename Scheduler::Work work;
+
+        unsigned stage2_id = sm_id;
+        for (;;) {
+            if (!scheduler.GetStage2Work(wtid, stage2_id, &work))
+                break;
+            work.expert_idx = __builtin_amdgcn_readfirstlane(work.expert_idx);
+            work.pool_block = __builtin_amdgcn_readfirstlane(work.pool_block);
+            work.pool_row = __builtin_amdgcn_readfirstlane(work.pool_row);
+            work.work_m = __builtin_amdgcn_readfirstlane(work.work_m);
+            work.tile = __builtin_amdgcn_readfirstlane(work.tile);
+            RunStage2(workspace, shm, w2, scales_w2, w2_bias, work, tid, wid,
+                      wtid);
+            stage2_id += kStage2GridBlocks;
+        }
+    }
+
+    TAL_DEVICE void RunStage1Kernel(
+        const uint4 *w13, const unsigned *scales_w13, unsigned num_tokens,
+        const void *w13_bias, void *base, unsigned rank,
+        const uint4 *input_tokens, const unsigned *input_topk_ids,
+        const float *input_topk_weights) {
+        static_assert(Config::kNumRanks > 1);
+        __shared__ ShmBuf shm;
+        const unsigned sm_id = blockIdx.x;
+        const unsigned tid = threadIdx.x;
+        const unsigned wid = __builtin_amdgcn_readfirstlane(tid / kWarpSize);
+        const unsigned wtid = tid % kWarpSize;
+        Workspace workspace(base, rank);
+
+        TokenDispatch dispatch(num_tokens, &workspace, &shm.dispatch,
+                               input_tokens, input_topk_ids,
+                               input_topk_weights);
+        const unsigned dispatch_epoch = dispatch.Run(sm_id, tid, wid, wtid);
+        dispatch.WaitForLocalPlan(dispatch_epoch, tid);
+        Scheduler scheduler(&workspace);
+        scheduler.FetchRecvSumPerExpert(wtid);
+        ComputeStage1Only(workspace, scheduler, shm, dispatch, dispatch_epoch,
+                          w13, scales_w13, w13_bias, sm_id, tid, wid, wtid);
+    }
+
+    TAL_DEVICE void RunStage2Kernel(uint4 *out, const uint4 *w2,
+                                    const unsigned *scales_w2,
+                                    unsigned num_tokens, const void *w2_bias,
+                                    void *base, unsigned rank) {
+        static_assert(Config::kNumRanks > 1);
+        (void)out;
+        (void)num_tokens;
+        __shared__ ShmBuf shm;
+        const unsigned sm_id = blockIdx.x;
+        const unsigned tid = threadIdx.x;
+        const unsigned wid = __builtin_amdgcn_readfirstlane(tid / kWarpSize);
+        const unsigned wtid = tid % kWarpSize;
+        Workspace workspace(base, rank);
+        Scheduler scheduler(&workspace);
+        scheduler.FetchRecvSumPerExpert(wtid);
+        ComputeStage2Only(workspace, scheduler, shm, w2, scales_w2, w2_bias,
+                          sm_id, tid, wid, wtid);
     }
     TAL_DEVICE void Run(uint4 *out, const uint4 *w13, const uint4 *w2,
                         const unsigned *scales_w13, const unsigned *scales_w2,

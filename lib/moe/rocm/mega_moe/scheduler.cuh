@@ -32,6 +32,7 @@ template <class Config_> struct MegaMoEScheduler {
             }
             tokens_per_expert_[i] = value.x;
         }
+
     }
 
     TAL_DEVICE bool GetWork(unsigned wtid, unsigned work_id,
@@ -82,6 +83,7 @@ template <class Config_> struct MegaMoETwoStageScheduler {
         MegaMoEBlockPhase phase;
         unsigned expert_idx;
         unsigned pool_block;
+        unsigned pool_row;
         unsigned work_m;
         unsigned tile;
     };
@@ -105,16 +107,13 @@ template <class Config_> struct MegaMoETwoStageScheduler {
             }
             tokens_per_expert_[i] = value.x;
         }
+
     }
 
     TAL_DEVICE bool GetWork(unsigned wtid, unsigned logical_id,
                             Work *work) const {
         static_assert(kNumExpertsPerLane == 1,
                       "MegaMoE supports at most one local expert per lane");
-        static constexpr unsigned long long kExpertLaneMask =
-            kNumExpertsPerRank == kWarpSize
-                ? ~0ull
-                : (1ull << kNumExpertsPerRank) - 1;
         unsigned reduced_blocks = 0;
         if (wtid < kNumExpertsPerRank) {
             const unsigned lane_blocks =
@@ -156,6 +155,7 @@ template <class Config_> struct MegaMoETwoStageScheduler {
                     phase,
                     expert,
                     target_block,
+                    target_block * kSortedTokenBlock,
                     min(kSortedTokenBlock,
                         tokens - block_in_expert * kSortedTokenBlock),
                     phase_id - target_block * tiles_per_block,
@@ -167,7 +167,65 @@ template <class Config_> struct MegaMoETwoStageScheduler {
         return false;
     }
 
+    // Stage 1 may consume two adjacent M32 pool blocks at once.  The direct
+    // push layout remains padded per expert in M32 units so stage 2 can still
+    // consume each half independently; reconstruct both the coarser stage-1
+    // ticket and its physical row base here.
+    TAL_DEVICE bool GetStage1Work(unsigned wtid, unsigned logical_id,
+                                  Work *work) const {
+        static constexpr unsigned kStage1M = Config::kGroupM;
+        static_assert(kStage1M == 32 || kStage1M == 64);
+        const unsigned target_stage1_block = logical_id / kLinear1Tiles;
+        const unsigned tile = logical_id % kLinear1Tiles;
+        unsigned stage1_block_base = 0;
+        unsigned physical_block_base = 0;
+#pragma unroll 1
+        for (unsigned expert = 0; expert < kNumExpertsPerRank; ++expert) {
+            const unsigned tokens = __shfl(tokens_per_expert_[0], expert);
+            const unsigned stage1_blocks =
+                tal::CeilingDiv(tokens, kStage1M);
+            const unsigned physical_blocks =
+                tal::CeilingDiv(tokens, kSortedTokenBlock);
+            if (stage1_block_base <= target_stage1_block &&
+                target_stage1_block < stage1_block_base + stage1_blocks) {
+                const unsigned block_in_expert =
+                    target_stage1_block - stage1_block_base;
+                const unsigned pool_block =
+                    physical_block_base +
+                    block_in_expert * (kStage1M / kSortedTokenBlock);
+                *work = {
+                    MegaMoEBlockPhase::kLinear1,
+                    expert,
+                    pool_block,
+                    pool_block * kSortedTokenBlock,
+                    min(kStage1M, tokens - block_in_expert * kStage1M),
+                    tile,
+                };
+                return true;
+            }
+            stage1_block_base += stage1_blocks;
+            physical_block_base += physical_blocks;
+        }
+        return false;
+    }
+
+    TAL_DEVICE bool GetStage2Work(unsigned wtid, unsigned stage2_id,
+                                  Work *work) const {
+        unsigned reduced_blocks = 0;
+        if (wtid < kNumExpertsPerRank) {
+            const unsigned lane_blocks =
+                tal::CeilingDiv(tokens_per_expert_[0], kSortedTokenBlock);
+            reduced_blocks = __reduce_add_sync(kExpertLaneMask, lane_blocks);
+        }
+        const unsigned total_blocks = __shfl(reduced_blocks, 0);
+        return GetWork(wtid, total_blocks * kLinear1Tiles + stage2_id, work);
+    }
+
   private:
+    static constexpr unsigned long long kExpertLaneMask =
+        kNumExpertsPerRank == kWarpSize
+            ? ~0ull
+            : (1ull << kNumExpertsPerRank) - 1;
     Workspace *workspace_;
     unsigned tokens_per_expert_[kNumExpertsPerLane];
 };

@@ -30,6 +30,7 @@ struct DirectPushTokenShuffle {
     static constexpr unsigned kSortedTokenBlock = 32;
     static constexpr unsigned kRowVecs =
         Config::kInputTokenBytes / sizeof(uint4);
+    static constexpr unsigned kWorkShards = 8;
     // The caller selects a producer geometry before launch. Capping it by the
     // number of payload tasks preserves small-expert configurations.
     static constexpr unsigned kProducerBlocks = Config::kProducerBlocks;
@@ -311,6 +312,13 @@ struct DirectPushTokenShuffle {
     TAL_DEVICE void BuildDestinationPlan(unsigned tid, unsigned wid,
                                          unsigned wtid, unsigned parity,
                                          unsigned expected) {
+
+        // Clear the eight cache-line-spaced, destination-owned work heads in
+        // the planner CTA before publishing PLAN_READY.
+        if (tid < kWorkShards) {
+            workspace_->br_.template StoreU32<BufferResource::kNone>(
+                workspace_->DirectPushWorkHeadOffset(tid), 0, 0);
+        }
 
         // Wave 0 owns the destination plan while the remaining waves
         // concurrently build the source route order.

@@ -48,6 +48,7 @@ struct GridSyncSlotCount<Layout,
 //
 // Local data: (only visible to the local rank)
 // - Grid sync barrier (aligned to 64-byte cache line size)
+// - Direct-push work heads: eight independently cached scheduler shards
 // - Input TokenTopK Expert ID: (max_tokens_per_rank, kTopK), i32
 // - L2 arrival masks: one u32 bit mask per M32 routed-token block
 // - L2 token buffer: stage-2 MXFP4 activation values for all routed tokens
@@ -107,6 +108,10 @@ template <class Layout> class MegaMoEWorkspace {
     static constexpr unsigned kNumExpertsPerRank = kNumExperts / kNumRanks;
     static constexpr unsigned kMaxTokensPerRank = Layout::kMaxTokensPerRank;
     static constexpr unsigned kTopK = Layout::kTopK;
+    static constexpr unsigned kDirectWorkShards = 8;
+    static constexpr unsigned kDirectWorkShardStride = 64;
+    static constexpr unsigned kDirectWorkHeadBytes =
+        kDirectWorkShards * kDirectWorkShardStride;
     static constexpr unsigned kRankSymBufferBase =
         kNumRanks * kXGpuBarrierRecordBytes;
     static constexpr unsigned kSortedTokenBlock = 32;
@@ -196,7 +201,7 @@ template <class Layout> class MegaMoEWorkspace {
 
   public:
     static constexpr unsigned long kLocalDataBytes64 =
-        kCacheLineBytes +
+        kCacheLineBytes + kDirectWorkHeadBytes +
         static_cast<unsigned long>(kMaxTokensPerRank) * kTopK *
             sizeof(unsigned) +
         kL2ArrivalMaskBytes + kL2TokenBufferBytes + kL2ScaleBufferBytes;
@@ -457,8 +462,18 @@ template <class Layout> class MegaMoEWorkspace {
         return kLocalOffsetBase;
     }
 
+    // Keep the eight destination-local work-head atomics on separate
+    // 64-byte lines.
+    TAL_HOST_DEVICE inline unsigned
+    DirectPushWorkHeadOffset(unsigned shard) const {
+        [[assume(shard < kDirectWorkShards)]];
+        return GridSyncBarrierOffset() + kCacheLineBytes +
+               shard * kDirectWorkShardStride;
+    }
+
     TAL_HOST_DEVICE inline unsigned InputTokenTopKExpertIDOffset() const {
-        return GridSyncBarrierOffset() + kCacheLineBytes;
+        return GridSyncBarrierOffset() + kCacheLineBytes +
+               kDirectWorkHeadBytes;
     }
 
     TAL_HOST_DEVICE inline unsigned
