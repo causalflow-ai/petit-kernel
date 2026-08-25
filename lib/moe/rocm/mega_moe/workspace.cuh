@@ -39,7 +39,7 @@ struct GridSyncSlotCount<Layout,
 //     - Input Tokens: max_tokens_per_rank tokens (in input format)
 //     - Route output: source-owned (token, top-k) BF16 rows
 //     - Route output ready: (2, max_tokens_per_rank), i32 parity-buffered
-//       cumulative stage-2 contribution readiness
+//       epoch-local stage-2 contribution readiness
 //     - Token metadata: worst-case routed tokens, u64
 //     - L1 token buffer: worst-case routed tokens * Layout::kInputTokenBytes
 //     - L1 token weights: worst-case routed tokens * f32

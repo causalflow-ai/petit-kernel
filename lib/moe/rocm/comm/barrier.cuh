@@ -127,7 +127,7 @@ wait_xgpu_epoch(const Workspace &workspace, unsigned signal_offset,
 }
 
 template <unsigned kNumSMs, unsigned kGridSyncIndex = 0,
-          bool kAcquirePayload = true,
+          bool kAcquirePayload = true, bool kSystemScope = false,
           typename sync_scope_t, class Workspace>
 __device__ __forceinline__ void
 grid_sync(const Workspace &workspace, unsigned sm_idx, unsigned thread_idx,
@@ -149,11 +149,22 @@ grid_sync(const Workspace &workspace, unsigned sm_idx, unsigned thread_idx,
         const unsigned is_first_sm = (sm_idx - 1) >> 31;
         const unsigned arrival_delta =
             1 + is_first_sm * (kFinishSumTag - kNumSMs);
-        agent_fence_release();
-        const auto old_value = static_cast<unsigned>(
-            workspace.br_.template AtomicAddI32<
-                BufferResource::kAtomicScopeAgent>(
-                count_offset, 0, static_cast<int>(arrival_delta)));
+        if constexpr (kSystemScope)
+            system_fence_release();
+        else
+            agent_fence_release();
+        unsigned old_value;
+        if constexpr (kSystemScope) {
+            old_value = static_cast<unsigned>(
+                workspace.br_.template AtomicAddI32<
+                    BufferResource::kAtomicScopeSystem>(
+                    count_offset, 0, static_cast<int>(arrival_delta)));
+        } else {
+            old_value = static_cast<unsigned>(
+                workspace.br_.template AtomicAddI32<
+                    BufferResource::kAtomicScopeAgent>(
+                    count_offset, 0, static_cast<int>(arrival_delta)));
+        }
         unsigned new_value;
         while (true) {
             // Poll coherently at both cache scopes.  This cannot observe the
@@ -170,7 +181,10 @@ grid_sync(const Workspace &workspace, unsigned sm_idx, unsigned thread_idx,
             asm volatile("s_sleep 1" ::: "memory");
         }
         if constexpr (kAcquirePayload) {
-            agent_fence_acquire();
+            if constexpr (kSystemScope)
+                system_fence_acquire();
+            else
+                agent_fence_acquire();
         } else {
             // Preserve the compiler handoff for control-only barriers without
             // invalidating payload caches that have no downstream consumer.
@@ -222,12 +236,13 @@ xgpu_barrier(const Workspace &workspace, unsigned sm_idx,
                     BufferResource::kNone>(counter_offset, 0) & 3;
             }
             status = __shfl(status, 0);
-            // The prologue grid arrival gathers every producer CTA. Make
+            // The prologue grid arrival gathers every producer CTA.  Make
             // that agent-scoped dependency transitive before the rank lanes
-            // publish completion to peer GPUs. A cache writeback followed
+            // publish completion to peer GPUs.  A cache writeback followed
             // by a monotonic system atomic is not itself a release sequence;
             // the explicit system-release edge is what orders remote payload
-            // stores from the preceding kernel.
+            // stores from the preceding kernel, matching the combine
+            // handoff.
             system_fence_release();
             const unsigned signal_phase = status & 1;
             const unsigned signal_sign = status >> 1;

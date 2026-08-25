@@ -82,7 +82,12 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
                 const unsigned value =
                     output[row * (Base::kTileCols / 2) + pair_col];
                 const unsigned col = tile_col + pair_col * 2;
-                output_row.template StoreU32<BufferResource::kSC1Bit>(
+            // Match the reference stage-2 P2P scatter cache policy. These
+                // rows are consumed exactly once by the source-rank combine,
+                // so non-temporal stores avoid retaining peer-directed lines
+                // in the producer CU's cache.  The following combine kernel
+                // supplies the system release/acquire publication edge.
+                output_row.template StoreU32<BufferResource::kNTBit>(
                     col * sizeof(__hip_bfloat16), 0, value);
             }
         }
@@ -91,21 +96,19 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
 
 // Reduce the source-owned (token, top-k) route rows in FP32, return BF16,
 // and clear every row for the next invocation.
-template <class Config> struct SourceRouteReducer {
+template <class Config, unsigned kGridBlocks = Config::kNumSMs,
+          unsigned kBlockThreads = Config::kThreads>
+struct SourceRouteReducer {
     using Workspace = MegaMoEWorkspace<Config>;
 
-    static constexpr unsigned kNumSMs = Config::kNumSMs;
-    static constexpr unsigned kThreads = Config::kThreads;
+    static constexpr unsigned kNumSMs = kGridBlocks;
+    static constexpr unsigned kThreads = kBlockThreads;
     static constexpr unsigned kTopK = Config::kTopK;
     static constexpr unsigned kHiddenSize = Config::kHiddenSize;
     static constexpr unsigned kComputeHiddenSize = Config::kComputeHiddenSize;
     static constexpr unsigned kElementsPerVec =
         sizeof(uint4) / sizeof(__hip_bfloat16);
     static constexpr unsigned kVecCols = kHiddenSize / kElementsPerVec;
-    static constexpr unsigned kOutputTiles =
-        kComputeHiddenSize / Config::kGroupN;
-    static constexpr unsigned kContributionsPerToken = kTopK * kOutputTiles;
-
     static_assert(kThreads % kWarpSize == 0);
     static_assert(kHiddenSize % kElementsPerVec == 0);
     static_assert(kComputeHiddenSize >= kHiddenSize);
@@ -115,40 +118,41 @@ template <class Config> struct SourceRouteReducer {
 
     TAL_DEVICE void Run(uint4 *__restrict__ output, unsigned num_tokens,
                         unsigned output_row_stride, unsigned sm_id,
-                        unsigned wid, unsigned wtid,
-                        unsigned epoch = 0) const {
+                        unsigned wid, unsigned wtid) const {
         static constexpr unsigned kWarpsPerBlock = kThreads / kWarpSize;
-        static constexpr unsigned kWavesPerToken =
-            (kVecCols + kWarpSize - 1) / kWarpSize;
         static constexpr unsigned kTotalWaves = kNumSMs * kWarpsPerBlock;
         static constexpr unsigned kPackedElements = kElementsPerVec / 2;
 
-        const unsigned global_wave = sm_id * kWarpsPerBlock + wid;
-        const unsigned total_wave_tasks = num_tokens * kWavesPerToken;
+        if (num_tokens == 0)
+            return;
+        const unsigned global_wave =
+            Config::kNumRanks > 1
+                ? sm_id * kWarpsPerBlock + wid
+                : (num_tokens == 8 ? wid * kNumSMs + sm_id
+                                   : sm_id * kWarpsPerBlock + wid);
+        const unsigned waves_per_token = Config::kNumRanks > 1
+                                             ? (kTotalWaves + num_tokens - 1) /
+                                                   num_tokens
+                                             : (kVecCols + kWarpSize - 1) /
+                                                   kWarpSize;
+        const unsigned vecs_per_wave =
+            Config::kNumRanks > 1
+                ? (kVecCols + waves_per_token - 1) / waves_per_token
+                : kWarpSize;
+        const unsigned total_wave_tasks = num_tokens * waves_per_token;
         const unsigned owner =
             workspace_->RouteOutputBufferOffset(workspace_->Rank());
         for (unsigned wave_task = global_wave;
              wave_task < total_wave_tasks; wave_task += kTotalWaves) {
-            const unsigned token = wave_task / kWavesPerToken;
-            const unsigned wave_in_token = wave_task % kWavesPerToken;
-            if constexpr (Config::kNumRanks > 1) {
-                if (wtid == 0) {
-                    const unsigned expected =
-                        ((epoch + 1) / 2) * kContributionsPerToken;
-                    wait_xgpu_signal_relaxed(
-                        *workspace_,
-                        workspace_->RouteOutputReadyOffset(
-                            workspace_->Rank(), epoch & 1, token),
-                        static_cast<std::int32_t>(expected));
-                }
-                wave_barrier();
-                // Every wave consumes a disjoint slice of the token row and
-                // acquires after its lane-0 readiness observation.
-                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-            }
-            for (unsigned vec_col = wave_in_token * kWarpSize + wtid;
-                 vec_col < kVecCols;
-                 vec_col += kWavesPerToken * kWarpSize) {
+            const unsigned token = wave_task / waves_per_token;
+            const unsigned wave_in_token = wave_task % waves_per_token;
+            for (unsigned vec_in_wave = wtid;
+                 vec_in_wave < vecs_per_wave;
+                 vec_in_wave += kWarpSize) {
+                const unsigned vec_col =
+                    wave_in_token * vecs_per_wave + vec_in_wave;
+                if (vec_col >= kVecCols)
+                    break;
                 const unsigned col_offset = vec_col * sizeof(uint4);
                 const unsigned route_row_offset =
                     owner + token * kTopK * kHiddenSize *
@@ -167,18 +171,15 @@ template <class Config> struct SourceRouteReducer {
                         route_row_offset +
                         topk * kHiddenSize * sizeof(__hip_bfloat16));
                     route_values[topk] = workspace_->br_.template Load<
-                        BufferResource::kNTBit>(col_offset, row_offset);
+                        BufferResource::kSC1Bit | BufferResource::kNTBit>(
+                        col_offset, row_offset);
                 }
                 float2 accum[kPackedElements] = {};
 #pragma unroll
                 for (unsigned topk = 0; topk < kTopK; ++topk) {
-                    const unsigned row_offset =
-                        route_row_offset +
-                        topk * kHiddenSize * sizeof(__hip_bfloat16);
-                    const uint4 value = workspace_->br_.template Load<
-                        BufferResource::kNone>(col_offset, row_offset);
-                    workspace_->br_.template Store<BufferResource::kNone>(
-                        col_offset, row_offset, uint4{});
+                    // Route rows are parity-reused across graph launches.
+                    // Device scope rejects private-cache lines from a prior
+                    // epoch, while NT avoids retaining this one-shot input.
                     const auto *bf16 =
                         reinterpret_cast<const __hip_bfloat162 *>(
                             &route_values[topk]);

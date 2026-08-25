@@ -29,9 +29,9 @@ template <FusedMoESolutionId Solution> struct MegaMoEConfigSelector {
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kNumSMs = 256;
     // Pull dispatch (used by EP1) owns 0/1 and uses 2 for its local handoff.
-    // The fused kernel uses 3 for compute completion and 4 for the xGPU output
-    // handoff. Multi-rank direct push uses per-expert epochs instead of an
-    // entry grid barrier.
+    // The EP1 fused kernel uses 3 for compute completion. Slot 4 is the xGPU
+    // output handoff used by the separate multi-rank combine kernel. Direct
+    // push uses per-expert epochs instead of an entry grid barrier.
     static constexpr unsigned kGridSyncSlots = 5;
     static constexpr unsigned kStage2GroupInterDim = kGroupDim;
     static constexpr unsigned kNumRanks = 1u << Solution.NumRanksLog2();
@@ -181,6 +181,7 @@ int MegaMoESolutionAdapter<kRepr>::Invoke(MegaMoEParams params) {
     using Kernel = MegaMoETwoStageCommComputeKernel<Config>;
     using ExternalInputKernel =
         MegaMoETwoStageCommComputeKernel<Config, true>;
+    using CombineKernel = MegaMoECombineKernel<Config>;
 
     const unsigned external_input_count =
         static_cast<unsigned>(params.input_tokens != nullptr) +
@@ -199,7 +200,7 @@ int MegaMoESolutionAdapter<kRepr>::Invoke(MegaMoEParams params) {
         return kFusedMoEErrorInvalidArgument;
     }
 
-    const auto launch = [&]<class SelectedKernel>() {
+    const auto launch = [&]<class SelectedKernel>() -> int {
         hipLaunchKernelGGL(
             (MegaMoETwoStage<SelectedKernel>), dim3(Config::kNumSMs),
             dim3(Config::kThreads), 0, params.stream,
@@ -210,9 +211,18 @@ int MegaMoESolutionAdapter<kRepr>::Invoke(MegaMoEParams params) {
             params.w13_bias, params.w2_bias, params.workspace, params.rank,
             reinterpret_cast<const uint4 *>(params.input_tokens),
             params.input_topk_ids, params.input_topk_weights);
-        return hipGetLastError() == hipSuccess
-                   ? 0
-                   : kFusedMoEErrorInvalidArgument;
+        if (hipGetLastError() != hipSuccess)
+            return kFusedMoEErrorInvalidArgument;
+        if constexpr (Config::kNumRanks > 1) {
+            hipLaunchKernelGGL(
+                (MegaMoECombine<CombineKernel>),
+                dim3(CombineKernel::kNumSMs), dim3(CombineKernel::kThreads), 0,
+                params.stream, reinterpret_cast<uint4 *>(params.out),
+                params.num_tokens, params.output_row_stride, params.workspace,
+                params.rank);
+        }
+        return hipGetLastError() == hipSuccess ? 0
+                                               : kFusedMoEErrorInvalidArgument;
     };
     if constexpr (Config::kNumRanks > 1) {
         if (external_input_count == 3)

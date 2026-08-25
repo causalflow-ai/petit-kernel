@@ -300,8 +300,14 @@ def run_worker(
     cuda_graph: bool = False,
     registered_shape: bool = False,
     zero_token_rank: bool = False,
+    uneven_tokens: bool = False,
+    varying_tokens: bool = False,
+    skewed_routing: bool = False,
     two_stage: bool = False,
     num_experts: int | None = None,
+    tokens: int = 17,
+    repeat: int = 1,
+    graph_layers: int = 1,
 ) -> None:
     if not has_gfx950(world_size):
         pytest.skip(f"requires {world_size} gfx950 GPUs")
@@ -321,10 +327,26 @@ def run_worker(
         command.append("--cuda-graph")
     if zero_token_rank:
         command.append("--zero-token-rank")
+    if uneven_tokens:
+        command.append("--uneven-tokens")
+    if varying_tokens:
+        command.append("--varying-tokens")
+    if skewed_routing:
+        command.append("--skewed-routing")
     if two_stage:
         command.append("--two-stage")
     if num_experts is not None:
         command.extend(("--num-experts", str(num_experts)))
+    command.extend(
+        (
+            "--tokens",
+            str(tokens),
+            "--repeat",
+            str(repeat),
+            "--graph-layers",
+            str(graph_layers),
+        )
+    )
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{REPO_ROOT}:{env.get('PYTHONPATH', '')}"
     process = subprocess.Popen(
@@ -376,6 +398,58 @@ def test_two_stage_mega_moe_gpt_oss_120b_shape_supports_cuda_graph() -> None:
         registered_shape=True,
         two_stage=True,
         num_experts=128,
+    )
+
+
+def test_two_stage_mega_moe_ep8_repeated_graph_outputs_are_complete() -> None:
+    run_worker(
+        8,
+        "mxfp4",
+        cuda_graph=True,
+        registered_shape=True,
+        two_stage=True,
+        tokens=8,
+        repeat=128,
+        graph_layers=24,
+    )
+
+
+def test_two_stage_mega_moe_ep8_uneven_graph_outputs_are_complete() -> None:
+    run_worker(
+        8,
+        "mxfp4",
+        cuda_graph=True,
+        registered_shape=True,
+        two_stage=True,
+        uneven_tokens=True,
+        tokens=8,
+        repeat=128,
+        graph_layers=24,
+    )
+
+
+def test_two_stage_mega_moe_ep8_varying_token_counts_are_complete() -> None:
+    run_worker(
+        8,
+        "mxfp4",
+        registered_shape=True,
+        two_stage=True,
+        varying_tokens=True,
+        tokens=8,
+    )
+
+
+def test_two_stage_mega_moe_ep8_skewed_graph_outputs_are_complete() -> None:
+    run_worker(
+        8,
+        "mxfp4",
+        cuda_graph=True,
+        registered_shape=True,
+        two_stage=True,
+        skewed_routing=True,
+        tokens=8,
+        repeat=128,
+        graph_layers=24,
     )
 
 

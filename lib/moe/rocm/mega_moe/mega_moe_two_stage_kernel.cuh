@@ -97,6 +97,10 @@ struct MegaMoETwoStageCommComputeKernel {
             typename TokenDispatch::Shm dispatch;
             unsigned overlapped_work_id;
         };
+        // NextDynamicWork's publishing thread may finish WriteBack before the
+        // other waves have drained the stage-2 epilogue LDS. Keep its
+        // broadcast slot disjoint from compute storage so publishing the next
+        // work ID cannot corrupt those outstanding reads.
         unsigned work_id;
     };
 
@@ -217,7 +221,7 @@ struct MegaMoETwoStageCommComputeKernel {
 
     TAL_DEVICE void RunStage2(Workspace &workspace, ShmBuf &shm,
                               const uint4 *w2, const unsigned *scales_w2,
-                              const void *w2_bias, unsigned dispatch_epoch,
+                              const void *w2_bias,
                               const typename Scheduler::Work &work,
                               unsigned tid, unsigned wid, unsigned wtid) {
         const unsigned pool_base = work.pool_block * kRoutesPerBlock;
@@ -278,37 +282,6 @@ struct MegaMoETwoStageCommComputeKernel {
         __syncthreads();
         Stage2Epilogue::WriteBack(output_context, shm.compute.stage2, tile_col,
                                   wid, wtid);
-        amdgcn_s_waitcnt<0, -1, 0>();
-        if constexpr (Config::kNumRanks > 1)
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-        __syncthreads();
-
-        if constexpr (Config::kNumRanks > 1) {
-            // One lane publishes each route after every lane has drained this
-            // output tile. The source reducer waits on the token's complete
-            // top-k x output-tile dependency count.
-            if (wtid == 0) {
-#pragma unroll
-                for (unsigned row_group = 0;
-                     row_group < kRoutesPerBlock / kNumWarps; ++row_group) {
-                    const unsigned row = wid + row_group * kNumWarps;
-                    if (row < work.work_m) {
-                        const TokenMetadata metadata = __builtin_bit_cast(
-                            TokenMetadata,
-                            workspace.br_.template LoadU64<
-                                BufferResource::kNone>(
-                                0, workspace.TokenMetadataOffset(
-                                       workspace.Rank(), pool_base + row)));
-                        workspace.br_.template AtomicAddI32<
-                            BufferResource::kAtomicScopeSystem>(
-                            workspace.RouteOutputReadyOffset(
-                                metadata.src_rank, dispatch_epoch & 1,
-                                metadata.token_topk_idx / Config::kTopK),
-                            0, 1);
-                    }
-                }
-            }
-        }
     }
 
     TAL_DEVICE void Compute(Workspace &workspace, Scheduler &scheduler,
@@ -354,8 +327,8 @@ struct MegaMoETwoStageCommComputeKernel {
             work.pool_row = __builtin_amdgcn_readfirstlane(work.pool_row);
             work.work_m = __builtin_amdgcn_readfirstlane(work.work_m);
             work.tile = __builtin_amdgcn_readfirstlane(work.tile);
-            RunStage2(workspace, shm, w2, scales_w2, w2_bias,
-                      dispatch_epoch, work, tid, wid, wtid);
+            RunStage2(workspace, shm, w2, scales_w2, w2_bias, work, tid, wid,
+                      wtid);
             logical_id =
                 NextDynamicWork(workspace, shm, sm_id, tid, logical_id);
             if (!scheduler.GetWork(wtid, logical_id, &work))
@@ -518,8 +491,8 @@ struct MegaMoETwoStageCommComputeKernel {
                 [] { __syncthreads(); });
             reducer.Run(out, num_tokens, output_row_stride, sm_id, wid, wtid);
         } else {
-            reducer.Run(out, num_tokens, output_row_stride, sm_id, wid, wtid,
-                        dispatch_epoch);
+            // Multi-rank stage 2 retires independently. The lightweight
+            // combine kernel performs the system publication.
         }
     }
     Input input_;
@@ -527,6 +500,73 @@ struct MegaMoETwoStageCommComputeKernel {
     Bias w13_bias_;
     W2Weights w2_weights_;
     Stage2Bias w2_bias_;
+};
+
+// Direct push completes stage 2 in the GEMM kernel, then uses a
+// lightweight 128-CTA, eight-wave kernel for the collective publication and
+// source-owned route reduction. Keeping this rendezvous out of the
+// high-register GEMM kernel lets all compute CTAs retire independently.
+template <class Config> struct MegaMoECombineKernel {
+    using Workspace = MegaMoEWorkspace<Config>;
+    static constexpr unsigned kNumSMs = 128;
+    static constexpr unsigned kNumWarps = 8;
+    static constexpr unsigned kThreads = kNumWarps * kWarpSize;
+    static constexpr unsigned kOutputHandoffGridSyncIndex = 4;
+
+    TAL_DEVICE void Run(uint4 *out, unsigned num_tokens,
+                        unsigned output_row_stride, void *base,
+                        unsigned rank) const {
+        const unsigned sm_id = blockIdx.x;
+        const unsigned tid = threadIdx.x;
+        const unsigned wid = tid / kWarpSize;
+        const unsigned wtid = tid % kWarpSize;
+        Workspace workspace(base, rank);
+
+        const unsigned dispatch_epoch = workspace.br_.template LoadU32<
+            BufferResource::kSC0Bit | BufferResource::kSC1Bit>(
+            workspace.DirectPushEpochGateOffset(workspace.Rank()), 0);
+        // The counter itself is rank-local, but this barrier joins P2P output
+        // stores from every combine CTA. Use system scope so that join is
+        // transitive before SM0 publishes a release epoch to every peer. The
+        // reducer applies device scope directly to its peer-written rows.
+        // Release stores are intentional here; a release fence followed by
+        // the legacy monotonic signal atomic did not publish prior P2P stores
+        // reliably.
+        grid_sync<kNumSMs, kOutputHandoffGridSyncIndex,
+                  /* kAcquirePayload */ false,
+                  /* kSystemScope */ true>(
+            workspace, sm_id, tid, [] { __syncthreads(); });
+        if (tid < kWarpSize) {
+            if (sm_id == 0) {
+                // Only the publishing wave needs to acquire the system-scope
+                // grid join. This makes every CTA's release transitive before
+                // the rank lanes publish epochs, without invalidating the
+                // cache independently in all 128 combine CTAs.
+                system_fence_acquire();
+                if (tid < Config::kNumRanks) {
+                    store_xgpu_epoch_release(
+                        workspace,
+                        Workspace::XGpuEpochSignalOffset(
+                            tid, workspace.Rank()),
+                        dispatch_epoch);
+                }
+            }
+            wave_barrier();
+            if (sm_id == 0)
+                amdgcn_s_waitcnt<0, -1, 0>();
+            if (tid < Config::kNumRanks) {
+                wait_xgpu_epoch_relaxed(
+                    workspace,
+                    Workspace::XGpuEpochSignalOffset(workspace.Rank(), tid),
+                    dispatch_epoch);
+            }
+            wave_barrier();
+        }
+        __syncthreads();
+
+        SourceRouteReducer<Config, kNumSMs, kThreads> reducer(&workspace);
+        reducer.Run(out, num_tokens, output_row_stride, sm_id, wid, wtid);
+    }
 };
 
 template <class Kernel>
@@ -542,5 +582,13 @@ __global__ static void __launch_bounds__(Kernel::kThreads)
     kernel.Run(out, w13, w2, scales_w13, scales_w2, num_tokens,
                output_row_stride, w13_bias, w2_bias, base, rank, input_tokens,
                input_topk_ids, input_topk_weights);
+}
+
+template <class Kernel>
+__global__ static void __launch_bounds__(Kernel::kThreads)
+    MegaMoECombine(uint4 *out, unsigned num_tokens, unsigned output_row_stride,
+                   void *base, unsigned rank) {
+    Kernel kernel;
+    kernel.Run(out, num_tokens, output_row_stride, base, rank);
 }
 } // namespace causalflow::petit::rocm::moe
