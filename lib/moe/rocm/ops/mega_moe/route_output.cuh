@@ -130,6 +130,22 @@ template <class Config> struct SourceRouteReducer {
                 const unsigned route_row_offset =
                     owner + token * kTopK * kHiddenSize *
                                 sizeof(__hip_bfloat16);
+                uint4 route_values[kTopK];
+#pragma unroll
+                for (unsigned topk = 0; topk < kTopK; ++topk) {
+                    // The route row is wave-uniform, but deriving token from
+                    // the wave task leaves the value in a VGPR.  Passing that
+                    // VGPR as the scalar buffer offset makes LLVM emit a
+                    // waterfall loop for every route load. Read the uniform
+                    // value into an SGPR and issue all four loads before
+                    // consuming them so VMEM latency can overlap across
+                    // routes.
+                    const unsigned row_offset = __builtin_amdgcn_readfirstlane(
+                        route_row_offset +
+                        topk * kHiddenSize * sizeof(__hip_bfloat16));
+                    route_values[topk] = workspace_->br_.template Load<
+                        BufferResource::kNTBit>(col_offset, row_offset);
+                }
                 float2 accum[kPackedElements] = {};
 #pragma unroll
                 for (unsigned topk = 0; topk < kTopK; ++topk) {
@@ -141,7 +157,8 @@ template <class Config> struct SourceRouteReducer {
                     workspace_->br_.template Store<BufferResource::kNone>(
                         col_offset, row_offset, uint4{});
                     const auto *bf16 =
-                        reinterpret_cast<const __hip_bfloat162 *>(&value);
+                        reinterpret_cast<const __hip_bfloat162 *>(
+                            &route_values[topk]);
 #pragma unroll
                     for (unsigned pair = 0; pair < kPackedElements; ++pair) {
                         accum[pair] = amdgcn_pk_add_f32(
