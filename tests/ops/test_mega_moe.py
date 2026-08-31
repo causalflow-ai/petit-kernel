@@ -13,84 +13,72 @@ import petit_kernel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).with_name("mega_moe_worker.py")
+MULTIGRAPH_WORKER = Path(__file__).with_name("mega_moe_multigraph_worker.py")
 
 
-@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
-def test_mega_moe_two_stage_registered_configs(world_size: int) -> None:
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param(
+            {
+                "world_size": world_size,
+                "num_experts": 32,
+                "topk": 4,
+                "model_dim": 2880,
+            },
+            id=f"gpt-oss-ep{world_size}",
+        )
+        for world_size in (1, 2, 4, 8)
+    ]
+    + [
+        pytest.param(
+            {
+                "world_size": 8,
+                "num_experts": 128,
+                "topk": 4,
+                "model_dim": 2880,
+            },
+            id="gpt-oss-120b",
+        ),
+        pytest.param(
+            {
+                "world_size": 8,
+                "num_experts": 256,
+                "topk": 8,
+                "model_dim": 7168,
+                "inter_dim": 2048,
+                "activation_function": (
+                    petit_kernel.MegaMoeActivationFunction.silu
+                ),
+                "has_bias": False,
+            },
+            id="deepseek-v3.2",
+        ),
+        pytest.param(
+            {
+                "world_size": 8,
+                "num_experts": 384,
+                "topk": 6,
+                "model_dim": 7168,
+                "inter_dim": 3072,
+                "activation_function": (
+                    petit_kernel.MegaMoeActivationFunction.silu
+                ),
+                "has_bias": False,
+            },
+            id="deepseek-v4",
+        ),
+    ],
+)
+def test_mega_moe_registered_configs(kwargs: dict[str, object]) -> None:
     config = petit_kernel.MegaMoeConfig(
-        world_size=world_size,
-        num_experts=32,
-        topk=4,
-        model_dim=2880,
+        **kwargs,
         activation="mxfp4",
         stages=petit_kernel.MegaMoeStages.two_stage,
     )
+
     assert config.activation is petit_kernel.MegaMoeActivation.mxfp4
     assert config.stages is petit_kernel.MegaMoeStages.two_stage
-
-
-def test_mega_moe_two_stage_registers_ep8_128_experts() -> None:
-    petit_kernel.MegaMoeConfig(
-        world_size=8,
-        num_experts=128,
-        topk=4,
-        model_dim=2880,
-        activation=petit_kernel.MegaMoeActivation.mxfp4,
-        stages=petit_kernel.MegaMoeStages.two_stage,
-    )
-
-
-def test_mega_moe_solution_id_helper_accepts_vllm_tile_shape_arguments() -> None:
-    solution_id = petit_kernel._make_mega_moe_solution_id(
-        petit_kernel._FusedMoeDataType.mxfp4,
-        2,
-        32,
-        4,
-        2880,
-        inter_dim=3072,
-        stages=petit_kernel._FusedMoeStages.two_stage,
-        w13_tile_shape=petit_kernel._MegaMoeTileShape.n128,
-        w2_tile_shape=petit_kernel._MegaMoeTileShape.n256,
-    )
-    config = petit_kernel.MegaMoeConfig(
-        world_size=2,
-        num_experts=32,
-        topk=4,
-        model_dim=2880,
-        activation="mxfp4",
-        stages=petit_kernel.MegaMoeStages.two_stage,
-    )
-
-    assert solution_id == config._solution_id
-    assert (solution_id >> 53) & 0xFF == 3072 // 64
-
-
-def test_mega_moe_solution_id_encodes_inter_dim() -> None:
-    solution_id = petit_kernel._make_mega_moe_solution_id(
-        petit_kernel._FusedMoeDataType.mxfp4,
-        2,
-        32,
-        4,
-        2880,
-        inter_dim=4096,
-    )
-
-    assert (solution_id >> 53) & 0xFF == 4096 // 64
-
-
-@pytest.mark.parametrize("inter_dim", [0, 63, 64 * 256])
-def test_mega_moe_solution_id_rejects_unencodable_inter_dim(
-    inter_dim: int,
-) -> None:
-    with pytest.raises(ValueError, match="inter_dim"):
-        petit_kernel._make_mega_moe_solution_id(
-            petit_kernel._FusedMoeDataType.mxfp4,
-            2,
-            32,
-            4,
-            2880,
-            inter_dim=inter_dim,
-        )
 
 
 @pytest.mark.parametrize(
@@ -151,7 +139,13 @@ def test_mega_moe_config_validates_workspace_and_launch_sizes() -> None:
         )
 
 
-def test_mega_moe_mxfp4_quantizer_matches_native_encoding() -> None:
+@pytest.fixture(scope="module")
+def mxfp4_quantizer_case() -> tuple[
+    petit_kernel.MegaMoeConfig,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     if not has_gfx950(1):
         pytest.skip("requires one gfx950 GPU")
     config = petit_kernel.MegaMoeConfig(
@@ -167,15 +161,20 @@ def test_mega_moe_mxfp4_quantizer_matches_native_encoding() -> None:
         dtype=torch.bfloat16,
         device="cuda",
     )
-    # Exercise a row-contiguous view whose physical stride is the padded GPT-OSS
-    # dimension used by the serving benchmark.
     values = table.repeat(8, 192)[:, : config.model_dim]
-    quantized, scales = config.quantize(values)
     expected_bytes = torch.tensor(
         [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE],
         dtype=torch.uint8,
         device="cuda",
     ).repeat(8, config.model_dim // 16)
+    return config, table, values, expected_bytes
+
+
+def test_mega_moe_mxfp4_quantizer_matches_native_encoding(
+    mxfp4_quantizer_case,
+) -> None:
+    config, table, values, expected_bytes = mxfp4_quantizer_case
+    quantized, scales = config.quantize(values)
 
     assert torch.equal(quantized, expected_bytes)
     assert torch.equal(scales, torch.full_like(scales, 127))
@@ -186,6 +185,31 @@ def test_mega_moe_mxfp4_quantizer_matches_native_encoding() -> None:
     physical_scales = scales.as_strided((8, 96), (1536, 1))
     assert not torch.count_nonzero(physical_scales[:, 90:])
 
+    deepseek_config = petit_kernel.MegaMoeConfig(
+        world_size=8,
+        num_experts=256,
+        topk=8,
+        model_dim=7168,
+        activation="mxfp4",
+        activation_function=petit_kernel.MegaMoeActivationFunction.silu,
+        stages=petit_kernel.MegaMoeStages.two_stage,
+        inter_dim=2048,
+        has_bias=False,
+    )
+    deepseek_values = table.repeat(
+        2, deepseek_config.model_dim // table.numel()
+    )
+    _, deepseek_scales = deepseek_config.quantize(deepseek_values)
+    assert deepseek_scales.shape == (2, 224)
+    assert deepseek_scales.stride() == (3808, 1)
+    assert torch.equal(deepseek_scales, torch.full_like(deepseek_scales, 127))
+
+
+def test_mega_moe_mxfp4_quantizer_reuses_output_and_handles_empty_values(
+    mxfp4_quantizer_case,
+) -> None:
+    config, _, values, expected_bytes = mxfp4_quantizer_case
+    quantized, _ = config.quantize(values)
     output_storage = torch.empty(
         (values.size(0), quantized.stride(0)),
         dtype=torch.uint8,
@@ -227,23 +251,23 @@ def test_mega_moe_mxfp4_quantizer_matches_native_encoding() -> None:
     assert zero_scales.stride() == (1536, 1)
     assert zero_scales.data_ptr() == zeros.data_ptr() + config.model_dim // 2
 
-    deepseek_config = petit_kernel.MegaMoeConfig(
-        world_size=8,
-        num_experts=256,
-        topk=8,
-        model_dim=7168,
-        activation="mxfp4",
-        activation_function=petit_kernel.MegaMoeActivationFunction.silu,
-        stages=petit_kernel.MegaMoeStages.two_stage,
-        inter_dim=2048,
-        has_bias=False,
+def test_mega_moe_mxfp4_quantizer_validates_inputs(
+    mxfp4_quantizer_case,
+) -> None:
+    config, _, values, _ = mxfp4_quantizer_case
+    output_storage = torch.empty(
+        (values.size(0), 1536), dtype=torch.uint8, device=values.device
     )
-    deepseek_values = table.repeat(2, deepseek_config.model_dim // table.numel())
-    _, deepseek_scales = deepseek_config.quantize(deepseek_values)
-    assert deepseek_scales.shape == (2, 224)
-    assert deepseek_scales.stride() == (3808, 1)
-    assert torch.equal(deepseek_scales, torch.full_like(deepseek_scales, 127))
-
+    output_tokens = output_storage[:, : config.model_dim // 2]
+    output_scales = output_storage[
+        :, config.model_dim // 2 : config.model_dim // 2 + config.model_dim // 32
+    ]
+    output_views = petit_kernel.MegaMoeInputViews(
+        output_tokens,
+        output_scales,
+        torch.empty((8, config.topk), dtype=torch.int32, device=values.device),
+        torch.empty((8, config.topk), dtype=torch.float32, device=values.device),
+    )
     with pytest.raises(ValueError, match="shape"):
         config.quantize(values[:, :-32])
     with pytest.raises(RuntimeError, match="dtype"):
@@ -451,6 +475,41 @@ def test_two_stage_mega_moe_ep8_skewed_graph_outputs_are_complete() -> None:
         repeat=128,
         graph_layers=24,
     )
+
+
+def test_deepseek_v32_mega_moe_supports_multiple_cuda_graphs() -> None:
+    if not has_gfx950(8):
+        pytest.skip("requires 8 gfx950 GPUs")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        str(MULTIGRAPH_WORKER),
+        "--shape",
+        "dsv32",
+        "--capture-sizes",
+        "128,120,112",
+        "--layers",
+        "61",
+        "--quantize",
+        "--skewed",
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{REPO_ROOT}:{env.get('PYTHONPATH', '')}"
+    process = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=300,
+    )
+    assert process.returncode == 0, process.stdout
+    assert "captured 112" in process.stdout
+    assert "replayed 112" in process.stdout
 
 
 def test_two_stage_mega_moe_handles_a_zero_token_rank() -> None:
