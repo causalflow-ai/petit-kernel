@@ -44,7 +44,9 @@ struct MegaMoETwoStageCommComputeKernel {
     static constexpr unsigned kThreads = Config::kThreads;
     static constexpr unsigned kNumSMs = Config::kNumSMs;
     static constexpr unsigned kTokenBatch = Config::kTokenBatch;
-    static constexpr unsigned kRoutesPerBlock = kTokenBatch * kNumWarps;
+    static constexpr unsigned kRoutesPerBlock = Config::kGroupM;
+    static constexpr unsigned kSortedTokenBlock =
+        Config::kSortedTokenBlock;
     static constexpr unsigned kGroupDim = Config::kGroupDim;
     static constexpr unsigned kInterDim = Config::kInterDim;
     static constexpr unsigned kComputeHiddenSize = Config::kComputeHiddenSize;
@@ -123,6 +125,40 @@ struct MegaMoETwoStageCommComputeKernel {
         }
     }
 
+    TAL_DEVICE void WaitForPayloadBlocks(
+        Workspace &workspace, const typename Scheduler::Work &work,
+        unsigned tid) const {
+        if constexpr (Config::kNumRanks > 1) {
+            if (tid == 0) {
+                const unsigned subblocks =
+                    tal::CeilingDiv(work.work_m, kSortedTokenBlock);
+                for (unsigned subblock = 0; subblock < subblocks;
+                     ++subblock) {
+                    const unsigned rows = min(
+                        kSortedTokenBlock,
+                        work.work_m - subblock * kSortedTokenBlock);
+                    const unsigned ready_mask =
+                        rows == 32 ? ~0u : (1u << rows) - 1u;
+                    unsigned observed;
+                    do {
+                        observed = workspace.br_.template LoadU32<
+                            BufferResource::kSC0Bit |
+                            BufferResource::kSC1Bit>(
+                            workspace.L1PayloadArrivalMaskOffset(
+                                workspace.Rank(),
+                                work.pool_block + subblock),
+                            0);
+                        if ((observed & ready_mask) != ready_mask)
+                            asm volatile("s_sleep 1" ::: "memory");
+                    } while ((observed & ready_mask) != ready_mask);
+                }
+            }
+            __syncthreads();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+            __syncthreads();
+        }
+    }
+
     TAL_DEVICE void RunStage1(Workspace &workspace, ShmBuf &shm,
                               TokenDispatch &dispatch,
                               unsigned dispatch_epoch,
@@ -130,10 +166,7 @@ struct MegaMoETwoStageCommComputeKernel {
                               const void *w13_bias,
                               const typename Scheduler::Work &work,
                               unsigned tid, unsigned wid, unsigned wtid) {
-        if constexpr (Config::kNumRanks > 1) {
-            dispatch.WaitForExpertPayload(work.expert_idx, dispatch_epoch,
-                                          tid);
-        }
+        WaitForPayloadBlocks(workspace, work, tid);
         const unsigned pool_base = work.pool_block * kRoutesPerBlock;
         input_.Initialize(workspace, work.pool_block, work.work_m);
         input_.PrepareScales(shm.compute.stage1.x, wid, wtid);

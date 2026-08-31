@@ -265,12 +265,19 @@ def _select_mega_moe_producer_geometry(
     activation_function: MegaMoeActivationFunction | str,
     num_tokens: int,
 ) -> _MegaMoeProducerGeometry:
-    MegaMoeActivationFunction(activation_function)
-    if num_experts == 32:
+    activation_function = MegaMoeActivationFunction(activation_function)
+    if num_experts <= 56:
+        return _MegaMoeProducerGeometry.cta56
+    if activation_function is MegaMoeActivationFunction.silu:
+        if num_experts == 256 and 12 <= num_tokens < 1024:
+            return _MegaMoeProducerGeometry.cta192
+        if num_experts == 384 and num_tokens < 512:
+            return _MegaMoeProducerGeometry.cta192
+    if num_tokens < 12:
         return _MegaMoeProducerGeometry.cta128
-    if 12 <= num_tokens < 24:
+    if num_tokens < 24:
         return _MegaMoeProducerGeometry.cta64
-    return _MegaMoeProducerGeometry.cta128
+    return _MegaMoeProducerGeometry.cta56
 
 
 def create_vmm_symmetric_heap(world_size: int):
@@ -367,7 +374,7 @@ class MegaMoeConfig:
                 self.topk,
                 self.model_dim,
                 inter_dim=self.inter_dim,
-                producer_geometry=_MegaMoeProducerGeometry.cta128,
+                producer_geometry=_MegaMoeProducerGeometry.cta56,
                 stages=_FusedMoeStages(stages),
                 w2_tile_shape=_MegaMoeTileShape.n256,
                 activation_function=(

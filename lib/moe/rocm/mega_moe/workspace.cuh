@@ -40,6 +40,8 @@ struct GridSyncSlotCount<Layout,
 //     - Route output: source-owned (token, top-k) BF16 rows
 //     - Route output ready: (2, max_tokens_per_rank), i32 parity-buffered
 //       epoch-local stage-2 contribution readiness
+//     - L1 payload arrival masks: one u32 row mask per M32 routed-token block
+//       published by direct-push sources and consumed by stage 1
 //     - Token metadata: worst-case routed tokens, u64
 //     - L1 token buffer: worst-case routed tokens * Layout::kInputTokenBytes
 //     - L1 token weights: worst-case routed tokens * f32
@@ -169,6 +171,8 @@ template <class Layout> class MegaMoEWorkspace {
         static_cast<unsigned long>(kMaxPoolTokens) * sizeof(TokenMetadata);
     static constexpr unsigned long kRouteOutputReadyBytes =
         2ul * kMaxTokensPerRank * sizeof(unsigned);
+    static constexpr unsigned long kL1PayloadArrivalMaskBytes =
+        static_cast<unsigned long>(kMaxPoolBlocks) * sizeof(unsigned);
     static constexpr unsigned long kL1TokenBufferBytes =
         static_cast<unsigned long>(kMaxPoolTokens) * Layout::kInputTokenBytes;
     static constexpr unsigned long kL1TokenWeightBytes =
@@ -184,7 +188,7 @@ template <class Layout> class MegaMoEWorkspace {
             Layout::kInputTokenBytes +
         static_cast<unsigned long>(kMaxTokensPerRank) *
             Layout::kRouteOutputBufferBytes +
-        kRouteOutputReadyBytes +
+        kRouteOutputReadyBytes + kL1PayloadArrivalMaskBytes +
         kTokenMetadataBytes + kL1TokenBufferBytes + kL1TokenWeightBytes;
     static_assert(kRankSlotRawBytes <= 0xffffffffull,
                   "MegaMoE rank slot exceeds 32-bit offsets");
@@ -349,10 +353,19 @@ template <class Layout> class MegaMoEWorkspace {
     }
 
     TAL_HOST_DEVICE inline unsigned
+    L1PayloadArrivalMaskOffset(unsigned rank,
+                               unsigned pool_block_index) const {
+        [[assume(rank < kNumRanks)]];
+        [[assume(pool_block_index < kMaxPoolBlocks)]];
+        return RouteOutputReadyOffset(rank, 1, kMaxTokensPerRank - 1) +
+               sizeof(unsigned) + pool_block_index * sizeof(unsigned);
+    }
+
+    TAL_HOST_DEVICE inline unsigned
     TokenMetadataOffset(unsigned rank, unsigned pool_token_index) const {
         [[assume(rank < kNumRanks)]];
         [[assume(pool_token_index < kMaxPoolTokens)]];
-        return RouteOutputReadyOffset(rank, 1, kMaxTokensPerRank - 1) +
+        return L1PayloadArrivalMaskOffset(rank, kMaxPoolBlocks - 1) +
                sizeof(unsigned) +
                pool_token_index * sizeof(TokenMetadata);
     }

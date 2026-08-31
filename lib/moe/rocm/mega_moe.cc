@@ -36,36 +36,44 @@ struct MegaMoESolutionOperations {
     }
 
 #define MEGA_MOE_N256 MegaMoETileShape::kN256
+#define MEGA_MOE_P56 MegaMoEProducerGeometry::kCta56
 #define MEGA_MOE_P64 MegaMoEProducerGeometry::kCta64
 #define MEGA_MOE_P128 MegaMoEProducerGeometry::kCta128
+#define MEGA_MOE_P192 MegaMoEProducerGeometry::kCta192
 
 const std::unordered_map<unsigned long, MegaMoESolutionOperations>
     kMegaMoESolutions = {
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 1, 32, 4, 2880,
-                          3072, MEGA_MOE_P128, MEGA_MOE_N256),
+                          3072, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 2, 32, 4, 2880,
-                          3072, MEGA_MOE_P128, MEGA_MOE_N256),
+                          3072, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 4, 32, 4, 2880,
-                          3072, MEGA_MOE_P128, MEGA_MOE_N256),
+                          3072, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 8, 32, 4, 2880,
-                          3072, MEGA_MOE_P128, MEGA_MOE_N256),
+                          3072, MEGA_MOE_P56, MEGA_MOE_N256),
+        MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 8, 128, 4, 2880,
+                          3072, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 8, 128, 4, 2880,
                           3072, MEGA_MOE_P64, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 8, 128, 4, 2880,
                           3072, MEGA_MOE_P128, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 256, 8,
-                          7168, 2048, MEGA_MOE_P64, MEGA_MOE_N256),
+                          7168, 2048, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 256, 8,
                           7168, 2048, MEGA_MOE_P128, MEGA_MOE_N256),
+        MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 256, 8,
+                          7168, 2048, MEGA_MOE_P192, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 384, 6,
-                          7168, 3072, MEGA_MOE_P64, MEGA_MOE_N256),
+                          7168, 3072, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 384, 6,
-                          7168, 3072, MEGA_MOE_P128, MEGA_MOE_N256),
+                          7168, 3072, MEGA_MOE_P192, MEGA_MOE_N256),
 };
 
 #undef MEGA_MOE_N256
+#undef MEGA_MOE_P56
 #undef MEGA_MOE_P64
 #undef MEGA_MOE_P128
+#undef MEGA_MOE_P192
 #undef MEGA_MOE_REGISTER
 #undef MEGA_MOE_SOLUTION
 

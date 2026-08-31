@@ -90,6 +90,7 @@ struct DirectPushTokenShuffle {
         const unsigned parity = epoch & 1;
         const unsigned expected = Expected(epoch);
         const bool owner = block == 0;
+
         if (owner) {
             AdmitLaunch(tid, wid, wtid, epoch);
             PopulateSendCounters(tid, wid, wtid, parity, expected);
@@ -120,14 +121,20 @@ struct DirectPushTokenShuffle {
     }
 
     TAL_DEVICE void WaitForExpertPayload(unsigned local_expert,
-                                         unsigned epoch, unsigned tid) const {
+                                         unsigned, unsigned tid) const {
         if (tid == 0) {
-            wait_xgpu_signal_relaxed(
-                *workspace_,
-                workspace_->DirectPushPayloadReadyOffset(workspace_->Rank(),
-                                                         epoch & 1,
-                                                         local_expert),
-                static_cast<std::int32_t>(Expected(epoch)));
+            unsigned pool_block = 0;
+            for (unsigned expert = 0; expert <= local_expert; ++expert) {
+                const unsigned rows =
+                    workspace_->br_.template LoadU32<
+                        BufferResource::kSC1Bit>(
+                        workspace_->RecvSumCounterOffset(workspace_->Rank(),
+                                                         expert),
+                        0);
+                if (expert == local_expert)
+                    WaitForPayloadBlocks(pool_block, rows);
+                pool_block += tal::CeilingDiv(rows, kSortedTokenBlock);
+            }
         }
         __syncthreads();
         // Every compute wave can consume the remote payload. Acquire on each
@@ -150,14 +157,18 @@ struct DirectPushTokenShuffle {
         __syncthreads();
     }
 
-    TAL_DEVICE void WaitForAllPayloads(unsigned epoch, unsigned tid) const {
+    TAL_DEVICE void WaitForAllPayloads(unsigned, unsigned tid) const {
         if (tid == 0) {
+            unsigned pool_block = 0;
             for (unsigned expert = 0; expert < kExpertsPerRank; ++expert) {
-                wait_xgpu_signal_relaxed(
-                    *workspace_,
-                    workspace_->DirectPushPayloadReadyOffset(
-                        workspace_->Rank(), epoch & 1, expert),
-                    static_cast<std::int32_t>(Expected(epoch)));
+                const unsigned rows =
+                    workspace_->br_.template LoadU32<
+                        BufferResource::kSC1Bit>(
+                        workspace_->RecvSumCounterOffset(workspace_->Rank(),
+                                                         expert),
+                        0);
+                WaitForPayloadBlocks(pool_block, rows);
+                pool_block += tal::CeilingDiv(rows, kSortedTokenBlock);
             }
         }
         __syncthreads();
@@ -165,6 +176,27 @@ struct DirectPushTokenShuffle {
     }
 
   private:
+    TAL_DEVICE void WaitForPayloadBlocks(unsigned pool_block,
+                                         unsigned rows) const {
+        const unsigned blocks = tal::CeilingDiv(rows, kSortedTokenBlock);
+        for (unsigned block = 0; block < blocks; ++block) {
+            const unsigned block_rows =
+                min(kSortedTokenBlock, rows - block * kSortedTokenBlock);
+            const unsigned ready_mask =
+                block_rows == 32 ? ~0u : (1u << block_rows) - 1u;
+            unsigned observed;
+            do {
+                observed = workspace_->br_.template LoadU32<
+                    BufferResource::kSC0Bit | BufferResource::kSC1Bit>(
+                    workspace_->L1PayloadArrivalMaskOffset(
+                        workspace_->Rank(), pool_block + block),
+                    0);
+                if ((observed & ready_mask) != ready_mask)
+                    asm volatile("s_sleep 1" ::: "memory");
+            } while ((observed & ready_mask) != ready_mask);
+        }
+    }
+
     TAL_DEVICE static unsigned Expected(unsigned epoch) {
         return ((epoch + 1) / 2) * kNumRanks;
     }
@@ -380,6 +412,10 @@ struct DirectPushTokenShuffle {
                  block < pool_rows / kSortedTokenBlock;
                  block += kWarpSize) {
                 workspace_->br_.template StoreU32<BufferResource::kNone>(
+                    workspace_->L1PayloadArrivalMaskOffset(
+                        workspace_->Rank(), block),
+                    0, 0);
+                workspace_->br_.template StoreU32<BufferResource::kNone>(
                     workspace_->L2ArrivalMaskOffset(block), 0, 0);
             }
         } else {
@@ -429,9 +465,11 @@ struct DirectPushTokenShuffle {
     TAL_DEVICE void PushPayload(unsigned producer_slot, unsigned tid,
                                 unsigned wid, unsigned wtid, unsigned parity,
                                 unsigned expected) {
-        // Pin every producer to one destination. With no payload chunking,
-        // task_index advances by the dispatch grid size and maps back to a
-        // local expert by dividing by the destination count.
+        // Pin every producer to one destination.  In the dense 56-CTA path,
+        // all seven destination-local producers cooperate on source-expert
+        // payloads of at least 64 rows.  This is the important skew case: one
+        // CTA no longer serializes a 100+ row peer copy while compute waits.
+        // Sparse tasks retain one owner and therefore pay no extra traffic.
         const unsigned destination = producer_slot % kNumRanks;
         if (tid == 0) {
             wait_xgpu_signal_relaxed(
@@ -443,71 +481,154 @@ struct DirectPushTokenShuffle {
         }
         __syncthreads();
 
-        for (unsigned task_index = producer_slot; task_index < kNumExperts;
-             task_index += kDispatchBlocks) {
-            const unsigned local_expert = task_index / kNumRanks;
-            const unsigned expert =
-                destination * kExpertsPerRank + local_expert;
-            if (tid == 0) {
-                shm_->payload_plan = {
-                    LoadParityValue(
-                        workspace_->SendCounterOffset(workspace_->Rank(),
-                                                      expert),
-                        parity),
-                    LoadParityValue(
-                        workspace_->DirectPushPlanBaseOffset(
-                            workspace_->Rank(), destination, local_expert),
-                        parity)};
+        if constexpr (kDispatchBlocks == 56 && kDispatchBlocks >= kNumRanks) {
+            static constexpr unsigned kProducersPerDestination =
+                kDispatchBlocks / kNumRanks;
+            const unsigned destination_producer =
+                producer_slot / kNumRanks;
+            // Load all destination-local task descriptors cooperatively once.
+            // The first split implementation serialized 16 tid-0 loads and
+            // 16 CTA barriers in every producer, which erased the skew win on
+            // balanced layers.  The existing dispatch scratch is CTA-private
+            // and no longer needed after planning, so reuse it here.
+            if (tid < kExpertsPerRank) {
+                const unsigned expert =
+                    destination * kExpertsPerRank + tid;
+                shm_->expert_count[tid] = LoadParityValue(
+                    workspace_->SendCounterOffset(workspace_->Rank(), expert),
+                    parity);
+                shm_->source_count[tid] = LoadParityValue(
+                    workspace_->DirectPushPlanBaseOffset(
+                        workspace_->Rank(), destination, tid),
+                    parity);
             }
             __syncthreads();
-            const uint2 plan = shm_->payload_plan;
-
-            // Assign one row to each wave only once all waves have enough
-            // rows; otherwise the whole CTA cooperates on one row.
-            if (plan.x >= kThreads / kWarpSize * 2) {
-                for (unsigned ordinal = wid; ordinal < plan.x;
-                     ordinal += kThreads / kWarpSize) {
-                    unsigned route = 0;
-                    if (wtid == 0) {
-                        route =
-                            workspace_->br_.template LoadU32<kPeerCoherent>(
-                                workspace_->RecvTokenOffset(
-                                    workspace_->Rank(), destination,
-                                    local_expert, ordinal),
-                                0);
-                    }
-                    route = __builtin_amdgcn_readfirstlane(route);
-                    CopyPayloadRow(destination, plan.y + ordinal, route, wtid,
-                                   kWarpSize, wtid == 0);
-                }
-            } else {
-                for (unsigned ordinal = 0; ordinal < plan.x; ++ordinal) {
-                    const unsigned route =
-                        workspace_->br_.template LoadU32<kPeerCoherent>(
-                            workspace_->RecvTokenOffset(
-                                workspace_->Rank(), destination, local_expert,
-                                ordinal),
-                            0);
-                    CopyPayloadRow(destination, plan.y + ordinal, route, tid,
-                                   kThreads, tid == 0);
-                }
+            for (unsigned local_expert = 0;
+                 local_expert < kExpertsPerRank; ++local_expert) {
+                const uint2 plan = {shm_->expert_count[local_expert],
+                                    shm_->source_count[local_expert]};
+                const unsigned workers =
+                    plan.x >= 64 ? kProducersPerDestination : 1u;
+                const unsigned primary =
+                    local_expert % kProducersPerDestination;
+                const bool active = workers == 1
+                                        ? destination_producer == primary
+                                        : destination_producer < workers;
+                if (!active)
+                    continue;
+                const unsigned worker =
+                    workers == 1 ? 0u : destination_producer;
+                const unsigned begin = plan.x * worker / workers;
+                const unsigned end = plan.x * (worker + 1) / workers;
+                CopyPayloadRows(destination, local_expert, plan.y, begin,
+                                end, tid, wid, wtid);
             }
-            amdgcn_s_waitcnt<0, -1, 0>();
-            // Publish each task independently only after every wave's rows
-            // and header stores have reached the release point.
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-            __syncthreads();
-            if (tid == 0) {
-                workspace_->br_
-                    .template AtomicAddI32<
-                        BufferResource::kAtomicScopeSystem>(
-                        workspace_->DirectPushPayloadReadyOffset(
-                            destination, parity, local_expert),
-                        0, 1);
-            }
-            amdgcn_s_waitcnt<0, -1, 0>();
-            __syncthreads();
+            return;
         }
+
+        // Non-split geometries keep the one-task-per-producer mapping.
+        for (unsigned task_index = producer_slot;
+             task_index < kNumExperts; task_index += kDispatchBlocks) {
+            const unsigned local_expert = task_index / kNumRanks;
+            const uint2 plan = LoadPayloadPlan(destination, local_expert,
+                                               parity, tid);
+            CopyPayloadRows(destination, local_expert, plan.y, 0, plan.x,
+                            tid, wid, wtid);
+        }
+    }
+
+    TAL_DEVICE uint2 LoadPayloadPlan(unsigned destination,
+                                     unsigned local_expert,
+                                     unsigned parity, unsigned tid) {
+        const unsigned expert =
+            destination * kExpertsPerRank + local_expert;
+        if (tid == 0) {
+            shm_->payload_plan = {
+                LoadParityValue(
+                    workspace_->SendCounterOffset(workspace_->Rank(), expert),
+                    parity),
+                LoadParityValue(
+                    workspace_->DirectPushPlanBaseOffset(
+                        workspace_->Rank(), destination, local_expert),
+                    parity)};
+        }
+        __syncthreads();
+        return shm_->payload_plan;
+    }
+
+    TAL_DEVICE void CopyPayloadRows(unsigned destination,
+                                    unsigned local_expert,
+                                    unsigned pool_base,
+                                    unsigned ordinal_begin,
+                                    unsigned ordinal_end, unsigned tid,
+                                    unsigned wid, unsigned wtid) {
+        const unsigned rows = ordinal_end - ordinal_begin;
+
+        // The reference mapping assigns one row to each wave. Petit rows are
+        // wider, so use that mapping only when the fragment supplies at least
+        // two rows per wave; otherwise the whole CTA cooperates on one row.
+        if (rows >= kThreads / kWarpSize * 2) {
+            for (unsigned ordinal = ordinal_begin + wid;
+                 ordinal < ordinal_end;
+                 ordinal += kThreads / kWarpSize) {
+                unsigned route = 0;
+                if (wtid == 0) {
+                    route = workspace_->br_.template LoadU32<kPeerCoherent>(
+                        workspace_->RecvTokenOffset(
+                            workspace_->Rank(), destination, local_expert,
+                            ordinal),
+                        0);
+                }
+                route = __builtin_amdgcn_readfirstlane(route);
+                CopyPayloadRow(destination, pool_base + ordinal, route, wtid,
+                               kWarpSize, wtid == 0);
+            }
+        } else {
+            for (unsigned ordinal = ordinal_begin; ordinal < ordinal_end;
+                 ++ordinal) {
+                const unsigned route =
+                    workspace_->br_.template LoadU32<kPeerCoherent>(
+                        workspace_->RecvTokenOffset(
+                            workspace_->Rank(), destination, local_expert,
+                            ordinal),
+                        0);
+                CopyPayloadRow(destination, pool_base + ordinal, route, tid,
+                               kThreads, tid == 0);
+            }
+        }
+        amdgcn_s_waitcnt<0, -1, 0>();
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        __syncthreads();
+        if (tid == 0) {
+            // Publish exactly the rows contributed by this producer
+            // fragment. Masks from producer fragments and source ranks
+            // compose into a full destination-owned M32 block.
+            const unsigned first = pool_base + ordinal_begin;
+            const unsigned end = pool_base + ordinal_end;
+            for (unsigned pool_block = first / kSortedTokenBlock;
+                 pool_block * kSortedTokenBlock < end; ++pool_block) {
+                const unsigned block_first =
+                    pool_block * kSortedTokenBlock;
+                const unsigned lo =
+                    first > block_first ? first - block_first : 0;
+                const unsigned block_end =
+                    block_first + kSortedTokenBlock;
+                const unsigned hi = end < block_end ? end - block_first
+                                                    : kSortedTokenBlock;
+                const unsigned high_mask =
+                    hi == 32 ? ~0u : (1u << hi) - 1u;
+                const unsigned low_mask =
+                    lo == 0 ? 0u : (1u << lo) - 1u;
+                workspace_->br_
+                    .template AtomicOrU32<
+                        BufferResource::kAtomicScopeSystem>(
+                        workspace_->L1PayloadArrivalMaskOffset(
+                            destination, pool_block),
+                        0, high_mask & ~low_mask);
+            }
+        }
+        amdgcn_s_waitcnt<0, -1, 0>();
+        __syncthreads();
     }
 
     unsigned num_tokens_;
