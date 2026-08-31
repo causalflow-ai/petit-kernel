@@ -82,11 +82,11 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
                 const unsigned value =
                     output[row * (Base::kTileCols / 2) + pair_col];
                 const unsigned col = tile_col + pair_col * 2;
-            // Match the reference stage-2 P2P scatter cache policy. These
-                // rows are consumed exactly once by the source-rank combine,
-                // so non-temporal stores avoid retaining peer-directed lines
-                // in the producer CU's cache.  The following combine kernel
-                // supplies the system release/acquire publication edge.
+                // These rows are consumed exactly once by the source-rank
+                // combine, so non-temporal stores avoid retaining
+                // peer-directed lines in the producer CU's cache. The
+                // following combine kernel supplies the system release/acquire
+                // publication edge.
                 output_row.template StoreU32<BufferResource::kNTBit>(
                     col * sizeof(__hip_bfloat16), 0, value);
             }
@@ -94,8 +94,10 @@ struct MegaMoETwoStage2Epilogue : TwoStageStage2Epilogue<TileSchedule> {
     }
 };
 
-// Reduce the source-owned (token, top-k) route rows in FP32, return BF16,
-// and clear every row for the next invocation.
+// Reduce the source-owned (token, top-k) route rows in FP32 and return BF16.
+// Direct-push stage 2 has unique ownership of every route row and overwrites
+// it completely on every invocation, so combine must not spend bandwidth
+// clearing the previous epoch's rows.
 template <class Config, unsigned kGridBlocks = Config::kNumSMs,
           unsigned kBlockThreads = Config::kThreads>
 struct SourceRouteReducer {

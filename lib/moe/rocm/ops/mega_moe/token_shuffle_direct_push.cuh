@@ -345,11 +345,14 @@ struct DirectPushTokenShuffle {
                                          unsigned wtid, unsigned parity,
                                          unsigned expected) {
 
-        // Clear the eight cache-line-spaced, destination-owned work heads in
-        // the planner CTA before publishing PLAN_READY.
-        if (tid < kWorkShards) {
+        // Stage 1 and stage 2 use separate cache-line-spaced work heads so
+        // their kernels can be launched independently without an intervening
+        // reset kernel.
+        if (tid < 2 * kWorkShards) {
+            const unsigned set = tid / kWorkShards;
+            const unsigned shard = tid % kWorkShards;
             workspace_->br_.template StoreU32<BufferResource::kNone>(
-                workspace_->DirectPushWorkHeadOffset(tid), 0, 0);
+                workspace_->DirectPushWorkHeadOffset(shard, set), 0, 0);
         }
 
         // Wave 0 owns the destination plan while the remaining waves
@@ -564,8 +567,7 @@ struct DirectPushTokenShuffle {
                                     unsigned wid, unsigned wtid) {
         const unsigned rows = ordinal_end - ordinal_begin;
 
-        // The reference mapping assigns one row to each wave. Petit rows are
-        // wider, so use that mapping only when the fragment supplies at least
+        // Assign one row to each wave only when the fragment supplies at least
         // two rows per wave; otherwise the whole CTA cooperates on one row.
         if (rows >= kThreads / kWarpSize * 2) {
             for (unsigned ordinal = ordinal_begin + wid;

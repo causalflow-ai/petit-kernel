@@ -50,7 +50,8 @@ struct GridSyncSlotCount<Layout,
 //
 // Local data: (only visible to the local rank)
 // - Grid sync barrier (aligned to 64-byte cache line size)
-// - Direct-push work heads: eight independently cached scheduler shards
+// - Direct-push work heads: two sets of eight independently cached scheduler
+//   shards, one set per GEMM stage
 // - Input TokenTopK Expert ID: (max_tokens_per_rank, kTopK), i32
 // - L2 arrival masks: one u32 bit mask per M32 routed-token block
 // - L2 token buffer: stage-2 MXFP4 activation values for all routed tokens
@@ -111,9 +112,10 @@ template <class Layout> class MegaMoEWorkspace {
     static constexpr unsigned kMaxTokensPerRank = Layout::kMaxTokensPerRank;
     static constexpr unsigned kTopK = Layout::kTopK;
     static constexpr unsigned kDirectWorkShards = 8;
+    static constexpr unsigned kDirectWorkHeadSets = 2;
     static constexpr unsigned kDirectWorkShardStride = 64;
     static constexpr unsigned kDirectWorkHeadBytes =
-        kDirectWorkShards * kDirectWorkShardStride;
+        kDirectWorkHeadSets * kDirectWorkShards * kDirectWorkShardStride;
     static constexpr unsigned kRankSymBufferBase =
         kNumRanks * kXGpuBarrierRecordBytes;
     static constexpr unsigned kSortedTokenBlock = 32;
@@ -475,13 +477,14 @@ template <class Layout> class MegaMoEWorkspace {
         return kLocalOffsetBase;
     }
 
-    // Keep the eight destination-local work-head atomics on separate
-    // 64-byte lines.
+    // Keep the eight destination-local work-head atomics on separate 64-byte
+    // lines.
     TAL_HOST_DEVICE inline unsigned
-    DirectPushWorkHeadOffset(unsigned shard) const {
+    DirectPushWorkHeadOffset(unsigned shard, unsigned set = 0) const {
         [[assume(shard < kDirectWorkShards)]];
+        [[assume(set < kDirectWorkHeadSets)]];
         return GridSyncBarrierOffset() + kCacheLineBytes +
-               shard * kDirectWorkShardStride;
+               (set * kDirectWorkShards + shard) * kDirectWorkShardStride;
     }
 
     TAL_HOST_DEVICE inline unsigned InputTokenTopKExpertIDOffset() const {

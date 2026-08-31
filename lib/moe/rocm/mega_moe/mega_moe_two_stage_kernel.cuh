@@ -53,8 +53,11 @@ struct MegaMoETwoStageCommComputeKernel {
     static constexpr unsigned kK256Tiles = kInterDim / kGroupDim;
     static constexpr unsigned kStage1TileCount =
         kInterDim / Config::kStage1GroupN;
-    static constexpr unsigned kStage2GridBlocks =
-        kNumSMs * Scheduler::kLinear2Tiles;
+    // GSM8K's hottest destination has 1,116 stage-2 tickets. A 1,280-CTA grid
+    // covers that skew without a second work item while avoiding the 1,792
+    // empty CTAs launched by the former 12-CTA-per-SM grid. Denser workloads
+    // remain correct through ComputeStage2Only's persistent ticket loop.
+    static constexpr unsigned kStage2GridBlocks = kNumSMs * 5;
     static constexpr unsigned kWorkShards = 8;
     static constexpr unsigned kCommComputeEntryGridSyncIndex = 2;
     static constexpr unsigned kComputeCompleteGridSyncIndex = 3;
@@ -103,12 +106,20 @@ struct MegaMoETwoStageCommComputeKernel {
         // other waves have drained the stage-2 epilogue LDS. Keep its
         // broadcast slot disjoint from compute storage so publishing the next
         // work ID cannot corrupt those outstanding reads.
-        unsigned work_id;
+        [[no_unique_address]] SeparateWorkId work_id;
     };
+
+    TAL_DEVICE unsigned &WorkId(ShmBuf &shm) const {
+        if constexpr (kOverlapStage1WorkId)
+            return shm.overlapped_work_id;
+        else
+            return shm.work_id;
+    }
 
     TAL_DEVICE unsigned NextDynamicWork(Workspace &workspace, ShmBuf &shm,
                                         unsigned sm_id, unsigned tid,
-                                        unsigned logical_id) const {
+                                        unsigned logical_id,
+                                        unsigned set = 0) const {
         if constexpr (Config::kNumRanks == 1) {
             return logical_id + kNumSMs;
         } else {
@@ -117,11 +128,11 @@ struct MegaMoETwoStageCommComputeKernel {
                 const unsigned local_work = static_cast<unsigned>(
                     workspace.br_.template AtomicAddI32<
                         BufferResource::kAtomicScopeAgent>(
-                        workspace.DirectPushWorkHeadOffset(shard), 0, 1));
-                shm.work_id = shard + local_work * kWorkShards;
+                        workspace.DirectPushWorkHeadOffset(shard, set), 0, 1));
+                WorkId(shm) = shard + local_work * kWorkShards;
             }
             __syncthreads();
-            return shm.work_id;
+            return WorkId(shm);
         }
     }
 
@@ -167,8 +178,8 @@ struct MegaMoETwoStageCommComputeKernel {
                               const typename Scheduler::Work &work,
                               unsigned tid, unsigned wid, unsigned wtid) {
         WaitForPayloadBlocks(workspace, work, tid);
-        const unsigned pool_base = work.pool_block * kRoutesPerBlock;
-        input_.Initialize(workspace, work.pool_block, work.work_m);
+        const unsigned pool_base = work.pool_row;
+        input_.Initialize(workspace, pool_base, work.work_m);
         input_.PrepareScales(shm.compute.stage1.x, wid, wtid);
         Config::InitializeW13(*this, w13, scales_w13, work.expert_idx,
                               work.tile, 0, 0);
@@ -315,6 +326,7 @@ struct MegaMoETwoStageCommComputeKernel {
         __syncthreads();
         Stage2Epilogue::WriteBack(output_context, shm.compute.stage2, tile_col,
                                   wid, wtid);
+
     }
 
     TAL_DEVICE void Compute(Workspace &workspace, Scheduler &scheduler,
@@ -535,10 +547,10 @@ struct MegaMoETwoStageCommComputeKernel {
     Stage2Bias w2_bias_;
 };
 
-// Direct push completes stage 2 in the GEMM kernel, then uses a
-// lightweight 128-CTA, eight-wave kernel for the collective publication and
-// source-owned route reduction. Keeping this rendezvous out of the
-// high-register GEMM kernel lets all compute CTAs retire independently.
+// Complete direct-push stage 2 in the GEMM kernel, then use a lightweight
+// 128-CTA, eight-wave kernel for collective publication and source-owned route
+// reduction. Keeping this rendezvous out of the high-register GEMM kernel lets
+// all compute CTAs retire independently.
 template <class Config> struct MegaMoECombineKernel {
     using Workspace = MegaMoEWorkspace<Config>;
     static constexpr unsigned kNumSMs = 128;
@@ -615,6 +627,26 @@ __global__ static void __launch_bounds__(Kernel::kThreads)
     kernel.Run(out, w13, w2, scales_w13, scales_w2, num_tokens,
                output_row_stride, w13_bias, w2_bias, base, rank, input_tokens,
                input_topk_ids, input_topk_weights);
+}
+
+template <class Kernel>
+__global__ static void __launch_bounds__(Kernel::kThreads)
+    MegaMoEStage1(const uint4 *w13, const unsigned *scales_w13,
+                  unsigned num_tokens, const void *w13_bias, void *base,
+                  unsigned rank, const uint4 *input_tokens,
+                  const unsigned *input_topk_ids,
+                  const float *input_topk_weights) {
+    Kernel kernel;
+    kernel.RunStage1Kernel(w13, scales_w13, num_tokens, w13_bias, base, rank,
+                           input_tokens, input_topk_ids, input_topk_weights);
+}
+
+template <class Kernel>
+__global__ static void __launch_bounds__(Kernel::kThreads)
+    MegaMoEStage2(const uint4 *w2, const unsigned *scales_w2,
+                  const void *w2_bias, void *base, unsigned rank) {
+    Kernel kernel;
+    kernel.RunStage2Kernel(nullptr, w2, scales_w2, 0, w2_bias, base, rank);
 }
 
 template <class Kernel>

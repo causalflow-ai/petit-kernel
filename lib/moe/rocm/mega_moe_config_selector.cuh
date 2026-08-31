@@ -131,9 +131,49 @@ template <FusedMoESolutionId Solution> struct MegaMoEConfigSelector {
     }
 };
 
-// Use an eight-wave M64 x N512 stage-1 tile once each expert has enough rows
-// to amortize it. Keep stage 2 on the four-wave M32 base config; the
-// direct-push pool and L2 readiness layout remain expressed in M32 units.
+// Use a four-wave M64 x N512 stage-1 tile for medium token counts. Keep stage
+// 2 on the four-wave M32 base config; the direct-push pool and L2 readiness
+// layout remain expressed in M32 units.
+template <class Base> struct MegaMoEStage1M64W4Config : Base {
+    using Self = MegaMoEStage1M64W4Config;
+    static constexpr unsigned kGroupM = 64;
+    static constexpr unsigned kStage1GroupN = 256;
+    static constexpr unsigned kTokenBatch = 16;
+    static constexpr unsigned kNumWarps = 4;
+    static constexpr unsigned kStage1WarpsM = 2;
+    static constexpr unsigned kStage1WarpsN = 2;
+    static constexpr unsigned kThreads = kNumWarps * kWarpSize;
+    static constexpr MxFp4TileShape kW13TileShape =
+        MxFp4TileShape::kM64N256;
+
+    using Input = MxFp4InputPacked<Self>;
+    using Weight = FusedMoEWeightSelector<
+        Base::kSolution.weight_dtype, Base::kSolution.weight_ordering, Self>;
+    using W13Weights = typename Weight::W13Weights;
+    using W13 = typename W13Weights::W13;
+    using Bias = std::conditional_t<
+        Base::kSolution.bias_dtype == FusedMoEDataType::kNone,
+        NoopBiasLayout<kNumWarps, kStage1GroupN>,
+        Bf16BiasLayout<kNumWarps, kStage1GroupN,
+                       MxFp4BiasLayoutM64N256, 8>>;
+    using Stage1Tiles = typename FusedMoEStage1TilesSelector<
+        Base::kSolution.weight_dtype, Base::kSolution.weight_ordering,
+        Base::kSolution.mfma, Self>::Type;
+    using Stage1Op = typename FusedMoEStage1OpSelector<
+        Base::kSolution.stage1_buffering, Stage1Tiles>::Type;
+
+    template <class Kernel>
+    TAL_DEVICE static void
+    InitializeW13(Kernel &kernel, const uint4 *w13,
+                  const unsigned *scales_w13, unsigned expert,
+                  unsigned tile_k, unsigned n_blocks, unsigned k_blocks) {
+        Weight::InitializeW13(kernel, w13, scales_w13, expert, tile_k,
+                              n_blocks, k_blocks);
+    }
+};
+
+// Use the eight-wave variant at large token counts, where the additional
+// waves are fully amortized.
 template <class Base> struct MegaMoEStage1M64W8Config : Base {
     using Self = MegaMoEStage1M64W8Config;
     static constexpr unsigned kGroupM = 64;
@@ -181,7 +221,26 @@ int MegaMoESolutionAdapter<kRepr>::Invoke(MegaMoEParams params) {
     using Kernel = MegaMoETwoStageCommComputeKernel<Config>;
     using ExternalInputKernel =
         MegaMoETwoStageCommComputeKernel<Config, true>;
+    using M64Stage1Config = MegaMoEStage1M64W4Config<Config>;
+    using M64Stage1Kernel =
+        MegaMoETwoStageCommComputeKernel<M64Stage1Config>;
+    using M64ExternalInputStage1Kernel =
+        MegaMoETwoStageCommComputeKernel<M64Stage1Config, true>;
+    using M64W8Stage1Config = MegaMoEStage1M64W8Config<Config>;
+    using M64W8Stage1Kernel =
+        MegaMoETwoStageCommComputeKernel<M64W8Stage1Config>;
+    using M64W8ExternalInputStage1Kernel =
+        MegaMoETwoStageCommComputeKernel<M64W8Stage1Config, true>;
     using CombineKernel = MegaMoECombineKernel<Config>;
+    // Choose M64 from route density rather than applying the GPT-OSS cutoff
+    // to every expert topology. The E256/top-k8 shape fills useful M64 work
+    // at M128; the sparser E384/top-k6 and GPT-OSS shapes retain M256.
+    static constexpr unsigned kM64MinTokens =
+        Config::kNumExperts == 256 ? 128 : 256;
+    // GPT-OSS needs the lower-overhead four-wave tile through M512. Preserve
+    // the existing eight-wave crossover for the denser E256/E384 shapes.
+    static constexpr unsigned kM64W8MinTokens =
+        Config::kNumExperts == 128 ? 1024 : kM64MinTokens;
 
     const unsigned external_input_count =
         static_cast<unsigned>(params.input_tokens != nullptr) +
@@ -200,37 +259,78 @@ int MegaMoESolutionAdapter<kRepr>::Invoke(MegaMoEParams params) {
         return kFusedMoEErrorInvalidArgument;
     }
 
-    const auto launch = [&]<class SelectedKernel>() -> int {
-        hipLaunchKernelGGL(
-            (MegaMoETwoStage<SelectedKernel>), dim3(Config::kNumSMs),
-            dim3(Config::kThreads), 0, params.stream,
-            reinterpret_cast<uint4 *>(params.out),
-            reinterpret_cast<const uint4 *>(params.w13),
-            reinterpret_cast<const uint4 *>(params.w2), params.scales_w13,
-            params.scales_w2, params.num_tokens, params.output_row_stride,
-            params.w13_bias, params.w2_bias, params.workspace, params.rank,
-            reinterpret_cast<const uint4 *>(params.input_tokens),
-            params.input_topk_ids, params.input_topk_weights);
+    const auto launch = [&]<class SelectedStage1Kernel,
+                            class SelectedKernel>() -> int {
+        if constexpr (Config::kNumRanks > 1) {
+            hipLaunchKernelGGL(
+                (MegaMoEStage1<SelectedStage1Kernel>),
+                dim3(Config::kNumSMs),
+                dim3(SelectedStage1Kernel::kThreads), 0, params.stream,
+                reinterpret_cast<const uint4 *>(params.w13),
+                params.scales_w13, params.num_tokens, params.w13_bias,
+                params.workspace, params.rank,
+                reinterpret_cast<const uint4 *>(params.input_tokens),
+                params.input_topk_ids, params.input_topk_weights);
+            if (hipGetLastError() != hipSuccess)
+                return kFusedMoEErrorInvalidArgument;
+            hipLaunchKernelGGL(
+                (MegaMoEStage2<SelectedKernel>),
+                dim3(SelectedKernel::kStage2GridBlocks),
+                dim3(SelectedKernel::kThreads), 0, params.stream,
+                reinterpret_cast<const uint4 *>(params.w2),
+                params.scales_w2, params.w2_bias, params.workspace,
+                params.rank);
+        } else {
+            hipLaunchKernelGGL(
+                (MegaMoETwoStage<SelectedKernel>),
+                dim3(Config::kNumSMs), dim3(Config::kThreads), 0,
+                params.stream, reinterpret_cast<uint4 *>(params.out),
+                reinterpret_cast<const uint4 *>(params.w13),
+                reinterpret_cast<const uint4 *>(params.w2),
+                params.scales_w13, params.scales_w2, params.num_tokens,
+                params.output_row_stride, params.w13_bias, params.w2_bias,
+                params.workspace, params.rank,
+                reinterpret_cast<const uint4 *>(params.input_tokens),
+                params.input_topk_ids, params.input_topk_weights);
+        }
         if (hipGetLastError() != hipSuccess)
             return kFusedMoEErrorInvalidArgument;
         if constexpr (Config::kNumRanks > 1) {
             hipLaunchKernelGGL(
                 (MegaMoECombine<CombineKernel>),
-                dim3(CombineKernel::kNumSMs), dim3(CombineKernel::kThreads), 0,
-                params.stream, reinterpret_cast<uint4 *>(params.out),
-                params.num_tokens, params.output_row_stride, params.workspace,
-                params.rank);
+                dim3(CombineKernel::kNumSMs),
+                dim3(CombineKernel::kThreads), 0, params.stream,
+                reinterpret_cast<uint4 *>(params.out), params.num_tokens,
+                params.output_row_stride, params.workspace, params.rank);
         }
         return hipGetLastError() == hipSuccess ? 0
                                                : kFusedMoEErrorInvalidArgument;
     };
     if constexpr (Config::kNumRanks > 1) {
-        if (external_input_count == 3)
-            return launch.template operator()<ExternalInputKernel>();
+        if (external_input_count == 3) {
+            if (params.num_tokens >= kM64W8MinTokens) {
+                return launch.template operator()<
+                    M64W8ExternalInputStage1Kernel, ExternalInputKernel>();
+            }
+            if (params.num_tokens >= kM64MinTokens) {
+                return launch.template operator()<
+                    M64ExternalInputStage1Kernel, ExternalInputKernel>();
+            }
+            return launch.template operator()<ExternalInputKernel,
+                                              ExternalInputKernel>();
+        }
     } else if (external_input_count != 0) {
         return kFusedMoEErrorUnsupported;
     }
-    return launch.template operator()<Kernel>();
+    if constexpr (Config::kNumRanks > 1) {
+        if (params.num_tokens >= kM64W8MinTokens) {
+            return launch.template operator()<M64W8Stage1Kernel, Kernel>();
+        }
+        if (params.num_tokens >= kM64MinTokens) {
+            return launch.template operator()<M64Stage1Kernel, Kernel>();
+        }
+    }
+    return launch.template operator()<Kernel, Kernel>();
 }
 
 template <unsigned long kRepr>
