@@ -392,7 +392,6 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
     def build(self) -> dict[str, torch.Tensor]:
         block_n, block_k = BLOCK_SHAPE
         aiter = pytest.importorskip("aiter")
-        fused_topk = pytest.importorskip("aiter.fused_moe").fused_topk
         quant_dtype = aiter.dtypes.fp8
         w1_rows = self.inter_dim * 2
         w1_row_blocks = w1_rows // block_n
@@ -402,8 +401,13 @@ class FmoeBlockscaleFp8AiterTestDataBuilder:
 
         input_f = torch.randn((self.tokens, self.model_dim), dtype=self.dtype, device=self.device)
         score = torch.randn((self.tokens, self.experts), dtype=self.dtype, device=self.device)
-        topk_weights, topk_ids = fused_topk(input_f, score, self.topk, True)
-        topk_weights = topk_weights.to(torch.float32)
+        routing_scores = torch.softmax(score.to(torch.float32), dim=-1)
+        topk_weights, topk_ids = torch.topk(
+            routing_scores, self.topk, dim=-1
+        )
+        topk_weights = topk_weights / topk_weights.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-12)
         topk_ids = topk_ids.to(torch.int32)
 
         w1 = (
