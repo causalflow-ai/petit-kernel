@@ -12,6 +12,8 @@ template <class Config> struct MxFp4Input {
     static constexpr unsigned kDim = Config::kDim;
     static constexpr unsigned kTokenBatch = Config::kTokenBatch;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
+    static constexpr unsigned kWarpsM = Config::kStage1WarpsM;
+    static constexpr unsigned kWarpsN = Config::kStage1WarpsN;
     static constexpr unsigned kGroupDim = Config::kGroupDim;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kGroupK = kGroupDim;
@@ -30,18 +32,21 @@ template <class Config> struct MxFp4Input {
     static constexpr unsigned kScaleBlockSize = 32;
     static constexpr unsigned kRowVecs = kDim / kScaleBlockSize;
     static constexpr unsigned kScaleBlocksPerRouteGroup = kDim / 256;
+    static constexpr unsigned kScaleWordsPerM32 = kWarpSize;
 
     static_assert(kGroupK % 128 == 0, "");
     static_assert(kGroupK % 256 == 0, "");
     static_assert(kGroupK / kScaleBlockSize == kRowVecsPerTile, "");
     static_assert(kNumWarps == 4, "");
     static_assert(kWarpSize == kMmaRows * kK32PerTile, "");
-    static_assert(kLoadIterations == 1, "");
+    static_assert(kLoadIterations == 1 || kLoadIterations == 2, "");
     static_assert(kScaleFragments == 1, "");
+    static_assert(kWarpsM * kWarpsN == kNumWarps, "");
+    static_assert(kTokenBatch * kNumWarps == 32 * kWarpsM, "");
 
     struct Shm {
         uint4 act[kLoadIterations * kThreads];
-        unsigned scale[kScaleFragments * kWarpSize];
+        unsigned scale[kScaleFragments * kScaleWordsPerM32 * kWarpsM];
     };
 
     __device__ static auto MakeRowVecLayout() {
@@ -74,7 +79,7 @@ template <class Config> struct MxFp4Input {
         };
         scales_.v = {
             .ptr = reinterpret_cast<uintptr_t>(scale_ptr),
-            .range = route_group_limit * kDim,
+            .range = route_group_limit * kWarpsM * kDim,
             .config = BufferResource::kDataFormatU32Config,
         };
         route_group_ = route_group;
@@ -114,17 +119,18 @@ template <class Config> struct MxFp4Input {
     __device__ void FetchScaleAsync(unsigned *shm_scale, unsigned wid,
                                     unsigned wtid, const unsigned *,
                                     unsigned) {
-        if (wid != 0) {
+        if (wid >= kWarpsM) {
             return;
         }
         const unsigned offset = scales_offset_vec_;
         scales_offset_vec_ += kScaleFragments;
         auto lds_ptr =
             (__attribute__((address_space(3))) unsigned *)shm_scale;
+        const unsigned m32_group = route_group_ * kWarpsM + wid;
         const unsigned src_word =
-            (route_group_ * kScaleBlocksPerRouteGroup + offset) *
-                kWarpSize +
+            (m32_group * kScaleBlocksPerRouteGroup + offset) * kWarpSize +
             wtid;
+        lds_ptr += wid * kScaleWordsPerM32;
         scales_.LoadLds<BufferResource::kNone, sizeof(unsigned), 0>(
             lds_ptr, src_word * sizeof(unsigned), 0);
     }
@@ -145,7 +151,9 @@ template <class Config> struct MxFp4Input {
 
     __device__ unsigned FetchScaleToReg(const unsigned *shm_scale,
                                         unsigned wtid) const {
-        return shm_scale[wtid];
+        const unsigned wid = threadIdx.x / kWarpSize;
+        const unsigned wave_m = wid / kWarpsN;
+        return shm_scale[wave_m * kScaleWordsPerM32 + wtid];
     }
 
     BufferResource values_;

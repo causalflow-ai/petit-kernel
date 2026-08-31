@@ -26,48 +26,69 @@
 namespace causalflow::petit::rocm::moe {
 
 template <FusedMoEDataType kBiasDType, FusedMoEDataType kWeightDType,
-          FusedMoEMfmaShape kMfma, unsigned kNumWarps, unsigned kGroupN>
+          FusedMoEMfmaShape kMfma, unsigned kNumWarps, unsigned kGroupN,
+          unsigned kGroupM = 32>
 struct BiasLayoutSelector;
 
 template <FusedMoEDataType kWeightDType, FusedMoEMfmaShape kMfma,
-          unsigned kNumWarps, unsigned kGroupN>
+          unsigned kNumWarps, unsigned kGroupN, unsigned kGroupM>
 struct BiasLayoutSelector<FusedMoEDataType::kNone, kWeightDType, kMfma,
-                          kNumWarps, kGroupN> {
+                          kNumWarps, kGroupN, kGroupM> {
     using Type = NoopBiasLayout<kNumWarps, kGroupN>;
 };
 
-template <FusedMoEDataType, FusedMoEMfmaShape, unsigned kGroupN>
+template <FusedMoEDataType, FusedMoEMfmaShape, unsigned kGroupM,
+          unsigned kGroupN>
 struct BiasMemoryLayoutSelector;
 
-template <unsigned kGroupN>
+template <unsigned kGroupM, unsigned kGroupN>
 struct BiasMemoryLayoutSelector<FusedMoEDataType::kMxFp4,
                                 FusedMoEMfmaShape::kMfmaFp816x16x32,
-                                kGroupN> {
-    using Type = typename MxFp4BiasLayout<kGroupN>::Type;
+                                kGroupM, kGroupN> {
+    using Type = typename MxFp4BiasLayout<kGroupM, kGroupN>::Type;
 };
 
-template <unsigned kGroupN>
+template <unsigned kGroupM, unsigned kGroupN>
 struct BiasMemoryLayoutSelector<FusedMoEDataType::kMxFp4,
                                 FusedMoEMfmaShape::kMfmaBf16MxFp4,
-                                kGroupN> {
-    using Type = typename MxFp4BiasLayout<kGroupN>::Type;
+                                kGroupM, kGroupN> {
+    using Type = typename MxFp4BiasLayout<kGroupM, kGroupN>::Type;
 };
 
-template <unsigned kGroupN>
+template <unsigned kGroupM, unsigned kGroupN>
 struct BiasMemoryLayoutSelector<FusedMoEDataType::kMxFp4,
                                 FusedMoEMfmaShape::kMfmaScaleFp4MxFp4,
-                                kGroupN> {
-    using Type = typename MxFp4BiasLayout<kGroupN>::Type;
+                                kGroupM, kGroupN> {
+    using Type = typename MxFp4BiasLayout<kGroupM, kGroupN>::Type;
 };
 
 template <FusedMoEDataType kWeightDType, FusedMoEMfmaShape kMfma,
-          unsigned kNumWarps, unsigned kGroupN>
+          unsigned kNumWarps, unsigned kGroupN, unsigned kGroupM>
 struct BiasLayoutSelector<FusedMoEDataType::kBf16, kWeightDType, kMfma,
-                          kNumWarps, kGroupN> {
-    using Type =
-        Bf16BiasLayout<kNumWarps, kGroupN,
-                       typename BiasMemoryLayoutSelector<
-                           kWeightDType, kMfma, kGroupN>::Type>;
+                          kNumWarps, kGroupN, kGroupM> {
+    static constexpr unsigned kWarpsM = kGroupM / 32;
+    static constexpr unsigned kWarpsN = kNumWarps / kWarpsM;
+    static constexpr unsigned kLoadGlobal = kGroupN / kWarpsN / 16;
+    using Type = Bf16BiasLayout<
+        kNumWarps, kGroupN,
+        typename BiasMemoryLayoutSelector<kWeightDType, kMfma, kGroupM,
+                                          kGroupN>::Type,
+        kLoadGlobal>;
+};
+
+template <unsigned kGroupM, unsigned kGroupN>
+struct MxFp4TileShapeSelector;
+
+template <> struct MxFp4TileShapeSelector<32, 128> {
+    static constexpr MxFp4TileShape value = MxFp4TileShape::kN128;
+};
+
+template <> struct MxFp4TileShapeSelector<32, 256> {
+    static constexpr MxFp4TileShape value = MxFp4TileShape::kN256;
+};
+
+template <> struct MxFp4TileShapeSelector<64, 256> {
+    static constexpr MxFp4TileShape value = MxFp4TileShape::kM64N256;
 };
 
 template <FusedMoEDataType kWeightDType, FusedMoEWeightOrdering kWeightOrdering,
@@ -318,13 +339,20 @@ struct ConfigSelector {
     static constexpr unsigned kInterDim = id.InterDim();
     static constexpr unsigned kTopK = kTopK_;
     static_assert(FusedMoESolutionId::IsShapeEncodable(kDim, kInterDim));
-    static constexpr unsigned kGroupM = 32;
-    static constexpr unsigned kStage1GroupN =
-        id.stages == FusedMoEStages::kTwoStage ? 128 : 256;
+    static constexpr unsigned kGroupM = id.Stage1TileM();
     static constexpr unsigned kGroupN = 256;
+    static constexpr unsigned kStage1GroupN =
+        id.stages == FusedMoEStages::kTwoStage ? id.Stage1TileN() / 2
+                                               : kGroupN;
     static constexpr unsigned kGroupDim = 256;
-    static constexpr unsigned kTokenBatch = 8;
     static constexpr unsigned kNumWarps = 4;
+    static constexpr unsigned kTokenBatch = kGroupM / kNumWarps;
+    static constexpr unsigned kStage1WarpsM = kGroupM / 32;
+    static constexpr unsigned kStage1WarpsN = kNumWarps / kStage1WarpsM;
+    static constexpr unsigned kStage2GroupM = 32;
+    static constexpr unsigned kStage2TokenBatch = 8;
+    static constexpr unsigned kStage1ToStage2GroupRatio =
+        kGroupM / kStage2GroupM;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
     static constexpr unsigned kStage2GroupInterDim = kGroupDim;
     static constexpr FusedMoEDataType kActDType = id.act_dtype;
@@ -332,9 +360,16 @@ struct ConfigSelector {
     static constexpr FusedMoEMfmaShape kMfmaShape = id.mfma;
     static constexpr bool kValidateExpertIds = false;
     static constexpr MxFp4TileShape kW13TileShape =
-        id.stages == FusedMoEStages::kTwoStage ? MxFp4TileShape::kN128
-                                               : MxFp4TileShape::kN256;
+        MxFp4TileShapeSelector<kGroupM, kStage1GroupN>::value;
     static constexpr MxFp4TileShape kW2TileShape = MxFp4TileShape::kN256;
+
+    static_assert(kGroupM == 32 ||
+                  (id.stages == FusedMoEStages::kTwoStage &&
+                   id.act_dtype == FusedMoEDataType::kMxFp4 &&
+                   id.weight_dtype == FusedMoEDataType::kMxFp4 &&
+                   id.weight_ordering == FusedMoEWeightOrdering::kNativeMxFp4 &&
+                   id.mfma == FusedMoEMfmaShape::kMfmaScaleFp4MxFp4 &&
+                   id.bias_dtype == FusedMoEDataType::kBf16));
 
     using ActivationOp =
         typename FusedMoEActivationSelector<id.activation>::Type;
@@ -345,9 +380,9 @@ struct ConfigSelector {
     using W2Weights = typename Weight::W2Weights;
     using W13 = typename W13Weights::W13;
     using W2 = typename W2Weights::W2;
-    using Bias =
-        typename BiasLayoutSelector<id.bias_dtype, id.weight_dtype, id.mfma,
-                                    kNumWarps, kStage1GroupN>::Type;
+    using Bias = typename BiasLayoutSelector<
+        id.bias_dtype, id.weight_dtype, id.mfma, kNumWarps, kStage1GroupN,
+        kGroupM>::Type;
     using Stage2Bias =
         typename BiasLayoutSelector<id.bias_dtype, id.weight_dtype, id.mfma,
                                     kNumWarps, kGroupN>::Type;

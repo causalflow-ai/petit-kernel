@@ -25,4 +25,27 @@ StoreStage1AccumulatorLds(float (&shm)[32 * kGroupN], const float4 *h,
     }
 }
 
+template <unsigned kGroupM, unsigned kGroupN, unsigned kWarpsM,
+          unsigned kWarpsN>
+__device__ void StoreStage1AccumulatorLds2D(
+    float (&shm)[kGroupM * kGroupN], const float4 *h, unsigned wid,
+    unsigned wtid) {
+    static_assert(kGroupM == 32 * kWarpsM, "each M wave covers M32");
+    static_assert(kGroupN % kWarpsN == 0, "invalid N wave partition");
+    static constexpr unsigned kWaveN = kGroupN / kWarpsN;
+    static constexpr unsigned kInputFragments = kWaveN / 8;
+    const unsigned wave_m = wid / kWarpsN;
+    const unsigned wave_n = wid % kWarpsN;
+    const unsigned row_lane = wtid % 16;
+    const unsigned col_quadrant = wtid / 16;
+#pragma unroll
+    for (unsigned fragment = 0; fragment < kInputFragments; ++fragment) {
+        const unsigned row =
+            wave_m * 32 + (fragment & 1u) * 16 + row_lane;
+        const unsigned col = wave_n * kWaveN + (fragment / 2) * 16 +
+                             col_quadrant * 4;
+        *reinterpret_cast<float4 *>(&shm[row * kGroupN + col]) = h[fragment];
+    }
+}
+
 } // namespace causalflow::petit::rocm::moe

@@ -59,6 +59,11 @@ class _FusedMoeStage1Buffering(enum.IntEnum):
     double_buffer = 1
 
 
+class _FusedMoeStage1TileShape(enum.IntEnum):
+    m32_n256 = 0
+    m64_n512 = 1
+
+
 def _make_fused_moe_base_solution_id(
     activation_type: _FusedMoeDataType | int,
     weight_type: _FusedMoeDataType | int,
@@ -95,6 +100,15 @@ def _with_fused_moe_shape(solution_id: int, dim: int, inter_dim: int) -> int:
         (int(solution_id) & ~shape_mask)
         | ((dim // 64) << 24)
         | ((inter_dim // 64) << 32)
+    )
+
+
+def _with_fused_moe_stage1_tile_shape(
+    solution_id: int, shape: _FusedMoeStage1TileShape | int
+) -> int:
+    shape_mask = 1 << 41
+    return (int(solution_id) & ~shape_mask) | (
+        (int(_FusedMoeStage1TileShape(shape)) & 0x1) << 41
     )
 
 
@@ -175,6 +189,13 @@ _FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID = _make_fused_moe_solution_id(
     _FusedMoeStage1Buffering.double_buffer,
     3072,
     3072,
+)
+
+_FUSED_MOE_TWO_STAGE_MXFP4_BIAS_M64_N512_SOLUTION_ID = (
+    _with_fused_moe_stage1_tile_shape(
+        _FUSED_MOE_TWO_STAGE_MXFP4_BIAS_SOLUTION_ID,
+        _FusedMoeStage1TileShape.m64_n512,
+    )
 )
 
 _FUSED_MOE_TWO_STAGE_MXFP4_SILU_7168X2048_SOLUTION_ID = (

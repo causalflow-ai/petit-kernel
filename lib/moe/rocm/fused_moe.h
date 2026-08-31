@@ -48,6 +48,11 @@ enum class FusedMoEStage1Buffering : unsigned {
     kDoubleBuffer,
 };
 
+// W13 names include both gate and up projections. The default local two-stage
+// tile computes M32 x (N128 gate + N128 up); the large tile computes
+// M64 x (N256 gate + N256 up) with the same four waves.
+enum class FusedMoEStage1TileShape : unsigned { kM32N256, kM64N512 };
+
 struct FusedMoESolutionId {
     FusedMoEDataType act_dtype : 4;
     FusedMoEDataType weight_dtype : 4;
@@ -93,6 +98,25 @@ struct FusedMoESolutionId {
         };
     }
 
+    constexpr FusedMoEStage1TileShape Stage1TileShape() const {
+        return static_cast<FusedMoEStage1TileShape>((Repr() >> 41) & 0x1);
+    }
+
+    constexpr unsigned Stage1TileM() const {
+        return 32u << static_cast<unsigned>(Stage1TileShape());
+    }
+
+    constexpr unsigned Stage1TileN() const {
+        return 256u << static_cast<unsigned>(Stage1TileShape());
+    }
+
+    constexpr FusedMoESolutionId
+    WithStage1TileShape(FusedMoEStage1TileShape shape) const {
+        constexpr unsigned long kMask = 1ul << 41;
+        return FromRepr((Repr() & ~kMask) |
+                        (static_cast<unsigned long>(shape) << 41));
+    }
+
     constexpr unsigned long Repr() const {
         return (static_cast<unsigned long>(act_dtype) << 0) |
                (static_cast<unsigned long>(weight_dtype) << 4) |
@@ -103,7 +127,8 @@ struct FusedMoESolutionId {
                (static_cast<unsigned long>(activation) << 20) |
                (static_cast<unsigned long>(stage1_buffering) << 23) |
                (static_cast<unsigned long>(dim_div64) << 24) |
-               (static_cast<unsigned long>(inter_dim_div64) << 32);
+               (static_cast<unsigned long>(inter_dim_div64) << 32) |
+               (static_cast<unsigned long>(padding) << 40);
     }
 
     static constexpr FusedMoESolutionId FromRepr(unsigned long repr) {
@@ -118,7 +143,7 @@ struct FusedMoESolutionId {
             static_cast<FusedMoEStage1Buffering>((repr >> 23) & 0x1),
             (repr >> 24) & 0xff,
             (repr >> 32) & 0xff,
-            0,
+            (repr >> 40) & 0xffffff,
         };
     }
 

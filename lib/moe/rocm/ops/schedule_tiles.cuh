@@ -12,8 +12,9 @@ template <class Weight> struct MxFp4Tile {
     uint4 value[2][Weight::kLoadGlobal];
     unsigned scale[Weight::kLoadGlobal / 2];
 
-    static_assert(Weight::kLoadGlobal == 2 || Weight::kLoadGlobal == 4,
-                  "MXFP4 tiles require two or four N16 fragments");
+    static_assert(Weight::kLoadGlobal == 2 || Weight::kLoadGlobal == 4 ||
+                      Weight::kLoadGlobal == 8,
+                  "MXFP4 tiles require two, four, or eight N16 fragments");
 };
 
 template <class Config_, class Weight_> struct BlockScaleFp8TileOps {
@@ -209,7 +210,7 @@ template <class Config_, class Weight_> struct NativeMxFp4TileOps {
     using Config = Config_;
     using Weight = Weight_;
     using Input = typename Config::Input;
-    static constexpr unsigned kWaveTileN = Weight::kGroupN / Config::kNumWarps;
+    static constexpr unsigned kWaveTileN = Weight::kWaveTileN;
     using MatmulOp = NativeMxFp4Matmul<kWaveTileN>;
     using CShuffle = BlockedVectorRowMajorCShuffle;
 

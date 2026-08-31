@@ -87,7 +87,8 @@ template <class Config_, class Epilogue_> struct FusedMoEStage1 {
     using Stage1Op = typename Config::Stage1Op;
     using TokenMetadata = unsigned[kThreads];
 
-    static_assert(kRoutesPerBlock == 32, "token metadata cache expects M32");
+    static_assert(kRoutesPerBlock == 32 || kRoutesPerBlock == 64,
+                  "token metadata cache expects M32 or M64");
 
     struct ShmBuf {
         union {

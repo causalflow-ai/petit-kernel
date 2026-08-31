@@ -3,6 +3,7 @@
 #include "gemm/rocm/quantization/types.h"
 #include "moe/rocm/fused_moe.h"
 #include "moe/rocm/fused_moe_test_utils.h"
+#include "moe/rocm/ops/mxfp4_activation.cuh"
 #include "utils/hip_helper.h"
 
 #include <gtest/gtest.h>
@@ -62,6 +63,12 @@ static constexpr FusedMoESolutionId kTwoStageMxFp4BiasSolutionId =
         FusedMoEMfmaShape::kMfmaScaleFp4MxFp4, FusedMoEStages::kTwoStage,
         FusedMoEActivationFunction::kOpenAISwiGLU,
         FusedMoEStage1Buffering::kDoubleBuffer, 3072, 3072);
+static constexpr FusedMoESolutionId kTwoStageMxFp4BiasNonTemporalSolutionId =
+    kTwoStageMxFp4BiasSolutionId.WithWeightLoadPolicy(
+        FusedMoEWeightLoadPolicy::kNonTemporal);
+static constexpr FusedMoESolutionId kTwoStageMxFp4BiasM64N512SolutionId =
+    kTwoStageMxFp4BiasSolutionId.WithStage1TileShape(
+        FusedMoEStage1TileShape::kM64N512);
 
 static constexpr FusedMoESolutionId kTwoStageMxFp4Silu7168x2048SolutionId =
     FusedMoESolutionId::Make(
@@ -70,6 +77,10 @@ static constexpr FusedMoESolutionId kTwoStageMxFp4Silu7168x2048SolutionId =
         FusedMoEMfmaShape::kMfmaScaleFp4MxFp4, FusedMoEStages::kTwoStage,
         FusedMoEActivationFunction::kSiluDot,
         FusedMoEStage1Buffering::kDoubleBuffer, 7168, 2048);
+static constexpr FusedMoESolutionId
+    kTwoStageMxFp4Silu7168x2048NonTemporalSolutionId =
+        kTwoStageMxFp4Silu7168x2048SolutionId.WithWeightLoadPolicy(
+            FusedMoEWeightLoadPolicy::kNonTemporal);
 
 static constexpr FusedMoESolutionId kTwoStageMxFp4Silu7168x3072SolutionId =
     FusedMoESolutionId::Make(
@@ -78,6 +89,10 @@ static constexpr FusedMoESolutionId kTwoStageMxFp4Silu7168x3072SolutionId =
         FusedMoEMfmaShape::kMfmaScaleFp4MxFp4, FusedMoEStages::kTwoStage,
         FusedMoEActivationFunction::kSiluDot,
         FusedMoEStage1Buffering::kDoubleBuffer, 7168, 3072);
+static constexpr FusedMoESolutionId
+    kTwoStageMxFp4Silu7168x3072NonTemporalSolutionId =
+        kTwoStageMxFp4Silu7168x3072SolutionId.WithWeightLoadPolicy(
+            FusedMoEWeightLoadPolicy::kNonTemporal);
 
 template <unsigned kTokens_, unsigned kDim_, unsigned kInterDim_,
           unsigned kExperts_, unsigned kTopK_>
@@ -219,6 +234,10 @@ struct Fp8InputMxFp4BiasConfig<ReplayLikeSensitiveConfig>
 
 struct GptOssHiddenConfig : TestConfig<17, 3072, 4096, 32, 4> {};
 struct TwoStageGptOssConfig : TestConfig<16, 3072, 3072, 4, 4> {};
+struct TwoStageGptOssM64Config : TestConfig<16, 3072, 3072, 4, 4> {
+    static constexpr unsigned kSortedTokenPadding = 64;
+};
+struct TwoStageGptOssCachedConfig : TestConfig<64, 3072, 3072, 4, 4> {};
 struct TwoStageDeepSeekV3Config : TestConfig<8, 7168, 2048, 9, 9> {};
 struct TwoStageDeepSeekV3RoutedConfig : TestConfig<8, 7168, 2048, 8, 8> {};
 struct TwoStageDeepSeekV4Config : TestConfig<8, 7168, 3072, 7, 7> {};
@@ -249,7 +268,8 @@ struct DeviceContext : public moe_test::ReferenceDeviceContext<Config> {
                                         kMxScaleGroup];
     alignas(16) unsigned char q_mx_act[kTokens * kDim / 2];
     alignas(16) unsigned char scale_mx_act[kTokens * kDim / kMxScaleGroup];
-    alignas(16) unsigned char scale_mx_act_sorted[kMaxNumMBlocks * kDim];
+    alignas(16) unsigned char
+        scale_mx_act_sorted[kMaxNumMBlocks * (kSortedTokenPadding / 32) * kDim];
 };
 
 fp8_sampler::FP8E4M3Format CurrentDeviceFp8Format() {
@@ -296,11 +316,11 @@ template <class Context> void GenerateNativeMxFp4Activations(Context *ctx) {
 
 template <class Context>
 __global__ void PackAiterSortedMxFp4ActivationScalesKernel(Context *ctx) {
-    constexpr unsigned kRoutesPerGroup = Context::kSortedTokenPadding;
+    constexpr unsigned kRoutesPerGroup = 32;
     constexpr unsigned kScaleColsPerK256 = 8;
     constexpr unsigned kRowsPerHalf = 16;
     constexpr unsigned kColsPerHalf = 4;
-    static_assert(kRoutesPerGroup == 32, "");
+    static_assert(Context::kSortedTokenPadding % kRoutesPerGroup == 0, "");
     static_assert(Context::kMxScaleGroup == 32, "");
     static_assert(
         Context::kDim % (Context::kMxScaleGroup * kScaleColsPerK256) == 0, "");
@@ -355,11 +375,11 @@ void PackAiterSortedMxFp4ActivationScales(Context *d_ctx) {
     constexpr unsigned kScaleColsPerK256 = 8;
     constexpr unsigned kScaleBlocksPerRouteGroup =
         Context::kDim / (Context::kMxScaleGroup * kScaleColsPerK256);
-    constexpr unsigned kTileBytes =
-        Context::kSortedTokenPadding * kScaleColsPerK256;
+    constexpr unsigned kTileBytes = 32 * kScaleColsPerK256;
     static_assert(kTileBytes == 256, "");
 
-    dim3 grid(Context::kMaxNumMBlocks, kScaleBlocksPerRouteGroup);
+    dim3 grid(Context::kMaxNumMBlocks * Context::kSortedTokenPadding / 32,
+              kScaleBlocksPerRouteGroup);
     PackAiterSortedMxFp4ActivationScalesKernel<Context>
         <<<grid, dim3(4, 16, 4)>>>(d_ctx);
     CheckHIPStatus(hipGetLastError());
@@ -1074,7 +1094,19 @@ TEST_F(FusedMoEMxFp4Test, TwoStageGptOssShapeMatchesReference) {
     if (!SupportsNativeScaleFp4()) {
         GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
     }
-    NativeInputMxFp4Runner<TwoStageGptOssConfig> runner(true);
+    NativeInputMxFp4Runner<
+        TwoStageGptOssConfig, true,
+        kTwoStageMxFp4BiasNonTemporalSolutionId.Repr()>
+        runner(true);
+    runner.Initialize();
+    runner.RunTest();
+}
+
+TEST_F(FusedMoEMxFp4Test, TwoStageGptOssCachedWeightsMatchReference) {
+    if (!SupportsNativeScaleFp4()) {
+        GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
+    }
+    NativeInputMxFp4Runner<TwoStageGptOssCachedConfig> runner(true);
     runner.Initialize();
     runner.RunTest();
 }
@@ -1085,7 +1117,7 @@ TEST_F(FusedMoEMxFp4Test, TwoStageDeepSeekV3ShapeMatchesReference) {
     }
     NativeInputMxFp4Runner<
         TwoStageDeepSeekV3Config, true,
-        kTwoStageMxFp4Silu7168x2048SolutionId.Repr()>
+        kTwoStageMxFp4Silu7168x2048NonTemporalSolutionId.Repr()>
         runner(true);
     runner.Initialize();
     runner.RunTest();
@@ -1122,7 +1154,7 @@ TEST_F(FusedMoEMxFp4Test, TwoStageDeepSeekV4ShapeMatchesReference) {
     }
     NativeInputMxFp4Runner<
         TwoStageDeepSeekV4Config, true,
-        kTwoStageMxFp4Silu7168x3072SolutionId.Repr()>
+        kTwoStageMxFp4Silu7168x3072NonTemporalSolutionId.Repr()>
         runner(true);
     runner.Initialize();
     runner.RunTest();
@@ -1178,6 +1210,76 @@ TEST(MxFp4BiasLayout, PythonPermutationMatchesMxFp4DeviceRepack) {
     CheckHIPStatus(hipFree(d_logical));
 }
 
+TEST(MxFp4ActivationLayout, CooperativeScaleLoadsReconstructMfmaWords) {
+    using Layout = MxFp4ActivationLayout;
+    static constexpr unsigned kRows = 64;
+    static constexpr unsigned kInterDim = 512;
+    static constexpr unsigned kScaleCols = Layout::ScaleCols(kInterDim);
+    static constexpr unsigned kK256Tiles = kInterDim / 256;
+    std::vector<unsigned char> scales(Layout::ScaleBytes(kRows, kInterDim));
+    std::vector<unsigned char> packed_scales(scales.size());
+
+    const auto packed_offset = [](unsigned row, unsigned col) {
+        const unsigned d0 = row >> 5;
+        const unsigned d1 = (row >> 4) & 1u;
+        const unsigned d2 = row & 15u;
+        const unsigned d3 = col >> 3;
+        const unsigned d4 = (col >> 2) & 1u;
+        const unsigned d5 = col & 3u;
+        return d0 * kScaleCols * 32 + d3 * 256 + d5 * 64 + d2 * 4 +
+               d4 * 2 + d1;
+    };
+
+    for (unsigned row = 0; row < kRows; ++row) {
+        for (unsigned col = 0; col < kScaleCols; ++col) {
+            const auto value = static_cast<unsigned char>(row * 19 + col * 7);
+            scales[Layout::ScaleOffset(row, col, kScaleCols)] = value;
+            packed_scales[packed_offset(row, col)] = value;
+        }
+    }
+
+    for (unsigned route_group = 0; route_group < kRows / 32;
+         ++route_group) {
+        const unsigned row_base = route_group * 32;
+        for (unsigned tile_k = 0; tile_k < kK256Tiles; ++tile_k) {
+            unsigned loaded_words[64];
+            for (unsigned lane = 0; lane < 64; ++lane) {
+                const unsigned load_row = lane & 31u;
+                const unsigned load_col = tile_k * 8 + (lane >> 5) * 4;
+                const unsigned offset = Layout::ScaleOffset(
+                    row_base + load_row, load_col, kScaleCols);
+                loaded_words[lane] =
+                    static_cast<unsigned>(scales[offset]) |
+                    (static_cast<unsigned>(scales[offset + 1]) << 8) |
+                    (static_cast<unsigned>(scales[offset + 2]) << 16) |
+                    (static_cast<unsigned>(scales[offset + 3]) << 24);
+            }
+            for (unsigned lane = 0; lane < 64; ++lane) {
+                const unsigned row16 = lane & 15u;
+                const unsigned scale4 = lane >> 4;
+                const unsigned shift = scale4 * 8;
+                const auto extract = [&](unsigned source_lane) {
+                    return (loaded_words[source_lane] >> shift) & 0xffu;
+                };
+                const unsigned actual = extract(row16) |
+                                        (extract(row16 + 16) << 8) |
+                                        (extract(row16 + 32) << 16) |
+                                        (extract(row16 + 48) << 24);
+                const unsigned word =
+                    (route_group * kK256Tiles * 64 + tile_k * 64 + lane) * 4;
+                const unsigned expected =
+                    static_cast<unsigned>(packed_scales[word]) |
+                    (static_cast<unsigned>(packed_scales[word + 1]) << 8) |
+                    (static_cast<unsigned>(packed_scales[word + 2]) << 16) |
+                    (static_cast<unsigned>(packed_scales[word + 3]) << 24);
+                EXPECT_EQ(actual, expected)
+                    << "route_group=" << route_group << " tile_k=" << tile_k
+                    << " lane=" << lane;
+            }
+        }
+    }
+}
+
 void ValidateGptOssOneAndTwoStageBias(bool use_w13_bias, bool use_w2_bias) {
     NativeInputMxFp4Runner<TwoStageGptOssConfig> one_stage(false, use_w13_bias,
                                                            use_w2_bias);
@@ -1207,6 +1309,18 @@ TEST_F(FusedMoEMxFp4Test, GptOssW2BiasOneAndTwoStageMatchReference) {
         GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
     }
     ValidateGptOssOneAndTwoStageBias(false, true);
+}
+
+TEST_F(FusedMoEMxFp4Test, GptOssM64N512TwoStageMatchesReference) {
+    if (!SupportsNativeScaleFp4()) {
+        GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
+    }
+    NativeInputMxFp4Runner<
+        TwoStageGptOssM64Config, false,
+        kTwoStageMxFp4BiasM64N512SolutionId.Repr()>
+        runner(true, true, true);
+    runner.Initialize();
+    runner.RunTest();
 }
 
 TEST_F(FusedMoEMxFp4Test, BiasedGptOssOneAndTwoStageMatchReference) {

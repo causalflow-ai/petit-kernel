@@ -291,7 +291,7 @@ template <class TileSchedule> struct TwoStageStage2Epilogue {
     using BiasPrefetch = typename AccumulatorEpilogue::BiasPrefetch;
     static constexpr unsigned kAccumFragments = TileSchedule::kAccumFragments;
     static constexpr unsigned kNumWarps = 4;
-    static constexpr unsigned kTokenBatch = Config::kTokenBatch;
+    static constexpr unsigned kTokenBatch = Config::kStage2TokenBatch;
     static constexpr unsigned kTileRows = kTokenBatch * kNumWarps;
     static constexpr unsigned kTileCols = Config::kGroupN;
 
@@ -300,6 +300,8 @@ template <class TileSchedule> struct TwoStageStage2Epilogue {
         unsigned output_row_offsets[kTileRows];
     };
 
+    static_assert(kTileRows == Config::kStage2GroupM,
+                  "two-stage C-shuffle row geometry mismatch");
     static_assert(kTileRows == 32, "two-stage C-shuffle expects M32");
     static_assert(kTileCols == 256, "two-stage C-shuffle expects N256");
     static_assert(kAccumFragments == 8,

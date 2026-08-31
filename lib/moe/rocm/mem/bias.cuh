@@ -10,9 +10,9 @@ namespace causalflow::petit::rocm::moe {
 // MXFP4 bias access differs only in the mapping from [fragment, lane quarter,
 // wave] to the packed BF16 vector. Keep that mapping as a TAL layout rather
 // than encoding it in separate access classes.
-template <unsigned kGroupN> struct MxFp4BiasLayout;
+template <unsigned kGroupM, unsigned kGroupN> struct MxFp4BiasLayout;
 
-template <> struct MxFp4BiasLayout<128> {
+template <> struct MxFp4BiasLayout<32, 128> {
     // An N128 tile assigns N32 to each wave. Decomposing the wave coordinate
     // maps the two waves in a pair into one packed N64 slice.
     using Type = tal::Layout<
@@ -21,10 +21,22 @@ template <> struct MxFp4BiasLayout<128> {
                     tal::Stride<tal::_8, tal::C<64>>>>;
 };
 
-template <> struct MxFp4BiasLayout<256> {
+template <> struct MxFp4BiasLayout<32, 256> {
     using Type = tal::Layout<tal::Shape<tal::_4, tal::_4, tal::_4>,
                              tal::Stride<tal::_4, tal::_16, tal::C<64>>>;
 };
+
+// The M64/N512 W13 tile uses a 2x2 wave grid.  The two M waves load the same
+// N256 bias tile, while each N wave owns N128 (eight N16 fragments).
+template <> struct MxFp4BiasLayout<64, 256> {
+    using Type =
+        tal::Layout<tal::Shape<tal::Shape<tal::_4, tal::_2>, tal::_4,
+                               tal::Shape<tal::_2, tal::_2>>,
+                    tal::Stride<tal::Stride<tal::_4, tal::C<64>>, tal::_16,
+                                tal::Stride<tal::C<128>, tal::_0>>>;
+};
+
+using MxFp4BiasLayoutM64N256 = typename MxFp4BiasLayout<64, 256>::Type;
 
 template <class Layout_> struct Bf16BiasAccess {
     using Layout = Layout_;
@@ -59,12 +71,13 @@ __device__ inline float4 Bf16BiasToFloat(uint2 packed) {
     return float4{lo.x, lo.y, hi.x, hi.y};
 }
 
-template <unsigned kNumWarps_, unsigned kGroupN_, class MemoryLayout_>
+template <unsigned kNumWarps_, unsigned kGroupN_, class MemoryLayout_,
+          unsigned kLoadGlobal_ = kGroupN_ / 64>
 struct Bf16BiasLayout {
     static constexpr unsigned kGroupN = kGroupN_;
     static constexpr unsigned kNumWarps = kNumWarps_;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
-    static constexpr unsigned kLoadGlobal = kGroupN / 64;
+    static constexpr unsigned kLoadGlobal = kLoadGlobal_;
     static constexpr unsigned kElementBytes = sizeof(__hip_bfloat16);
     static constexpr unsigned kPackedTileElements = 256;
     using Access = Bf16BiasAccess<MemoryLayout_>;

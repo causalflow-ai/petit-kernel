@@ -217,6 +217,10 @@ static const std::unordered_map<unsigned long, TwoStageRegistration>
         std::unordered_map<unsigned long, TwoStageRegistration> calls;
         RegisterTwoStageShape<kFusedMoETwoStageMxFp4BiasSolutionId, 3072,
                               3072, 4>(calls);
+        RegisterTwoStageShape<
+            kFusedMoETwoStageMxFp4BiasSolutionId.WithStage1TileShape(
+                FusedMoEStage1TileShape::kM64N512),
+            3072, 3072, 4>(calls);
         RegisterTwoStageShapeEitherTopK<
             kFusedMoETwoStageMxFp4SiluSolutionId, 7168, 2048, 8, 9>(calls);
         RegisterTwoStageShape<kFusedMoETwoStageMxFp4SiluSolutionId, 7168, 3072,
