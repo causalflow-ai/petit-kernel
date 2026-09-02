@@ -165,7 +165,10 @@ struct MegaMoETwoStageCommComputeKernel {
                 }
             }
             __syncthreads();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+            // Stage-1 applies device scope directly to every protected value
+            // and scale load, avoiding a whole-cache acquire invalidation for
+            // each independently scheduled N tile.
+            asm volatile("" ::: "memory");
             __syncthreads();
         }
     }
@@ -301,10 +304,11 @@ struct MegaMoETwoStageCommComputeKernel {
 #pragma unroll
         for (unsigned tile_k = 0; tile_k < kK256Tiles; ++tile_k) {
             const unsigned stage = tile_k & 1u;
-            // Apply coherence only to the payload and scale lines protected by
-            // the arrival mask instead of invalidating the entire cache.
+            // Stage 1 stores and consumes the rank-local intermediate at
+            // device scope. The producer completes those stores before its
+            // arrival atomic, so these loads need no cache-wide acquire.
             const auto prefetched = Stage2Input::template LoadTile<
-                BufferResource::kSC0Bit | BufferResource::kSC1Bit>(
+                BufferResource::kSC1Bit>(
                 workspace.br_, value_voffset, value_soffset, scale_voffset,
                 scale_soffset, tile_k, true, wtid);
             Stage2Input::StoreLds(shm.compute.input, prefetched.value, stage,

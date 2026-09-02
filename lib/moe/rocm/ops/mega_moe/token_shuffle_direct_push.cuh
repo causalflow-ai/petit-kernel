@@ -31,10 +31,15 @@ struct DirectPushTokenShuffle {
     static constexpr unsigned kRowVecs =
         Config::kInputTokenBytes / sizeof(uint4);
     static constexpr unsigned kWorkShards = 8;
-    // The caller selects a producer geometry before launch. Capping it by the
-    // number of payload tasks preserves small-expert configurations.
+    // Python selects a registered producer geometry from the token bucket.
+    // Capping it by the number of payload tasks preserves the E32 behavior.
     static constexpr unsigned kProducerBlocks = Config::kProducerBlocks;
-    static constexpr unsigned kPeerCoherent =
+    // Peer-written plans and route lists reside in this GPU's symmetric-heap
+    // slice. Device-scoped loads bypass stale CU/non-coherent cache lines
+    // without also bypassing the system-coherent cache.
+    static constexpr unsigned kPeerCoherent = BufferResource::kSC1Bit;
+    static constexpr unsigned kDeviceStore = BufferResource::kSC1Bit;
+    static constexpr unsigned kSystemStore =
         BufferResource::kSC0Bit | BufferResource::kSC1Bit;
     static_assert(kTopK > 0 && kTopK <= kWarpSize);
     static_assert(kNumRanks == 2 || kNumRanks == 4 || kNumRanks == 8,
@@ -92,8 +97,8 @@ struct DirectPushTokenShuffle {
         const bool owner = block == 0;
 
         if (owner) {
-            AdmitLaunch(tid, wid, wtid, epoch);
-            PopulateSendCounters(tid, wid, wtid, parity, expected);
+            AdmitLaunch(tid, epoch);
+            PopulateSendCounters(tid, parity, expected);
             BuildDestinationPlan(tid, wid, wtid, parity, expected);
         } else if (block <= kProducerBlocks) {
             WaitForOwnerAdmission(epoch, tid);
@@ -152,7 +157,6 @@ struct DirectPushTokenShuffle {
                                                       epoch & 1,
                                                       workspace_->Rank()),
                 static_cast<std::int32_t>(Expected(epoch)));
-            agent_fence_acquire();
         }
         __syncthreads();
     }
@@ -201,39 +205,38 @@ struct DirectPushTokenShuffle {
         return ((epoch + 1) / 2) * kNumRanks;
     }
 
+    template <unsigned kStoreScope>
     TAL_DEVICE void StoreParityValue(unsigned offset, unsigned parity,
                                      unsigned value) const {
-        workspace_->br_.template StoreU32<BufferResource::kNone>(
-            offset + parity * sizeof(unsigned), 0, value);
+        workspace_->br_.template StoreU32<kStoreScope>(
+            offset, parity * sizeof(unsigned), value);
     }
 
     TAL_DEVICE unsigned LoadParityValue(unsigned offset,
                                         unsigned parity) const {
-        return workspace_->br_.template LoadU32<BufferResource::kNone>(
-            offset + parity * sizeof(unsigned), 0);
+        return workspace_->br_.template LoadU32<kPeerCoherent>(
+            offset, parity * sizeof(unsigned));
     }
 
-    TAL_DEVICE void AdmitLaunch(unsigned tid, unsigned wid, unsigned wtid,
-                                unsigned epoch) {
+    TAL_DEVICE void AdmitLaunch(unsigned tid, unsigned epoch) {
         // A rank may enter the next invocation while a peer is still leaving
         // the previous one.  Admit every peer before reusing the selected
         // parity through a launch-ready handshake.
-        if (wid == 0) {
-            if (wtid < kNumRanks) {
-                const unsigned peer =
-                    (workspace_->Rank() + wtid) % kNumRanks;
-                store_xgpu_epoch_release(
-                    *workspace_,
-                    workspace_->DirectPushLaunchReadyOffset(
-                        peer, workspace_->Rank()),
-                    epoch);
-                wait_xgpu_epoch_relaxed(
-                    *workspace_,
-                    workspace_->DirectPushLaunchReadyOffset(
-                        workspace_->Rank(), peer),
-                    epoch);
-                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-            }
+        if (tid < kNumRanks) {
+            const unsigned peer =
+                (workspace_->Rank() + tid) % kNumRanks;
+            // Admission is control-only: the selected parity is not reused
+            // until every peer has reached this epoch.
+            store_xgpu_epoch_relaxed(
+                *workspace_,
+                workspace_->DirectPushLaunchReadyOffset(
+                    peer, workspace_->Rank()),
+                epoch);
+            wait_xgpu_epoch_relaxed(
+                *workspace_,
+                workspace_->DirectPushLaunchReadyOffset(
+                    workspace_->Rank(), peer),
+                epoch);
         }
         __syncthreads();
     }
@@ -244,7 +247,6 @@ struct DirectPushTokenShuffle {
                 *workspace_,
                 workspace_->DirectPushEpochGateOffset(workspace_->Rank()),
                 static_cast<std::int32_t>(epoch));
-            agent_fence_acquire();
         }
         __syncthreads();
     }
@@ -272,7 +274,7 @@ struct DirectPushTokenShuffle {
                         source_row + vec * sizeof(uint4), 0);
                 }
             }();
-            workspace_->br_.template Store<BufferResource::kNone>(
+            workspace_->br_.template Store<kSystemStore>(
                 destination_row + vec * sizeof(uint4), 0, value);
         }
         if (header_owner) {
@@ -288,57 +290,63 @@ struct DirectPushTokenShuffle {
                         route * sizeof(float),
                     0);
             }
-            workspace_->br_.template StoreU32<BufferResource::kNone>(
+            workspace_->br_.template StoreU32<kSystemStore>(
                 workspace_->L1TokenWeightsOffset(destination, pool_index), 0,
                 weight);
             const TokenMetadata metadata{route, workspace_->Rank()};
-            workspace_->br_.template StoreU64<BufferResource::kNone>(
+            workspace_->br_.template StoreU64<kSystemStore>(
                 workspace_->TokenMetadataOffset(destination, pool_index), 0,
                 __builtin_bit_cast(uint2, metadata));
         }
     }
 
-    TAL_DEVICE void PopulateSendCounters(unsigned tid, unsigned wid,
-                                         unsigned wtid, unsigned parity,
+    TAL_DEVICE void PopulateSendCounters(unsigned tid, unsigned parity,
                                          unsigned expected) {
         Common::ClearExpertCounts(shm_->expert_count, tid);
 
         const unsigned route_count = num_tokens_ * kTopK;
         for (unsigned route = tid; route < route_count; route += kThreads) {
             const unsigned expert = LoadInputExpert(route);
-            if (expert < kNumExperts)
-                atomicAdd(shm_->expert_count + expert, 1);
+            atomicAdd(GetConditionShmPtr(shm_->expert_count + expert,
+                                         expert < kNumExperts),
+                      1);
         }
         __syncthreads();
 
-        for (unsigned expert = tid; expert < kNumExperts; expert += kThreads) {
-            const unsigned count = shm_->expert_count[expert];
-            StoreParityValue(
-                workspace_->SendCounterOffset(workspace_->Rank(), expert),
-                parity, count);
-            StoreParityValue(
-                workspace_->RecvCounterOffset(
-                    expert / kExpertsPerRank, workspace_->Rank(),
-                    expert % kExpertsPerRank),
-                parity, count);
-            shm_->expert_count[expert] = 0;
+        constexpr unsigned kIterations =
+            tal::CeilingDiv(kNumExperts, kThreads);
+#pragma unroll
+        for (unsigned i = 0; i < kIterations; ++i) {
+            const unsigned expert = tid + i * kThreads;
+            if (expert < kNumExperts) {
+                const unsigned count = shm_->expert_count[expert];
+                StoreParityValue<kDeviceStore>(
+                    workspace_->SendCounterOffset(workspace_->Rank(), expert),
+                    parity, count);
+                StoreParityValue<kSystemStore>(
+                    workspace_->RecvCounterOffset(
+                        expert / kExpertsPerRank, workspace_->Rank(),
+                        expert % kExpertsPerRank),
+                    parity, count);
+                shm_->expert_count[expert] = 0;
+            }
         }
-        amdgcn_s_waitcnt<0, -1, 0>();
-        // Publish the transposed counts before grouping. This lets wave 0
-        // consume peer counts and build the destination plan while the other
-        // waves build the source route order in the same CTA.
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        // Counts use system-scoped stores because the transposed half is
+        // peer-owned. Complete those stores before joining the CTA; scoped
+        // stores avoid a cache-wide system writeback here.
+        complete_scoped_vmem();
         __syncthreads();
-        if (wid == 0 && wtid < kNumRanks) {
+        if (tid < kNumRanks) {
             const unsigned destination =
-                (workspace_->Rank() + wtid) % kNumRanks;
-            store_xgpu_epoch_release(
+                (workspace_->Rank() + tid) % kNumRanks;
+            // The CTA join above gathers every completed count writer; the
+            // coherent signal store publishes that completed edge.
+            store_xgpu_epoch_relaxed(
                 *workspace_,
                 workspace_->DirectPushCountDoneOffset(
                     destination, parity, workspace_->Rank()),
                 expected);
         }
-        amdgcn_s_waitcnt<0, -1, 0>();
     }
 
     TAL_DEVICE void BuildDestinationPlan(unsigned tid, unsigned wid,
@@ -348,12 +356,15 @@ struct DirectPushTokenShuffle {
         // Stage 1 and stage 2 use separate cache-line-spaced work heads so
         // their kernels can be launched independently without an intervening
         // reset kernel.
-        if (tid < 2 * kWorkShards) {
-            const unsigned set = tid / kWorkShards;
-            const unsigned shard = tid % kWorkShards;
-            workspace_->br_.template StoreU32<BufferResource::kNone>(
-                workspace_->DirectPushWorkHeadOffset(shard, set), 0, 0);
-        }
+        BufferResource work_heads = workspace_->br_;
+        const unsigned work_head_base =
+            workspace_->DirectPushWorkHeadOffset(0, 0);
+        const unsigned work_head_stride =
+            workspace_->DirectPushWorkHeadOffset(1, 0) - work_head_base;
+        work_heads.v.ptr += work_head_base;
+        work_heads.v.range = 2 * kWorkShards * work_head_stride;
+        work_heads.template StoreU32<kDeviceStore>(
+            tid * work_head_stride, 0, 0);
 
         // Wave 0 owns the destination plan while the remaining waves
         // concurrently build the source route order.
@@ -365,7 +376,9 @@ struct DirectPushTokenShuffle {
                         workspace_->Rank(), parity, wtid),
                     static_cast<std::int32_t>(expected));
             }
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+            // Count loads below are device-scoped, so they cannot reuse stale
+            // local cache lines after the peer signal has been observed.
+            asm volatile("" ::: "memory");
 
             const bool valid_expert = wtid < kExpertsPerRank;
             unsigned total = 0;
@@ -388,14 +401,14 @@ struct DirectPushTokenShuffle {
             const unsigned pool_base = inclusive - padded;
 
             if (valid_expert) {
-                workspace_->br_.template StoreU64<BufferResource::kNone>(
+                workspace_->br_.template StoreU64<kDeviceStore>(
                     workspace_->RecvSumCounterOffset(workspace_->Rank(),
                                                      wtid),
                     0, {total, kNumSMs * kNumRanks});
 
                 unsigned source_prefix = 0;
                 for (unsigned source = 0; source < kNumRanks; ++source) {
-                    StoreParityValue(
+                    StoreParityValue<kSystemStore>(
                         workspace_->DirectPushPlanBaseOffset(
                             source, workspace_->Rank(), wtid),
                         parity, pool_base + source_prefix);
@@ -414,11 +427,11 @@ struct DirectPushTokenShuffle {
             for (unsigned block = wtid;
                  block < pool_rows / kSortedTokenBlock;
                  block += kWarpSize) {
-                workspace_->br_.template StoreU32<BufferResource::kNone>(
+                workspace_->br_.template StoreU32<kDeviceStore>(
                     workspace_->L1PayloadArrivalMaskOffset(
                         workspace_->Rank(), block),
                     0, 0);
-                workspace_->br_.template StoreU32<BufferResource::kNone>(
+                workspace_->br_.template StoreU32<kDeviceStore>(
                     workspace_->L2ArrivalMaskOffset(block), 0, 0);
             }
         } else {
@@ -433,7 +446,7 @@ struct DirectPushTokenShuffle {
                 if (expert < kNumExperts) {
                     const unsigned ordinal =
                         atomicAdd(shm_->expert_count + expert, 1);
-                    workspace_->br_.template StoreU32<BufferResource::kNone>(
+                    workspace_->br_.template StoreU32<kDeviceStore>(
                         workspace_->RecvTokenOffset(
                             workspace_->Rank(), expert / kExpertsPerRank,
                             expert % kExpertsPerRank, ordinal),
@@ -441,26 +454,24 @@ struct DirectPushTokenShuffle {
                 }
             }
         }
-        amdgcn_s_waitcnt<0, -1, 0>();
-        // Every planner lane releases its plan, route-list, or cleanup stores
-        // before wave 0 publishes the dependencies that admit producers and
-        // compute CTAs.
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        // Plan records use system scope; rank-local work heads, route lists,
+        // counters, and cleanup stores use device scope. Complete them before
+        // the CTA join and publication without writing back unrelated L2.
+        complete_scoped_vmem();
         __syncthreads();
-        if (wid == 0 && wtid < kNumRanks) {
-            store_xgpu_epoch_release(
+        if (tid < kNumRanks) {
+            store_xgpu_epoch_relaxed(
                 *workspace_,
                 workspace_->DirectPushPlanReadyOffset(
-                    wtid, parity, workspace_->Rank()),
+                    tid, parity, workspace_->Rank()),
                 expected);
         }
         if (tid == 0) {
-            store_xgpu_epoch_release(
+            store_xgpu_epoch_relaxed(
                 *workspace_,
                 workspace_->DirectPushEpochGateOffset(workspace_->Rank()),
                 current_epoch_);
         }
-        amdgcn_s_waitcnt<0, -1, 0>();
         __syncthreads();
     }
 
@@ -480,7 +491,6 @@ struct DirectPushTokenShuffle {
                 workspace_->DirectPushPlanReadyOffset(
                     workspace_->Rank(), parity, destination),
                 static_cast<std::int32_t>(expected));
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
         }
         __syncthreads();
 
@@ -598,8 +608,9 @@ struct DirectPushTokenShuffle {
                                kThreads, tid == 0);
             }
         }
-        amdgcn_s_waitcnt<0, -1, 0>();
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        // Payload rows use system-scoped stores into the destination rank.
+        // Complete every wave's stores before thread 0 publishes arrival bits.
+        complete_scoped_vmem();
         __syncthreads();
         if (tid == 0) {
             // Publish exactly the rows contributed by this producer
@@ -629,7 +640,6 @@ struct DirectPushTokenShuffle {
                         0, high_mask & ~low_mask);
             }
         }
-        amdgcn_s_waitcnt<0, -1, 0>();
         __syncthreads();
     }
 
