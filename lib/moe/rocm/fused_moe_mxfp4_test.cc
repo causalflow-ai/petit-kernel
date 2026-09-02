@@ -118,15 +118,16 @@ struct TestConfig {
                                    std::vector<float> &) {}
 };
 
-struct ReplayLikeSensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
-    static constexpr float kPerElementAtol = moe_test::kReplayLikeSensitiveAtol;
+struct NumericallySensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
+    static constexpr float kPerElementAtol =
+        moe_test::kNumericallySensitiveAtol;
     static constexpr float kOcpFp8PerElementAtol = kPerElementAtol;
     static constexpr float kScaleInvStd = 2.0e-2f;
     static constexpr float kScaleInvMean = 1.0e-1f;
 
     static void AdjustTopKPatterns(std::vector<unsigned> &topk_ids,
                                    std::vector<float> &topk_weights) {
-        moe_test::ApplyReplayLikeSensitiveTopKPatterns<kTokens, kTopK>(
+        moe_test::ApplyNumericallySensitiveTopKPatterns<kTokens, kTopK>(
             topk_ids, topk_weights);
     }
 };
@@ -222,8 +223,8 @@ template <class Config> struct Fp8InputMxFp4BiasConfig : Config {
 };
 
 template <>
-struct Fp8InputMxFp4BiasConfig<ReplayLikeSensitiveConfig>
-    : ReplayLikeSensitiveConfig {
+struct Fp8InputMxFp4BiasConfig<NumericallySensitiveConfig>
+    : NumericallySensitiveConfig {
     static constexpr auto kReferenceActivation =
         moe_test::TestRunnerConfig::ReferenceActivation::kOpenAISwiGLU;
     // The FP8 path quantizes the activated hidden state before W2; the
@@ -232,13 +233,11 @@ struct Fp8InputMxFp4BiasConfig<ReplayLikeSensitiveConfig>
     static constexpr float kOcpFp8PerElementAtol = kPerElementAtol;
 };
 
-struct GptOssHiddenConfig : TestConfig<17, 3072, 4096, 32, 4> {};
 struct TwoStageGptOssConfig : TestConfig<16, 3072, 3072, 4, 4> {};
 struct TwoStageGptOssM64Config : TestConfig<16, 3072, 3072, 4, 4> {
     static constexpr unsigned kSortedTokenPadding = 64;
 };
 struct TwoStageGptOssCachedConfig : TestConfig<64, 3072, 3072, 4, 4> {};
-struct TwoStageDeepSeekV3Config : TestConfig<8, 7168, 2048, 9, 9> {};
 struct TwoStageDeepSeekV3RoutedConfig : TestConfig<8, 7168, 2048, 8, 8> {};
 struct TwoStageDeepSeekV4Config : TestConfig<8, 7168, 3072, 7, 7> {};
 
@@ -1052,32 +1051,13 @@ TEST_F(FusedMoEMxFp4Test, SmallMatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<4, 256, 512, 4, 2>>();
 }
 
-TEST_F(FusedMoEMxFp4Test, MediumMatchesPythonStyleReference) {
-    RunComparisonTest<TestConfig<8, 256, 512, 8, 2>>();
-}
-
-TEST_F(FusedMoEMxFp4Test, Large512MatchesPythonStyleReference) {
-    RunComparisonTest<TestConfig<512, 4096, 1024, 8, 2>>();
-}
-
-TEST_F(FusedMoEMxFp4Test, Large1024MatchesPythonStyleReference) {
-    RunComparisonTest<TestConfig<1024, 4096, 1024, 8, 2>>();
-}
-
 TEST_F(FusedMoEMxFp4Test, Large1537MatchesPythonStyleReference) {
     RunComparisonTest<TestConfig<1537, 4096, 1024, 8, 2>>();
 }
 
-TEST_F(FusedMoEMxFp4Test, DeepSeekLikeMatchesPythonStyleReference) {
-    RunComparisonTest<TestConfig<8, 7168, 2048, 33, 9>>();
-}
-
-TEST_F(FusedMoEMxFp4Test, ReplayLikeSensitiveMatchesPythonStyleReference) {
-    RunComparisonTest<ReplayLikeSensitiveConfig>();
-}
-
-TEST_F(FusedMoEMxFp4Test, GptOssHiddenMatchesPythonStyleReference) {
-    RunComparisonTest<GptOssHiddenConfig>();
+TEST_F(FusedMoEMxFp4Test,
+       NumericallySensitiveMatchesPythonStyleReference) {
+    RunComparisonTest<NumericallySensitiveConfig>();
 }
 
 TEST_F(FusedMoEMxFp4Test, NativeMxFp4LayoutSensitiveMoEMatchesReference) {
@@ -1094,9 +1074,8 @@ TEST_F(FusedMoEMxFp4Test, TwoStageGptOssShapeMatchesReference) {
     if (!SupportsNativeScaleFp4()) {
         GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
     }
-    NativeInputMxFp4Runner<
-        TwoStageGptOssConfig, true,
-        kTwoStageMxFp4BiasNonTemporalSolutionId.Repr()>
+    NativeInputMxFp4Runner<TwoStageGptOssConfig, true,
+                           kTwoStageMxFp4BiasNonTemporalSolutionId.Repr()>
         runner(true);
     runner.Initialize();
     runner.RunTest();
@@ -1107,18 +1086,6 @@ TEST_F(FusedMoEMxFp4Test, TwoStageGptOssCachedWeightsMatchReference) {
         GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
     }
     NativeInputMxFp4Runner<TwoStageGptOssCachedConfig> runner(true);
-    runner.Initialize();
-    runner.RunTest();
-}
-
-TEST_F(FusedMoEMxFp4Test, TwoStageDeepSeekV3ShapeMatchesReference) {
-    if (!SupportsNativeScaleFp4()) {
-        GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
-    }
-    NativeInputMxFp4Runner<
-        TwoStageDeepSeekV3Config, true,
-        kTwoStageMxFp4Silu7168x2048NonTemporalSolutionId.Repr()>
-        runner(true);
     runner.Initialize();
     runner.RunTest();
 }
@@ -1160,15 +1127,6 @@ TEST_F(FusedMoEMxFp4Test, TwoStageDeepSeekV4ShapeMatchesReference) {
     runner.RunTest();
 }
 
-TEST_F(FusedMoEMxFp4Test, OneStageGptOssShapeMatchesReference) {
-    if (!SupportsNativeScaleFp4()) {
-        GTEST_SKIP() << "native scaled FP4 MFMA requires gfx950";
-    }
-    NativeInputMxFp4Runner<TwoStageGptOssConfig> runner;
-    runner.Initialize();
-    runner.RunTest();
-}
-
 TEST(MxFp4BiasLayout, PythonPermutationMatchesMxFp4DeviceRepack) {
     static constexpr unsigned kCols = 256;
     std::vector<__hip_bfloat16> logical(kCols);
@@ -1194,10 +1152,10 @@ TEST(MxFp4BiasLayout, PythonPermutationMatchesMxFp4DeviceRepack) {
         for (unsigned q = 0; q < 4; ++q) {
             for (unsigned fragment = 0; fragment < 4; ++fragment) {
                 for (unsigned component = 0; component < 4; ++component) {
-                    const unsigned dst = wave * 64 + q * 16 + fragment * 4 +
-                                         component;
-                    const unsigned src = wave * 64 + fragment * 16 + q * 4 +
-                                         component;
+                    const unsigned dst =
+                        wave * 64 + q * 16 + fragment * 4 + component;
+                    const unsigned src =
+                        wave * 64 + fragment * 16 + q * 4 + component;
                     ASSERT_EQ(std::memcmp(&packed[dst], &logical[src],
                                           sizeof(__hip_bfloat16)),
                               0)

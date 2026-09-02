@@ -56,8 +56,9 @@ struct TestConfig {
                                    std::vector<float> &) {}
 };
 
-struct ReplayLikeSensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
-    static constexpr float kPerElementAtol = moe_test::kReplayLikeSensitiveAtol;
+struct NumericallySensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
+    static constexpr float kPerElementAtol =
+        moe_test::kNumericallySensitiveAtol;
     static constexpr float kOcpFp8PerElementAtol = 1.3e-1f;
     static constexpr float kScaleInvStd = 2.0e-2f;
     static constexpr float kScaleInvMean = 1.0e-1f;
@@ -95,7 +96,7 @@ struct ReplayLikeSensitiveConfig : TestConfig<2, 7168, 2048, 32, 8> {
 
     static void AdjustTopKPatterns(std::vector<unsigned> &topk_ids,
                                    std::vector<float> &topk_weights) {
-        moe_test::ApplyReplayLikeSensitiveTopKPatterns<kTokens, kTopK>(
+        moe_test::ApplyNumericallySensitiveTopKPatterns<kTokens, kTopK>(
             topk_ids, topk_weights);
     }
 };
@@ -275,8 +276,8 @@ TEST_F(FusedMoEBlockScaleFP8Test, DeepSeekLikeMatchesPythonStyleReference) {
     RunReferenceTest<TestConfig<8, 7168, 2048, 33, 9>>();
 }
 
-TEST_F(FusedMoEBlockScaleFP8Test, ReplayLikeSensitiveMatchesReference) {
-    RunReferenceTest<ReplayLikeSensitiveConfig>();
+TEST_F(FusedMoEBlockScaleFP8Test, NumericallySensitiveMatchesReference) {
+    RunReferenceTest<NumericallySensitiveConfig>();
 }
 
 struct UltraHarshStage1ScaleConfig : TestConfig<32, 512, 512, 1, 1> {

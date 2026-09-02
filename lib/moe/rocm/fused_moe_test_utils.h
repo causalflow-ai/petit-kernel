@@ -72,30 +72,30 @@ inline unsigned MaskNegativeZeroOnNativeFp4Format(unsigned v) {
     return out;
 }
 
-static constexpr float kReplayLikeSensitiveAtol = 2.05e-2f;
-static constexpr unsigned kReplayLikeSensitiveTokens = 2;
-static constexpr unsigned kReplayLikeSensitiveTopK = 8;
+static constexpr float kNumericallySensitiveAtol = 2.05e-2f;
+static constexpr unsigned kNumericallySensitiveTokens = 2;
+static constexpr unsigned kNumericallySensitiveTopK = 8;
 static constexpr unsigned
-    kReplayLikeSensitiveTopKIds[kReplayLikeSensitiveTokens]
-                               [kReplayLikeSensitiveTopK] = {
+    kNumericallySensitiveTopKIds[kNumericallySensitiveTokens]
+                                [kNumericallySensitiveTopK] = {
                                    {9, 18, 29, 30, 25, 4, 11, 3},
                                    {15, 12, 20, 23, 31, 7, 6, 21},
 };
 
-inline float ReplayLikeSensitiveTopKWeight(unsigned token, unsigned slot) {
+inline float NumericallySensitiveTopKWeight(unsigned token, unsigned slot) {
     return 2.0f * (0.25f + 0.025f * static_cast<float>((token + 3 * slot) % 9));
 }
 
 template <unsigned kTokens, unsigned kTopK>
-void ApplyReplayLikeSensitiveTopKPatterns(std::vector<unsigned> &topk_ids,
-                                          std::vector<float> &topk_weights) {
-    static_assert(kTokens == kReplayLikeSensitiveTokens);
-    static_assert(kTopK == kReplayLikeSensitiveTopK);
+void ApplyNumericallySensitiveTopKPatterns(std::vector<unsigned> &topk_ids,
+                                           std::vector<float> &topk_weights) {
+    static_assert(kTokens == kNumericallySensitiveTokens);
+    static_assert(kTopK == kNumericallySensitiveTopK);
     for (unsigned token = 0; token < kTokens; ++token) {
         for (unsigned slot = 0; slot < kTopK; ++slot) {
             const size_t idx = static_cast<size_t>(token) * kTopK + slot;
-            topk_ids[idx] = kReplayLikeSensitiveTopKIds[token][slot];
-            topk_weights[idx] = ReplayLikeSensitiveTopKWeight(token, slot);
+            topk_ids[idx] = kNumericallySensitiveTopKIds[token][slot];
+            topk_weights[idx] = NumericallySensitiveTopKWeight(token, slot);
         }
     }
 }
