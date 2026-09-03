@@ -480,8 +480,14 @@ union BufferResource {
     __device__ inline void
     LoadLds(__attribute__((address_space(3))) unsigned *lds_ptr, int voffset,
             int soffset) const {
+#if defined(__gfx950__)
         llvm_amdgcn_raw_buffer_load_lds(content, lds_ptr, kSize, voffset,
                                         soffset, kOffset, kAux);
+#else
+        (void)lds_ptr;
+        (void)voffset;
+        (void)soffset;
+#endif
     }
 };
 

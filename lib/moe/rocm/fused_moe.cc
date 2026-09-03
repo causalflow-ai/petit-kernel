@@ -1,8 +1,27 @@
 #include "moe/rocm/fused_moe_config_selector.cuh"
 
+#include <cstring>
 #include <unordered_map>
 
 namespace causalflow::petit::rocm::moe {
+namespace {
+
+bool IsGfx950(hipStream_t stream) {
+    hipDevice_t device = 0;
+    if (hipStreamGetDevice(stream, &device) != hipSuccess)
+        return false;
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device) != hipSuccess)
+        return false;
+    return std::strncmp(props.gcnArchName, "gfx950", 6) == 0;
+}
+
+bool RequiresNativeMxFp4(unsigned long solution_id) {
+    return FusedMoESolutionId::FromRepr(solution_id).weight_ordering ==
+           FusedMoEWeightOrdering::kNativeMxFp4;
+}
+
+} // namespace
 
 using Call = int (*)(FusedMoE1StageParams params);
 using WorkspaceSizeCall = std::size_t (*)(unsigned, unsigned);
@@ -212,17 +231,20 @@ void RegisterOneStageShapes(std::unordered_map<unsigned long, Call> &calls) {
 
 static const std::unordered_map<unsigned long, Call> kCallMap = [] {
     std::unordered_map<unsigned long, Call> calls;
+#if PETIT_COMPILE_FUSED_MOE_KERNELS
     RegisterOneStageShapes<kFusedMoEBlockScaleFp8SolutionId>(calls);
     RegisterOneStageShapes<kFusedMoEFp8PetitMxFp4SolutionId>(calls);
     RegisterOneStageShapes<kFusedMoEFp8PetitMxFp4BiasSolutionId>(calls);
     RegisterOneStageShapes<kFusedMoEBf16NativeMxFp4BiasSolutionId>(calls);
     RegisterOneStageShapes<kFusedMoEMxFp4NativeMxFp4BiasSolutionId>(calls);
+#endif
     return calls;
 }();
 
 static const std::unordered_map<unsigned long, TwoStageRegistration>
     kTwoStageCallMap = [] {
         std::unordered_map<unsigned long, TwoStageRegistration> calls;
+#if PETIT_COMPILE_FUSED_MOE_KERNELS
         RegisterTwoStageShape<kFusedMoETwoStageMxFp4BiasSolutionId, 3072,
                               3072, 4>(calls);
         RegisterTwoStageShape<
@@ -233,6 +255,7 @@ static const std::unordered_map<unsigned long, TwoStageRegistration>
             kFusedMoETwoStageMxFp4SiluSolutionId, 7168, 2048, 8, 9>(calls);
         RegisterTwoStageShape<kFusedMoETwoStageMxFp4SiluSolutionId, 7168, 3072,
                               7>(calls);
+#endif
         return calls;
     }();
 
@@ -240,6 +263,8 @@ int FusedMoEMatmul1Stage(FusedMoE1StageParams params,
                          unsigned long solution_id) {
     const auto it = kCallMap.find(solution_id);
     if (it != kCallMap.end()) {
+        if (RequiresNativeMxFp4(solution_id) && !IsGfx950(params.stream))
+            return kFusedMoEErrorUnsupported;
         return it->second(params);
     }
     return kFusedMoEErrorInvalidSolution;
@@ -257,15 +282,23 @@ std::size_t FusedMoE2StageWorkspaceSize(unsigned max_num_m_blocks,
 int FusedMoEMatmul2Stage1(FusedMoE2Stage1Params params,
                           unsigned long solution_id) {
     const auto it = kTwoStageCallMap.find(solution_id);
-    return it == kTwoStageCallMap.end() ? kFusedMoEErrorInvalidSolution
-                                        : it->second.stage1(params);
+    if (it == kTwoStageCallMap.end())
+        return kFusedMoEErrorInvalidSolution;
+    if (RequiresNativeMxFp4(solution_id) &&
+        !IsGfx950(params.common.stream))
+        return kFusedMoEErrorUnsupported;
+    return it->second.stage1(params);
 }
 
 int FusedMoEMatmul2Stage2(FusedMoE2Stage2Params params,
                           unsigned long solution_id) {
     const auto it = kTwoStageCallMap.find(solution_id);
-    return it == kTwoStageCallMap.end() ? kFusedMoEErrorInvalidSolution
-                                        : it->second.stage2(params);
+    if (it == kTwoStageCallMap.end())
+        return kFusedMoEErrorInvalidSolution;
+    if (RequiresNativeMxFp4(solution_id) &&
+        !IsGfx950(params.common.stream))
+        return kFusedMoEErrorUnsupported;
+    return it->second.stage2(params);
 }
 
 } // namespace causalflow::petit::rocm::moe

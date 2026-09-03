@@ -627,10 +627,12 @@ __global__ static void __launch_bounds__(Kernel::kThreads)
                     const void *w2_bias, void *base, unsigned rank,
                     const uint4 *input_tokens, const unsigned *input_topk_ids,
                     const float *input_topk_weights) {
+#if defined(__gfx950__)
     Kernel kernel;
     kernel.Run(out, w13, w2, scales_w13, scales_w2, num_tokens,
                output_row_stride, w13_bias, w2_bias, base, rank, input_tokens,
                input_topk_ids, input_topk_weights);
+#endif
 }
 
 template <class Kernel>
@@ -640,24 +642,31 @@ __global__ static void __launch_bounds__(Kernel::kThreads)
                   unsigned rank, const uint4 *input_tokens,
                   const unsigned *input_topk_ids,
                   const float *input_topk_weights) {
+#if defined(__gfx950__)
     Kernel kernel;
     kernel.RunStage1Kernel(w13, scales_w13, num_tokens, w13_bias, base, rank,
                            input_tokens, input_topk_ids, input_topk_weights);
+#endif
 }
 
 template <class Kernel>
 __global__ static void __launch_bounds__(Kernel::kThreads)
     MegaMoEStage2(const uint4 *w2, const unsigned *scales_w2,
                   const void *w2_bias, void *base, unsigned rank) {
+#if defined(__gfx950__)
     Kernel kernel;
     kernel.RunStage2Kernel(nullptr, w2, scales_w2, 0, w2_bias, base, rank);
+#endif
 }
 
 template <class Kernel>
 __global__ static void __launch_bounds__(Kernel::kThreads)
     MegaMoECombine(uint4 *out, unsigned num_tokens, unsigned output_row_stride,
                    void *base, unsigned rank) {
+#if defined(__gfx950__)
     Kernel kernel;
     kernel.Run(out, num_tokens, output_row_stride, base, rank);
+#endif
 }
+
 } // namespace causalflow::petit::rocm::moe

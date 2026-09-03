@@ -335,6 +335,7 @@ struct HiddenShuffleSelector<FusedMoEDataType::kMxFp4, Config> {
 template <FusedMoESolutionId id, unsigned kTopK_ = 4>
 struct ConfigSelector {
     using Self = ConfigSelector<id, kTopK_>;
+    static constexpr FusedMoESolutionId kSolution = id;
     static constexpr unsigned kDim = id.Dim();
     static constexpr unsigned kInterDim = id.InterDim();
     static constexpr unsigned kTopK = kTopK_;

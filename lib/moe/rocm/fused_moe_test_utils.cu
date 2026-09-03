@@ -110,12 +110,26 @@ __device__ float ScaleFloatForMxFp4(float max_abs, unsigned &scale_byte) {
 }
 
 __device__ unsigned CvtScaleFp4x2(__hip_bfloat162 value, float scale) {
+#if defined(__gfx950__) &&                                                     \
+    __has_builtin(__builtin_amdgcn_cvt_scalef32_pk_fp4_bf16)
     return __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(0u, value, scale, 0) &
            0xffu;
+#else
+    (void)value;
+    (void)scale;
+    return 0;
+#endif
 }
 
 __device__ __hip_bfloat162 CvtFp4ByteToBf16x2(unsigned packed, float scale) {
+#if defined(__gfx950__) &&                                                     \
+    __has_builtin(__builtin_amdgcn_cvt_scalef32_pk_bf16_fp4)
     return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed, scale, 0);
+#else
+    (void)packed;
+    (void)scale;
+    return {};
+#endif
 }
 
 static constexpr unsigned kMxFp4ScaleGroupsPerDequantBlock = 16;

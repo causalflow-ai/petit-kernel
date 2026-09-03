@@ -130,6 +130,8 @@ struct NativeMxFp4Quantization {
     __device__ static void Pack(unsigned char *dst,
                                 const float4 values[kVectors],
                                 const MxFp4Scale &scale) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__) &&                  \
+    __has_builtin(__builtin_amdgcn_cvt_scalef32_pk_fp4_f32)
         static_assert(kVectors % 2 == 0,
                       "native packing consumes pairs of float4");
         auto *packed = reinterpret_cast<unsigned *>(dst);
@@ -148,6 +150,11 @@ struct NativeMxFp4Quantization {
                 word, b.z, b.w, scale.packing_scale, 3);
             packed[vector / 2] = word;
         }
+#else
+        (void)dst;
+        (void)values;
+        (void)scale;
+#endif
     }
 };
 
@@ -173,6 +180,8 @@ struct AiterMxFp4Quantization {
     __device__ static void Pack(unsigned char *dst,
                                 const float4 values[kVectors],
                                 const MxFp4Scale &scale) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__) &&                  \
+    __has_builtin(__builtin_amdgcn_cvt_scalef32_pk_fp4_f32)
         auto *packed = reinterpret_cast<unsigned short *>(dst);
 #pragma unroll
         for (unsigned vector = 0; vector < kVectors; ++vector) {
@@ -184,6 +193,11 @@ struct AiterMxFp4Quantization {
                 word, value.z, value.w, scale.packing_scale, 1);
             packed[vector] = static_cast<unsigned short>(word);
         }
+#else
+        (void)dst;
+        (void)values;
+        (void)scale;
+#endif
     }
 };
 

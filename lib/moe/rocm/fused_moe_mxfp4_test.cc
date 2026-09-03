@@ -1023,7 +1023,7 @@ class FusedMoEMxFp4Test : public ::testing::Test {
             runner.Initialize();
             runner.RunTest();
         }
-        {
+        if (SupportsNativeScaleFp4()) {
             SCOPED_TRACE("BF16 input MXFP4 MoE");
             Bf16InputMxFp4Runner<Config> runner;
             runner.Initialize();

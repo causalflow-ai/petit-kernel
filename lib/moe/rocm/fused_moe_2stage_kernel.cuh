@@ -114,6 +114,11 @@ __global__ static void __launch_bounds__(Config::kThreads)
         const unsigned *__restrict__ num_valid_ids, const uint4 *scales_act,
         const uint4 *scales_w13, unsigned m, unsigned num_experts,
         unsigned max_num_m_blocks, const void *w13_bias) {
+#if !defined(__gfx950__)
+    if constexpr (Config::kSolution.weight_ordering ==
+                  FusedMoEWeightOrdering::kNativeMxFp4)
+        return;
+#endif
     using Workspace = TwoStageFusedMoEWorkspace<Config>;
     using Epilogue = MxFp4Stage1WorkspaceEpilogue<Config>;
     using Kernel = FusedMoEStage1<Config, Epilogue>;
@@ -139,6 +144,7 @@ __global__ static void __launch_bounds__(Config::kThreads)
 }
 
 template <class Config> struct TwoStageFusedMoEStage2 {
+    using ConfigType = Config;
     static constexpr unsigned kGroupDim = Config::kGroupDim;
     static constexpr unsigned kNumWarps = Config::kNumWarps;
     static constexpr unsigned kThreads = kNumWarps * kWarpSize;
@@ -358,6 +364,12 @@ __global__ static void __launch_bounds__(Kernel::kThreads, 1)
         const unsigned *__restrict__ num_valid_ids, unsigned topk,
         const unsigned *__restrict__ scales_w2, unsigned num_experts,
         unsigned max_route_groups, const void *w2_bias) {
+#if !defined(__gfx950__)
+    using Config = typename Kernel::ConfigType;
+    if constexpr (Config::kSolution.weight_ordering ==
+                  FusedMoEWeightOrdering::kNativeMxFp4)
+        return;
+#endif
     Kernel kernel;
     kernel.Compute(out, intermediate, w2,
                    reinterpret_cast<const unsigned *>(sorted_token_ids),

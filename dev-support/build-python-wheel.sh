@@ -2,7 +2,7 @@
 
 set -eu
 
-ROCM_ARCH="${ROCM_ARCH:-gfx90a;gfx940;gfx942}"
+ROCM_ARCH="${ROCM_ARCH:-gfx90a;gfx942;gfx950}"
 
 if [ -z "${TORCH_PATH:-}" ]; then
     TORCH_PATH=$(

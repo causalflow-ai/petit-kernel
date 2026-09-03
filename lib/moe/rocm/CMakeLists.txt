@@ -10,6 +10,11 @@ function(petit_set_moe_hip_architectures target)
     set_target_properties(${target} PROPERTIES
       HIP_ARCHITECTURES "${moe_hip_architectures}"
     )
+    target_compile_definitions(${target} PUBLIC PETIT_COMPILE_FUSED_MOE_KERNELS=1)
+  else()
+    # Keep the host API linkable in MI250 builds without instantiating device
+    # kernels that require CDNA3 packed-BF16 atomics.
+    target_compile_definitions(${target} PUBLIC PETIT_COMPILE_FUSED_MOE_KERNELS=0)
   endif()
 endfunction()
 

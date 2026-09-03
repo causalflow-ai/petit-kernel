@@ -229,6 +229,11 @@ __global__ static void __launch_bounds__(64 * Kernel::kNumWarps)
         const void *w13_bias, const void *w2_bias) {
     (void)topk;
     using Config = typename Kernel::Config;
+#if !defined(__gfx950__)
+    if constexpr (Config::kSolution.weight_ordering ==
+                  FusedMoEWeightOrdering::kNativeMxFp4)
+        return;
+#endif
     static constexpr unsigned kNBlocks =
         Config::kDim / Kernel::kScaleBlockSize;
     static constexpr unsigned kKBlocks =

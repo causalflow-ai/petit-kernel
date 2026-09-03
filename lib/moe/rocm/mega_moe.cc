@@ -2,6 +2,7 @@
 #include "moe/rocm/quantization.cuh"
 
 #include <hip/hip_bfloat16.h>
+#include <cstring>
 #include <unordered_map>
 
 namespace causalflow::petit::rocm::moe {
@@ -14,6 +15,16 @@ struct MegaMoESolutionOperations {
     WorkspaceInfoCall workspace_info;
     LaunchCall launch;
 };
+
+bool IsGfx950(hipStream_t stream) {
+    hipDevice_t device = 0;
+    if (hipStreamGetDevice(stream, &device) != hipSuccess)
+        return false;
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device) != hipSuccess)
+        return false;
+    return std::strncmp(props.gcnArchName, "gfx950", 6) == 0;
+}
 
 #define MEGA_MOE_SOLUTION(BASE, RANKS, EXPERTS, TOPK, HIDDEN, INTER, PRODUCERS, \
                           W2_TILE)                                              \
@@ -43,6 +54,7 @@ struct MegaMoESolutionOperations {
 
 const std::unordered_map<unsigned long, MegaMoESolutionOperations>
     kMegaMoESolutions = {
+#if PETIT_COMPILE_FUSED_MOE_KERNELS
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 1, 32, 4, 2880,
                           3072, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SolutionId, 2, 32, 4, 2880,
@@ -67,6 +79,7 @@ const std::unordered_map<unsigned long, MegaMoESolutionOperations>
                           7168, 3072, MEGA_MOE_P56, MEGA_MOE_N256),
         MEGA_MOE_REGISTER(kMegaMoETwoStageMxFp4SiluSolutionId, 8, 384, 6,
                           7168, 3072, MEGA_MOE_P192, MEGA_MOE_N256),
+#endif
 };
 
 #undef MEGA_MOE_N256
@@ -82,10 +95,12 @@ const std::unordered_map<unsigned long, MegaMoESolutionOperations>
 // Assign one thread to each 1x32 MX block for small token counts. This avoids
 // the mostly-idle 128x32 tile used by generic quantizers when there are only a
 // handful of rows.
+#if PETIT_COMPILE_FUSED_MOE_KERNELS
 __global__ static void
 MegaMoEQuantizeMxFp4Kernel(const __hip_bfloat16 *__restrict__ input,
                            unsigned char *__restrict__ output,
                            unsigned groups_per_row, unsigned input_row_stride) {
+#if defined(__gfx950__)
     const unsigned group_col = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned scale_row_stride = (groups_per_row + 15) & ~15u;
     const unsigned value_row_bytes = groups_per_row * sizeof(uint4);
@@ -141,11 +156,14 @@ MegaMoEQuantizeMxFp4Kernel(const __hip_bfloat16 *__restrict__ input,
         reinterpret_cast<unsigned char *>(&row_values[group_col]), values,
         scale);
     row_scales[group_col] = scale_byte;
+#endif
 }
+#endif
 
 int MegaMoEQuantizeMxFp4(const void *input, unsigned char *output,
                          unsigned rows, unsigned cols,
                          unsigned input_row_stride, hipStream_t stream) {
+#if PETIT_COMPILE_FUSED_MOE_KERNELS
     if (cols == 0 || cols % 32 != 0 || input_row_stride < cols ||
         input_row_stride % 8 != 0 ||
         (rows != 0 && (input == nullptr || output == nullptr))) {
@@ -153,6 +171,8 @@ int MegaMoEQuantizeMxFp4(const void *input, unsigned char *output,
     }
     if (rows == 0)
         return 0;
+    if (!IsGfx950(stream))
+        return kFusedMoEErrorUnsupported;
     const unsigned groups_per_row = cols / 32;
     constexpr unsigned kThreads = 64;
     const unsigned blocks = (groups_per_row + kThreads - 1) / kThreads;
@@ -162,11 +182,22 @@ int MegaMoEQuantizeMxFp4(const void *input, unsigned char *output,
                        groups_per_row, input_row_stride);
     return hipGetLastError() == hipSuccess ? 0
                                            : kFusedMoEErrorInvalidArgument;
+#else
+    (void)input;
+    (void)output;
+    (void)rows;
+    (void)cols;
+    (void)input_row_stride;
+    (void)stream;
+    return kFusedMoEErrorUnsupported;
+#endif
 }
 
 int MegaMoECompute(MegaMoEParams params, unsigned long solution_id) {
     const auto it = kMegaMoESolutions.find(solution_id);
     if (it != kMegaMoESolutions.end()) {
+        if (!IsGfx950(params.stream))
+            return kFusedMoEErrorUnsupported;
         return it->second.launch(params);
     }
     return kFusedMoEErrorInvalidSolution;

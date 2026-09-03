@@ -240,10 +240,17 @@ template <class TileSchedule> struct OnestageFusedMoEStage1SingleBufferOp {
 __device__ static inline void
 BufferAtomicWriteBf16x2(const BufferResource &base, unsigned vo,
                         unsigned value) {
+#if defined(__gfx950__)
     asm volatile("buffer_atomic_pk_add_bf16 %2, %1, %0, 0 offen\n\t"
                  :
                  : "s"(base.content), "v"(vo), "v"(value)
                  : "memory");
+#else
+    asm volatile("global_atomic_pk_add_bf16 %1, %2, %0\n\t"
+                 :
+                 : "s"(base.v.ptr), "v"(vo), "v"(value)
+                 : "memory");
+#endif
 }
 
 template <unsigned kAccumFragments>
