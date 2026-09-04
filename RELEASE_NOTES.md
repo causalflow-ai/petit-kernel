@@ -2,6 +2,11 @@
 
 This file tracks release notes for all published versions.
 
+## 0.0.5 - 2026-09-04
+
+- Added experimental MegaMoE kernels for GPT-OSS-120B, DeepSeek V3 and V4.
+- Added A16W4, A8W4, and A4W4 fused MoE kernels.
+
 ## 0.0.4 - 2026-05-08
 
 - Added fused MoE blockscale FP8 kernels.

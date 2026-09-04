@@ -1,41 +1,86 @@
 # Petit
 
-Petit provides optimized FP16/BF16 x FP4 GPU kernels specifically designed for AMD GPUs. It enables efficient execution of NVFP4 and MXFP4 quantized models on GPUs that lack native FP4 arithmetic capabilities. This makes Petit particularly well-suited for serving high-quality FP4 models on standard GPUs while achieving ~3.3x memory savings. For example, a server with 8x AMD MI300x GPUs running [sglang v0.4.9.post2](https://github.com/sgl-project/sglang) can serve the [Llama-3.3-70B-Instruct](meta-llama/Llama-3.3-70B-Instruct) / [Llama-3.3-70B-Instruct-FP4](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP4) model with a MMLU score of 82.15 and 80.79 respectively.
+Petit provides optimized AMD GPU kernels for dense matrix multiplication,
+Mixture-of-Experts (MoE), and experimental single-node MegaMoE workloads. Its
+FP16/BF16 × FP4 kernels support NVFP4- and MXFP4-quantized models on GPUs with
+or without native FP4 arithmetic.
+
+## Features
+
+- Dense matrix multiplication with NVFP4 and MXFP4 weights
+- Fused MoE kernels for BF16 and MXFP4 workloads
+- Experimental single-node MegaMoE kernels with BF16 and MXFP4 activations
 
 ## Requirements
 
-* AMD CDNA2 / CDNA3 GPUs (AMD MI2xx / MI3xx series)
-* ROCm 6.2 or later
-* PyTorch 2.5 or later
+- AMD CDNA2, CDNA3, or CDNA4 GPUs (MI200, MI300, or MI350 series)
+- ROCm 6.2 or later
+- PyTorch 2.5 or later
 
-## Installation and Usages
+MegaMoE support currently requires CDNA4 (`gfx950`).
 
-You can install Petit directly using pip:
+## Installation and usage
+
+Install Petit from the repository with pip:
 
 ```bash
-$ CMAKE_ARGS='-DCMAKE_PREFIX_PATH=/opt/rocm;/usr/local/lib/python3.12/dist-packages/torch' pip install .
+CMAKE_ARGS="-DCMAKE_PREFIX_PATH=/opt/rocm;$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
+  pip install .
 ```
 
-You need to specify `CMAKE_PREFIX_PATH` in `CMAKE_ARGS` so that cmake can detect the ROCm or PyTorch.
+Set `CMAKE_PREFIX_PATH` through `CMAKE_ARGS` so that CMake can locate ROCm and
+PyTorch.
 
-Petit provides python APIs for matrix multiplications that are intended to be integrated with inference frameworks such as [SGLang](https://github.com/sgl-project/sglang) and [vLLM](https://github.com/vllm-project/vllm.git). It also provides C++ bindings to enable integrations with frameworks like [llama.cpp](https://github.com/ggml-org/llama.cpp.git). 
+Petit exposes Python APIs for matrix multiplication and MoE kernels for
+integration with inference frameworks such as
+[SGLang](https://github.com/sgl-project/sglang) and
+[vLLM](https://github.com/vllm-project/vllm). It also provides C++ bindings for
+integrations with frameworks such as [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
-## Techniques and Evaluations
+## Techniques and performance
 
-Similar to [Marlin](https://github.com/IST-DASLab/marlin.git), Petit performs offline weight shuffling to enable efficient GPU dequantization. To achieve optimal performance, Petit utilizes ranged buffer loads and vector instructions specifically designed for CDNA2 and CDNA3 architectures. These optimizations are based on the assumptions that scales remain positive and quantized weights contain no negative zeros. For detailed information about these optimizations, please refer to the documentation available [here](https://www.causalflow.ai/blogs/2025-08-optimizing-fp4-mixed-precision-inference-on-amd-gpus).
+Like [Marlin](https://github.com/IST-DASLab/marlin), Petit shuffles weights
+offline to make GPU dequantization more efficient. It also uses ranged buffer
+loads and vector instructions designed for AMD CDNA architectures. See
+[Optimizing FP4 Mixed-Precision Inference on AMD GPUs](https://www.causalflow.ai/blogs/2025-08-optimizing-fp4-mixed-precision-inference-on-amd-gpus)
+for details.
 
-Petit is optimized for the real-world use cases where the LLM engines perform inferences with small batches. For example, Petit is 1.2x-2.2x faster compared to [hipBLASLt](https://rocm.docs.amd.com/projects/hipBLASLt/en/latest) when performing BF16 matrix multiplications when batch size less than 16. For larger batches where the performance is bound by the available computational powers, Petit performs within 70% of the hand-optimized hipBLASLt library.
+FP4 quantization provides approximately 3.3× memory savings. For example, a
+server with eight AMD MI300X GPUs running
+[SGLang v0.4.9.post2](https://github.com/sgl-project/sglang) can serve both
+[Llama-3.3-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
+and
+[Llama-3.3-70B-Instruct-FP4](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP4),
+which achieve MMLU scores of 82.15 and 80.79, respectively.
 
-## Known Issues
+Petit targets small-batch LLM inference. For BF16 matrix multiplication with
+batch sizes below 16, Petit is 1.2–2.2× faster than
+[hipBLASLt](https://rocm.docs.amd.com/projects/hipBLASLt/en/latest). At larger
+batch sizes, where performance becomes compute-bound, Petit reaches 70% of the
+performance of the hand-optimized hipBLASLt library.
 
-Similar to Marlin, Petit shuffles the data offline to minimize the work performed on the GPU side. It requires all scales are positive which matches the output of the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer.git) quantizier. 
+## Known limitations
 
-The MFMA instructions on AMD MI2xx GPUs flush input and output denormal values to zero, which can potentially impact [numeric accuracy](https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices). Petit implements corrective measures for the AMD MI2xx GPUs which have ~10% overheads. 
+- Petit's offline data transformation assumes that scales are positive and
+  quantized weights contain no negative zeros. This is compatible with output
+  from the
+  [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
 
-Compared to NVIDIA architectures, CDNA architectures are significantly more sensitive to kernel hyperparameters like the shapes in shared memory. We strongly recommend running auto-tuning to achieve optimal performance. The repository provides benchmarking tool to facilitate auto tunings.
+- MFMA instructions on AMD MI200-series GPUs flush input and output denormal
+  values to zero, which can affect
+  [numerical accuracy](https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices).
+  Petit's corrective measures add approximately 10% overhead on these GPUs.
 
-## Contacts and Contributions
+- AMD CDNA architectures are sensitive to kernel hyperparameters such as
+  shared-memory tile shapes. Run the included benchmarking tools to tune these
+  parameters for optimal performance.
 
-We thank AMD and [InnoMatrix](https://innomatrix.ai) for their generous support of providing access of the GPUs to make this project possible. Neither organization is involved in the development of the project.
+## Contact and contributions
 
-Petit is a very young project and we are still working on implementing various optimizations.  Please contact haohui@causalflow.ai for questions and supports. Contributions are welcome.
+We thank AMD and [InnoMatrix](https://innomatrix.ai) for generously providing
+access to the GPUs that made this project possible. Neither organization is
+involved in the development of Petit.
+
+Petit is a young project, and many optimizations are still in progress.
+Questions, feedback, and contributions are welcome. Contact
+[haohui@causalflow.ai](mailto:haohui@causalflow.ai) for more information.
